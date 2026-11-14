@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">BeastLock</string>
+    <string name="vault_tagline">AES-256-GCM Hardware-Backed Folder Vault</string>
+    <string name="biometric_prompt_title">Unlock BeastLock</string>
+    <string name="biometric_prompt_subtitle">Authenticate with biometrics or device credential to access encrypted folders</string>
+    <string name="biometric_action_title">Authorize Folder Operation</string>
+    <string name="biometric_action_subtitle">Confirm your identity to lock or unlock protected folder contents</string>
+    <string name="biometric_negative_use_pin">Use Vault PIN</string>
+    <string name="qs_tile_lock_vault">Lock BeastLock</string>
+    <string name="qs_tile_panic_mode">BeastLock Panic</string>
+</resources>

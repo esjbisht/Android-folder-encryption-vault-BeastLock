@@ -1,0 +1,8 @@
+{
+  "name": "BeastLock",
+  "description": "Lock any Android folder with AES-256-GCM encryption and biometric authentication.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
