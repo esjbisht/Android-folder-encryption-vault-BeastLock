@@ -27,10 +27,21 @@ import java.util.zip.ZipOutputStream
 import javax.crypto.SecretKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+
+@Serializable
+data class CloudBackupVaultState(
+  val deviceModel: String = "",
+  val obfuscateFilenamesDefault: Boolean = true,
+  val autoLockEnabled: Boolean = true,
+  val autoLockTimeoutSeconds: Int = 30,
+  val panicModeEnabled: Boolean = true,
+  val batterySaverModeEnabled: Boolean = true,
+)
 
 @Serializable
 data class CloudBackupManifest(
@@ -41,6 +52,7 @@ data class CloudBackupManifest(
   val pinVerifier: String,
   val pinWrappedDekBase64: String,
   val folders: List<CloudBackupFolderEntry>,
+  val vaultState: CloudBackupVaultState? = null,
 )
 
 @Serializable
@@ -80,17 +92,30 @@ data class CloudRestoreResult(
   val requiresBackupPin: Boolean = false,
 )
 
+data class DriveVaultBackupItem(
+  val id: String,
+  val name: String,
+  val sizeBytes: Long,
+  val modifiedTimeIso: String,
+  val folderCount: Int,
+  val fileCount: Int,
+  val sha256Checksum: String,
+  val deviceModel: String,
+  val isAutoSyncArchive: Boolean,
+)
+
 /**
  * Creates and restores Zero-Knowledge Encrypted Cloud Backups (`.vlkbak`).
  *
  * Every file archived inside `.vlkbak` is AES-256-GCM encrypted (`VLK1` format)
- * prior to streaming to Google Drive, Dropbox, OneDrive, or any SAF cloud provider.
+ * prior to streaming to Google Drive API (`appDataFolder`), Dropbox, or SAF providers.
  */
 class CloudBackupManager(
   private val context: Context,
   private val vaultDao: VaultDao,
   private val prefsRepo: SecurityPreferencesRepository,
   private val auditLogRepo: EncryptedAuditLogRepository,
+  private val driveClient: GoogleDriveApiClient = GoogleDriveApiClient(),
 ) {
   private val json = Json {
     ignoreUnknownKeys = true
@@ -175,11 +200,178 @@ class CloudBackupManager(
     }
   }
 
+  suspend fun fetchGoogleDriveAccountEmail(accessToken: String): String? = runCatching {
+    driveClient.getUserInfo(accessToken)?.emailAddress
+  }.getOrNull()
+
+  suspend fun listGoogleDriveBackups(accessToken: String): Result<List<DriveVaultBackupItem>> =
+    withContext(Dispatchers.IO) {
+      runCatching {
+        driveClient.listAppDataBackups(accessToken)
+          .filter { it.name.endsWith(".vlkbak", ignoreCase = true) || it.appProperties["beastlock"] == "true" }
+          .map { meta ->
+            DriveVaultBackupItem(
+              id = meta.id,
+              name = meta.name,
+              sizeBytes = meta.size?.toLongOrNull() ?: 0L,
+              modifiedTimeIso = meta.modifiedTime.orEmpty(),
+              folderCount = meta.appProperties["folderCount"]?.toIntOrNull() ?: 0,
+              fileCount = meta.appProperties["fileCount"]?.toIntOrNull() ?: 0,
+              sha256Checksum = meta.appProperties["sha256"].orEmpty(),
+              deviceModel = meta.appProperties["deviceModel"].orEmpty(),
+              isAutoSyncArchive = meta.name == AUTO_SYNC_ARCHIVE_NAME,
+            )
+          }
+      }
+    }
+
+  suspend fun syncVaultToGoogleDrive(
+    accessToken: String,
+    dek: SecretKey,
+    folderIds: Set<String>? = null,
+    onlyAutoSyncEnabled: Boolean = false,
+    archiveFileName: String = AUTO_SYNC_ARCHIVE_NAME,
+    updateExistingAutoSync: Boolean = true,
+    onProgress: (CloudBackupProgress) -> Unit = {},
+  ): Result<CloudBackupResult?> = withContext(Dispatchers.IO) {
+    runCatching {
+      val allFolders = vaultDao.getAllFoldersOnce()
+      val targetFolders = when {
+        !folderIds.isNullOrEmpty() -> allFolders.filter { it.id in folderIds }
+        onlyAutoSyncEnabled -> allFolders.filter { it.autoCloudBackupSync }
+        else -> allFolders
+      }
+      if (targetFolders.isEmpty()) {
+        return@runCatching null
+      }
+
+      val stagingFile = File(context.cacheDir, ".tmp_gdrive_sync_${UUID.randomUUID()}.vlkbak")
+      try {
+        val stagedResult = exportEncryptedBackup(
+          destinationUri = Uri.fromFile(stagingFile),
+          providerLabel = "Google Drive API",
+          dek = dek,
+          folderIds = targetFolders.map { it.id }.toSet(),
+          recordAuditAndHistory = false,
+          onProgress = onProgress,
+        ).getOrThrow()
+
+        onProgress(
+          CloudBackupProgress(
+            phase = "Uploading encrypted vault to Google Drive",
+            currentFile = archiveFileName,
+            processedFiles = stagedResult.record.fileCount,
+            totalFiles = stagedResult.record.fileCount.coerceAtLeast(1),
+          ),
+        )
+
+        val existingId = if (updateExistingAutoSync) {
+          driveClient.listAppDataBackups(accessToken)
+            .firstOrNull { it.name == archiveFileName }
+            ?.id
+        } else {
+          null
+        }
+
+        val deviceLabel = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
+        val uploadedMeta = driveClient.uploadEncryptedArchive(
+          accessToken = accessToken,
+          fileName = archiveFileName,
+          archiveFile = stagingFile,
+          existingFileId = existingId,
+          appProperties = mapOf(
+            "beastlock" to "true",
+            "folderCount" to stagedResult.record.folderCount.toString(),
+            "fileCount" to stagedResult.record.fileCount.toString(),
+            "sha256" to stagedResult.record.sha256Checksum,
+            "deviceModel" to deviceLabel.take(64),
+          ),
+        )
+
+        val now = System.currentTimeMillis()
+        val finalRecord = stagedResult.record.copy(
+          providerName = "Google Drive API",
+          fileName = uploadedMeta.name,
+          destinationUri = "gdrive://appDataFolder/${uploadedMeta.id}",
+          createdAt = now,
+        )
+        vaultDao.insertBackupRecord(finalRecord)
+        prefsRepo.recordGoogleDriveSyncTimestamp(now)
+        auditLogRepo.recordEvent(
+          action = "GOOGLE_DRIVE_SYNC",
+          folderName = "Google Drive",
+          details = "Synced encrypted vault (${finalRecord.folderCount} folders, ${finalRecord.fileCount} files, SHA-256:${finalRecord.sha256Checksum}) to Drive appDataFolder",
+          category = AuditCategory.CLOUD_SYNC,
+        )
+        stagedResult.copy(record = finalRecord)
+      } finally {
+        if (stagingFile.exists()) stagingFile.delete()
+      }
+    }
+  }
+
+  suspend fun restoreFromGoogleDrive(
+    accessToken: String,
+    driveFileId: String,
+    fileName: String,
+    currentDek: SecretKey,
+    backupPinIfDifferentKey: String? = null,
+    onProgress: (CloudBackupProgress) -> Unit = {},
+  ): Result<CloudRestoreResult> = withContext(Dispatchers.IO) {
+    runCatching {
+      onProgress(
+        CloudBackupProgress(
+          phase = "Downloading encrypted archive from Google Drive",
+          currentFile = fileName,
+          processedFiles = 0,
+          totalFiles = 1,
+        ),
+      )
+      val tempArchive = File(context.cacheDir, ".tmp_gdrive_restore_${UUID.randomUUID()}.vlkbak")
+      try {
+        driveClient.downloadFileTo(accessToken, driveFileId, tempArchive)
+        val result = restoreEncryptedBackup(
+          backupUri = Uri.fromFile(tempArchive),
+          currentDek = currentDek,
+          backupPinIfDifferentKey = backupPinIfDifferentKey,
+          onProgress = onProgress,
+        ).getOrThrow()
+        if (!result.requiresBackupPin) {
+          auditLogRepo.recordEvent(
+            action = "GOOGLE_DRIVE_RESTORE",
+            folderName = "Google Drive",
+            details = "Restored ${result.restoredFolders} encrypted folder(s) (${result.restoredFiles} files) from Google Drive backup \"$fileName\"",
+            category = AuditCategory.CLOUD_SYNC,
+          )
+        }
+        result
+      } finally {
+        if (tempArchive.exists()) tempArchive.delete()
+      }
+    }
+  }
+
+  suspend fun deleteGoogleDriveBackup(
+    accessToken: String,
+    driveFileId: String,
+  ): Result<Unit> = withContext(Dispatchers.IO) {
+    runCatching {
+      driveClient.deleteFile(accessToken, driveFileId)
+      auditLogRepo.recordEvent(
+        action = "GOOGLE_DRIVE_DELETE",
+        folderName = "Google Drive",
+        details = "Removed encrypted cloud snapshot from Drive appDataFolder",
+        category = AuditCategory.CLOUD_SYNC,
+      )
+    }
+  }
+
   suspend fun exportEncryptedBackup(
     destinationUri: Uri,
     providerLabel: String,
     dek: SecretKey,
     folderIds: Set<String>? = null,
+    recordAuditAndHistory: Boolean = true,
     onProgress: (CloudBackupProgress) -> Unit = {},
   ): Result<CloudBackupResult> = withContext(Dispatchers.IO) {
     runCatching {
@@ -233,7 +425,7 @@ class CloudBackupManager(
       val manifestFolders = mutableListOf<CloudBackupFolderEntry>()
 
       val digest = MessageDigest.getInstance("SHA-256")
-      val rawOut = context.contentResolver.openOutputStream(destinationUri)
+      val rawOut = openOutputStreamCompat(destinationUri)
         ?: error("Unable to open destination stream for cloud backup")
 
       rawOut.use { stream ->
@@ -303,6 +495,7 @@ class CloudBackupManager(
             )
           }
 
+          val currentSettings = runCatching { prefsRepo.securitySettings.first() }.getOrNull()
           val manifest = CloudBackupManifest(
             createdAt = System.currentTimeMillis(),
             keyFingerprint = fingerprint,
@@ -310,6 +503,16 @@ class CloudBackupManager(
             pinVerifier = pinVerifier,
             pinWrappedDekBase64 = pinWrappedDek,
             folders = manifestFolders,
+            vaultState = currentSettings?.let {
+              CloudBackupVaultState(
+                deviceModel = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim(),
+                obfuscateFilenamesDefault = it.obfuscateFilenamesDefault,
+                autoLockEnabled = it.autoLockEnabled,
+                autoLockTimeoutSeconds = it.autoLockTimeoutSeconds,
+                panicModeEnabled = it.panicModeEnabled,
+                batterySaverModeEnabled = it.batterySaverModeEnabled,
+              )
+            },
           )
           zip.putNextEntry(ZipEntry("manifest.json"))
           zip.write(json.encodeToString(manifest).toByteArray(Charsets.UTF_8))
@@ -330,13 +533,15 @@ class CloudBackupManager(
         totalBytes = totalArchivedBytes,
         sha256Checksum = checksum,
       )
-      vaultDao.insertBackupRecord(record)
-      auditLogRepo.recordEvent(
-        action = "CLOUD_BACKUP",
-        folderName = providerLabel,
-        details = "Uploaded encrypted backup (${manifestFolders.size} folders, $processedFiles files, SHA-256:$checksum)",
-        category = AuditCategory.CLOUD_SYNC,
-      )
+      if (recordAuditAndHistory) {
+        vaultDao.insertBackupRecord(record)
+        auditLogRepo.recordEvent(
+          action = "CLOUD_BACKUP",
+          folderName = providerLabel,
+          details = "Uploaded encrypted backup (${manifestFolders.size} folders, $processedFiles files, SHA-256:$checksum)",
+          category = AuditCategory.CLOUD_SYNC,
+        )
+      }
       CloudBackupResult(record = record, skippedMissingFolders = skippedFolders)
     }
   }
@@ -349,7 +554,7 @@ class CloudBackupManager(
   ): Result<CloudRestoreResult> = withContext(Dispatchers.IO) {
     runCatching {
       var manifest: CloudBackupManifest? = null
-      context.contentResolver.openInputStream(backupUri)?.use { rawIn ->
+      openInputStreamCompat(backupUri)?.use { rawIn ->
         ZipInputStream(BufferedInputStream(rawIn)).use { zip ->
           var entry = zip.nextEntry
           while (entry != null) {
@@ -432,7 +637,7 @@ class CloudBackupManager(
         }
       }
 
-      context.contentResolver.openInputStream(backupUri)?.use { rawIn ->
+      openInputStreamCompat(backupUri)?.use { rawIn ->
         ZipInputStream(BufferedInputStream(rawIn)).use { zip ->
           var entry = zip.nextEntry
           while (entry != null) {
@@ -558,7 +763,24 @@ class CloudBackupManager(
     }
   }
 
+  private fun openInputStreamCompat(uri: Uri) =
+    if (uri.scheme == "file" && !uri.path.isNullOrBlank()) {
+      File(uri.path!!).inputStream()
+    } else {
+      context.contentResolver.openInputStream(uri)
+    }
+
+  private fun openOutputStreamCompat(uri: Uri) =
+    if (uri.scheme == "file" && !uri.path.isNullOrBlank()) {
+      File(uri.path!!).apply { parentFile?.mkdirs() }.outputStream()
+    } else {
+      context.contentResolver.openOutputStream(uri)
+    }
+
   private fun resolveDisplayName(uri: Uri): String? {
+    if (uri.scheme == "file" && !uri.path.isNullOrBlank()) {
+      return File(uri.path!!).name
+    }
     return runCatching {
       context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
         ?.use { cursor ->

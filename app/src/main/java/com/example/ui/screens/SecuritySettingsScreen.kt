@@ -41,6 +41,7 @@ import androidx.compose.material.icons.rounded.LockClock
 import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Timer
+import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material.icons.rounded.Vibration
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.Widgets
@@ -91,11 +92,15 @@ fun SecuritySettingsScreen(
   orphanCount: Int,
   orphanBytes: Long,
   isScanningOrphans: Boolean,
+  isScanningIntegrity: Boolean,
+  lastIntegrityCorruptedCount: Int?,
   onToggleBiometric: (Boolean) -> Unit,
   onToggleAutoLockEnabled: (Boolean) -> Unit,
   onSelectAutoLockSeconds: (Int) -> Unit,
   onToggleAutoLockReencrypt: (Boolean) -> Unit,
   onToggleRequireBioAfterAutoLock: (Boolean) -> Unit,
+  onToggleIdleTimeoutEnabled: (Boolean) -> Unit,
+  onSelectIdleTimeoutSeconds: (Int) -> Unit,
   onTogglePanicMode: (Boolean) -> Unit,
   onSelectPanicSensitivity: (PanicSensitivity) -> Unit,
   onTogglePanicExitToHome: (Boolean) -> Unit,
@@ -113,6 +118,7 @@ fun SecuritySettingsScreen(
   onTogglePreferPatternFallback: (Boolean) -> Unit,
   onUpdateRecoveryQuestions: (q1: String, a1: String, q2: String, a2: String, onDone: () -> Unit) -> Unit,
   onOpenOrphanCleanup: () -> Unit,
+  onOpenIntegrityDiagnostic: () -> Unit,
   onOpenMigrateOut: () -> Unit,
   modifier: Modifier = Modifier,
 ) {
@@ -121,6 +127,7 @@ fun SecuritySettingsScreen(
   var showUpdateQuestionsDialog by remember { mutableStateOf(false) }
   var showOpenSourceSpecDialog by remember { mutableStateOf(false) }
   var showCustomDurationDialog by remember { mutableStateOf(false) }
+  var showCustomIdleDurationDialog by remember { mutableStateOf(false) }
 
   val bioSupported = biometricAvailability == BiometricAvailability.AVAILABLE_STRONG ||
     biometricAvailability == BiometricAvailability.AVAILABLE_WEAK_OR_DEVICE
@@ -371,6 +378,83 @@ fun SecuritySettingsScreen(
                       )
                     },
                     modifier = Modifier.testTag("autolock_chip_custom"),
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Foreground Inactivity Idle Timeout
+      item(key = "idle_timeout_card") {
+        Card(
+          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+          modifier = Modifier.fillMaxWidth(),
+        ) {
+          Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+              Icon(Icons.Rounded.Timer, contentDescription = "Inactivity Idle Timeout", tint = MaterialTheme.colorScheme.primary)
+              Spacer(modifier = Modifier.width(12.dp))
+              Column(modifier = Modifier.weight(1f)) {
+                Text("Inactivity Idle Timeout", style = MaterialTheme.typography.titleSmall)
+                Text(
+                  text = if (settings.idleTimeoutEnabled) {
+                    "Active • Locks vault after ${formatAutoLockDuration(settings.idleTimeoutSeconds)} without activity"
+                  } else {
+                    "Disabled • Foreground inactivity will not lock vault"
+                  },
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              }
+              Switch(
+                checked = settings.idleTimeoutEnabled,
+                onCheckedChange = onToggleIdleTimeoutEnabled,
+                modifier = Modifier.testTag("settings_idle_timeout_switch"),
+              )
+            }
+
+            if (settings.idleTimeoutEnabled) {
+              Text(
+                text = "Resets automatically on touch or input. Active encryption or cloud backup pauses the countdown until finished.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+
+              Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                  Icon(Icons.Rounded.LockClock, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                  Spacer(modifier = Modifier.width(8.dp))
+                  Text("Inactivity Lock Duration", style = MaterialTheme.typography.labelLarge)
+                }
+                val idlePresets = listOf(15 to "15s", 30 to "30s", 60 to "1 min", 120 to "2 min", 300 to "5 min", 900 to "15 min")
+                val isIdlePreset = idlePresets.any { it.first == settings.idleTimeoutSeconds }
+                FlowRow(
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                  verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                  idlePresets.forEach { (sec, label) ->
+                    FilterChip(
+                      selected = settings.idleTimeoutSeconds == sec,
+                      onClick = { onSelectIdleTimeoutSeconds(sec) },
+                      label = { Text(label) },
+                      modifier = Modifier.testTag("idle_timeout_chip_$sec"),
+                    )
+                  }
+                  FilterChip(
+                    selected = !isIdlePreset,
+                    onClick = { showCustomIdleDurationDialog = true },
+                    label = {
+                      Text(
+                        if (!isIdlePreset) {
+                          "Custom (${formatAutoLockDuration(settings.idleTimeoutSeconds)})"
+                        } else {
+                          "Custom..."
+                        },
+                      )
+                    },
+                    modifier = Modifier.testTag("idle_timeout_chip_custom"),
                   )
                 }
               }
@@ -756,6 +840,45 @@ fun SecuritySettingsScreen(
               verticalAlignment = Alignment.CenterVertically,
               modifier = Modifier
                 .fillMaxWidth()
+                .clickable(onClick = onOpenIntegrityDiagnostic)
+                .padding(16.dp)
+                .testTag("settings_integrity_scan_row"),
+            ) {
+              Icon(
+                imageVector = Icons.Rounded.VerifiedUser,
+                contentDescription = null,
+                tint = if ((lastIntegrityCorruptedCount ?: 0) > 0) {
+                  MaterialTheme.colorScheme.error
+                } else {
+                  MaterialTheme.colorScheme.primary
+                },
+              )
+              Spacer(modifier = Modifier.width(12.dp))
+              Column(modifier = Modifier.weight(1f)) {
+                Text("Encrypted File Integrity Diagnostic", style = MaterialTheme.typography.titleSmall)
+                Text(
+                  text = when {
+                    isScanningIntegrity -> "Verifying VLK1 headers & AES-256-GCM chunk tags..."
+                    (lastIntegrityCorruptedCount ?: 0) > 0 ->
+                      "$lastIntegrityCorruptedCount corrupted file(s) detected — tap to view affected names"
+                    lastIntegrityCorruptedCount == 0 ->
+                      "Last scan passed (0 corrupted files) — tap to re-scan"
+                    else -> "Scan .vlock files for tampered headers, bit rot, or truncated chunks"
+                  },
+                  style = MaterialTheme.typography.bodySmall,
+                  color = if ((lastIntegrityCorruptedCount ?: 0) > 0) {
+                    MaterialTheme.colorScheme.error
+                  } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                  },
+                )
+              }
+            }
+
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              modifier = Modifier
+                .fillMaxWidth()
                 .clickable(onClick = onOpenMigrateOut)
                 .padding(16.dp)
                 .testTag("settings_migrate_out_row"),
@@ -846,12 +969,31 @@ fun SecuritySettingsScreen(
   }
 
   if (showCustomDurationDialog) {
-    CustomAutoLockDurationDialog(
+    CustomTimeoutDurationDialog(
+      title = "Custom Auto-Lock Duration",
+      description = "Set how long the app can remain in the background before re-encrypting unlocked folders and requiring authentication.",
+      minSeconds = 1,
       currentSeconds = settings.autoLockTimeoutSeconds,
+      testTagPrefix = "custom_duration",
       onDismiss = { showCustomDurationDialog = false },
       onConfirmSeconds = { seconds ->
         showCustomDurationDialog = false
         onSelectAutoLockSeconds(seconds)
+      },
+    )
+  }
+
+  if (showCustomIdleDurationDialog) {
+    CustomTimeoutDurationDialog(
+      title = "Custom Idle Timeout Duration",
+      description = "Set how long BeastLock can remain open without user activity before automatically locking the vault.",
+      minSeconds = 1,
+      currentSeconds = settings.idleTimeoutSeconds,
+      testTagPrefix = "custom_idle_duration",
+      onDismiss = { showCustomIdleDurationDialog = false },
+      onConfirmSeconds = { seconds ->
+        showCustomIdleDurationDialog = false
+        onSelectIdleTimeoutSeconds(seconds)
       },
     )
   }
@@ -1033,25 +1175,33 @@ private fun UpdateRecoveryQuestionsDialog(
 }
 
 @Composable
-private fun CustomAutoLockDurationDialog(
+private fun CustomTimeoutDurationDialog(
+  title: String,
+  description: String,
+  minSeconds: Int,
   currentSeconds: Int,
+  testTagPrefix: String,
   onDismiss: () -> Unit,
   onConfirmSeconds: (Int) -> Unit,
 ) {
   var useMinutes by remember { mutableStateOf(currentSeconds >= 60 && currentSeconds % 60 == 0) }
   var rawInput by remember {
-    val initial = if (useMinutes) (currentSeconds / 60).coerceAtLeast(1) else currentSeconds.coerceAtLeast(5)
+    val initial = if (useMinutes) {
+      (currentSeconds / 60).coerceAtLeast(1)
+    } else {
+      currentSeconds.coerceAtLeast(minSeconds)
+    }
     mutableStateOf(initial.toString())
   }
   var error by remember { mutableStateOf<String?>(null) }
 
   AlertDialog(
     onDismissRequest = onDismiss,
-    title = { Text("Custom Auto-Lock Duration") },
+    title = { Text(title) },
     text = {
       Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
-          text = "Set how long the app can remain in the background before re-encrypting unlocked folders and requiring biometric authentication.",
+          text = description,
           style = MaterialTheme.typography.bodySmall,
           color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -1060,13 +1210,13 @@ private fun CustomAutoLockDurationDialog(
             selected = !useMinutes,
             onClick = { useMinutes = false },
             label = { Text("Seconds") },
-            modifier = Modifier.testTag("custom_duration_unit_seconds"),
+            modifier = Modifier.testTag("${testTagPrefix}_unit_seconds"),
           )
           FilterChip(
             selected = useMinutes,
             onClick = { useMinutes = true },
             label = { Text("Minutes") },
-            modifier = Modifier.testTag("custom_duration_unit_minutes"),
+            modifier = Modifier.testTag("${testTagPrefix}_unit_minutes"),
           )
         }
         OutlinedTextField(
@@ -1082,7 +1232,7 @@ private fun CustomAutoLockDurationDialog(
           singleLine = true,
           modifier = Modifier
             .fillMaxWidth()
-            .testTag("custom_duration_value_input"),
+            .testTag("${testTagPrefix}_value_input"),
         )
         if (error != null) {
           Text(error!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
@@ -1098,13 +1248,13 @@ private fun CustomAutoLockDurationDialog(
             useMinutes -> parsed * 60
             else -> parsed
           }
-          if (totalSeconds == null || totalSeconds > 86_400) {
-            error = "Enter a valid duration between 1 second and 24 hours."
+          if (totalSeconds == null || totalSeconds < minSeconds || totalSeconds > 86_400) {
+            error = "Enter a valid duration between $minSeconds second(s) and 24 hours."
           } else {
             onConfirmSeconds(totalSeconds)
           }
         },
-        modifier = Modifier.testTag("custom_duration_confirm"),
+        modifier = Modifier.testTag("${testTagPrefix}_confirm"),
       ) {
         Text("Apply Duration")
       }

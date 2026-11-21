@@ -51,6 +51,7 @@ import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -88,6 +89,8 @@ import com.example.data.local.VaultFolderEntity
 import com.example.data.storage.SecurePreviewContent
 import com.example.data.storage.VaultFileItem
 import com.example.ui.components.BatchFileRenameDialog
+import com.example.ui.components.ConfirmRemoveFilesDialog
+import com.example.ui.components.ConfirmRemoveFoldersDialog
 import com.example.ui.components.VaultStatusBadge
 import com.example.ui.components.formatByteSize
 import com.example.ui.components.formatTimestamp
@@ -104,18 +107,23 @@ fun FolderDetailScreen(
   onRefresh: () -> Unit,
   onImportDocuments: (List<Uri>) -> Unit,
   onLockFolder: () -> Unit,
+  onSelectiveLockFolder: () -> Unit,
   onUnlockFolder: () -> Unit,
+  onEncryptFiles: (Set<String>) -> Unit,
+  onDecryptFiles: (Set<String>) -> Unit,
+  onRemoveFiles: (Set<String>) -> Unit,
   onUpdateOptions: (requireBio: Boolean, obfuscateNames: Boolean) -> Unit,
   onToggleAutoCloudSync: (enabled: Boolean) -> Unit,
   onBatchRenameFiles: (Map<String, String>) -> Unit,
   onPeekFile: (VaultFileItem) -> Unit,
   onDismissPreview: () -> Unit,
-  onRemoveFolder: () -> Unit,
+  onRemoveFolder: (decryptLockedSafFirst: Boolean) -> Unit,
 ) {
   var showDeleteConfirm by remember { mutableStateOf(false) }
   var isFileSelectionMode by remember { mutableStateOf(false) }
   var selectedFileIds by remember { mutableStateOf<Set<String>>(emptySet()) }
   var showBatchRenameDialog by remember { mutableStateOf(false) }
+  var pendingRemoveFiles by remember { mutableStateOf<List<VaultFileItem>>(emptyList()) }
   val haptic = LocalHapticFeedback.current
 
   BackHandler {
@@ -221,7 +229,7 @@ fun FolderDetailScreen(
           start = 16.dp,
           end = 16.dp,
           top = 16.dp,
-          bottom = if (isFileSelectionMode) 112.dp else 16.dp,
+          bottom = if (isFileSelectionMode) 156.dp else 16.dp,
         ),
         verticalArrangement = Arrangement.spacedBy(12.dp),
         modifier = Modifier
@@ -255,6 +263,8 @@ fun FolderDetailScreen(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier.fillMaxWidth(),
               ) {
+                val hasRemainingPlaintext = (folder.fileCount - folder.encryptedFileCount) > 0 ||
+                  files.any { !it.isEncrypted }
                 Button(
                   onClick = if (folder.isLocked) onUnlockFolder else onLockFolder,
                   modifier = Modifier
@@ -267,7 +277,41 @@ fun FolderDetailScreen(
                     modifier = Modifier.size(18.dp),
                   )
                   Spacer(modifier = Modifier.width(8.dp))
-                  Text(if (folder.isLocked) "Unlock Folder" else "Lock with AES-256")
+                  Text(
+                    text = if (folder.isLocked) {
+                      if (folder.encryptedFileCount > 0) {
+                        "Unlock All (${folder.encryptedFileCount})"
+                      } else {
+                        "Unlock Folder"
+                      }
+                    } else {
+                      "Lock All"
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                  )
+                }
+                if (hasRemainingPlaintext) {
+                  FilledTonalButton(
+                    onClick = onSelectiveLockFolder,
+                    modifier = Modifier
+                      .weight(1f)
+                      .testTag(
+                        if (folder.isLocked) {
+                          "detail_encrypt_remaining_button"
+                        } else {
+                          "detail_selective_lock_button"
+                        },
+                      ),
+                  ) {
+                    Icon(Icons.Rounded.Checklist, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                      text = if (folder.isLocked) "Encrypt Plain" else "Choose Files",
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis,
+                    )
+                  }
                 }
               }
 
@@ -283,7 +327,7 @@ fun FolderDetailScreen(
                 ) {
                   Icon(Icons.Rounded.NoteAdd, contentDescription = null, modifier = Modifier.size(18.dp))
                   Spacer(modifier = Modifier.width(6.dp))
-                  Text("Import Files", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  Text("Add Files", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 FilledTonalButton(
                   onClick = {
@@ -297,7 +341,7 @@ fun FolderDetailScreen(
                 ) {
                   Icon(Icons.Rounded.AddPhotoAlternate, contentDescription = null, modifier = Modifier.size(18.dp))
                   Spacer(modifier = Modifier.width(6.dp))
-                  Text("Import Photos", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  Text("Add Photos", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
               }
             }
@@ -431,7 +475,7 @@ fun FolderDetailScreen(
               ) {
                 Icon(Icons.Rounded.Checklist, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("Select / Batch Rename")
+                Text("Select / Batch")
               }
             }
           }
@@ -465,7 +509,7 @@ fun FolderDetailScreen(
                 Column(modifier = Modifier.weight(1f)) {
                   Text(
                     text = if (selectedFileIds.isEmpty()) {
-                      "Select files to rename"
+                      "Select files"
                     } else {
                       "${selectedFileIds.size} file(s) selected"
                     },
@@ -473,7 +517,7 @@ fun FolderDetailScreen(
                     fontWeight = FontWeight.SemiBold,
                   )
                   Text(
-                    text = "Renames encrypted headers without decrypting payloads",
+                    text = "Decrypt, encrypt, or rename selected files",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f),
                   )
@@ -619,10 +663,50 @@ fun FolderDetailScreen(
                     modifier = Modifier.testTag("file_checkbox_${file.displayName}"),
                   )
                 } else {
+                  IconButton(
+                    onClick = {
+                      if (file.isEncrypted) {
+                        onDecryptFiles(setOf(file.id))
+                      } else {
+                        onEncryptFiles(setOf(file.id))
+                      }
+                    },
+                    modifier = Modifier.testTag(
+                      if (file.isEncrypted) {
+                        "file_decrypt_${file.displayName}"
+                      } else {
+                        "file_encrypt_${file.displayName}"
+                      },
+                    ),
+                  ) {
+                    Icon(
+                      imageVector = if (file.isEncrypted) Icons.Rounded.LockOpen else Icons.Rounded.Lock,
+                      contentDescription = if (file.isEncrypted) {
+                        "Decrypt ${file.displayName}"
+                      } else {
+                        "Encrypt ${file.displayName}"
+                      },
+                      tint = if (file.isEncrypted) {
+                        MaterialTheme.colorScheme.primary
+                      } else {
+                        MaterialTheme.colorScheme.secondary
+                      },
+                    )
+                  }
                   IconButton(onClick = { onPeekFile(file) }) {
                     Icon(
                       imageVector = Icons.Rounded.Visibility,
                       contentDescription = "Secure preview",
+                    )
+                  }
+                  IconButton(
+                    onClick = { pendingRemoveFiles = listOf(file) },
+                    modifier = Modifier.testTag("file_remove_${file.displayName}"),
+                  ) {
+                    Icon(
+                      imageVector = Icons.Rounded.DeleteOutline,
+                      contentDescription = "Remove ${file.displayName}",
+                      tint = MaterialTheme.colorScheme.error,
                     )
                   }
                 }
@@ -641,6 +725,12 @@ fun FolderDetailScreen(
           .navigationBarsPadding()
           .padding(horizontal = 16.dp, vertical = 14.dp),
       ) {
+        val selectedEncryptedIds = remember(selectedFiles) {
+          selectedFiles.filter { it.isEncrypted }.map { it.id }.toSet()
+        }
+        val selectedPlainIds = remember(selectedFiles) {
+          selectedFiles.filter { !it.isEncrypted }.map { it.id }.toSet()
+        }
         Surface(
           shape = MaterialTheme.shapes.large,
           color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -652,20 +742,80 @@ fun FolderDetailScreen(
             .fillMaxWidth()
             .testTag("file_batch_action_bar"),
         ) {
-          Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+          Column(
+            verticalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
           ) {
-            Button(
-              onClick = { showBatchRenameDialog = true },
-              modifier = Modifier
-                .fillMaxWidth()
-                .testTag("detail_batch_rename_button"),
+            if (selectedEncryptedIds.isNotEmpty() || selectedPlainIds.isNotEmpty()) {
+              Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth(),
+              ) {
+                if (selectedEncryptedIds.isNotEmpty()) {
+                  Button(
+                    onClick = {
+                      val targetIds = selectedEncryptedIds
+                      isFileSelectionMode = false
+                      selectedFileIds = emptySet()
+                      onDecryptFiles(targetIds)
+                    },
+                    modifier = Modifier
+                      .weight(1f)
+                      .testTag("detail_batch_decrypt_button"),
+                  ) {
+                    Icon(Icons.Rounded.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Decrypt (${selectedEncryptedIds.size})", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  }
+                }
+                if (selectedPlainIds.isNotEmpty()) {
+                  FilledTonalButton(
+                    onClick = {
+                      val targetIds = selectedPlainIds
+                      isFileSelectionMode = false
+                      selectedFileIds = emptySet()
+                      onEncryptFiles(targetIds)
+                    },
+                    modifier = Modifier
+                      .weight(1f)
+                      .testTag("detail_batch_encrypt_button"),
+                  ) {
+                    Icon(Icons.Rounded.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Encrypt (${selectedPlainIds.size})", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  }
+                }
+              }
+            }
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.spacedBy(8.dp),
+              modifier = Modifier.fillMaxWidth(),
             ) {
-              Icon(Icons.Rounded.DriveFileRenameOutline, contentDescription = null, modifier = Modifier.size(18.dp))
-              Spacer(modifier = Modifier.width(8.dp))
-              Text("Batch Rename & Sanitize (${selectedFiles.size})")
+              OutlinedButton(
+                onClick = { showBatchRenameDialog = true },
+                modifier = Modifier
+                  .weight(1f)
+                  .testTag("detail_batch_rename_button"),
+              ) {
+                Icon(Icons.Rounded.DriveFileRenameOutline, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Rename (${selectedFiles.size})", maxLines = 1, overflow = TextOverflow.Ellipsis)
+              }
+              OutlinedButton(
+                onClick = { pendingRemoveFiles = selectedFiles },
+                colors = ButtonDefaults.outlinedButtonColors(
+                  contentColor = MaterialTheme.colorScheme.error,
+                ),
+                modifier = Modifier
+                  .weight(1f)
+                  .testTag("detail_batch_remove_button"),
+              ) {
+                Icon(Icons.Rounded.DeleteOutline, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Remove (${selectedFiles.size})", maxLines = 1, overflow = TextOverflow.Ellipsis)
+              }
             }
           }
         }
@@ -710,33 +860,28 @@ fun FolderDetailScreen(
     )
   }
 
+  if (pendingRemoveFiles.isNotEmpty()) {
+    ConfirmRemoveFilesDialog(
+      files = pendingRemoveFiles,
+      onDismiss = { pendingRemoveFiles = emptyList() },
+      onConfirm = {
+        val targetIds = pendingRemoveFiles.map { it.id }.toSet()
+        pendingRemoveFiles = emptyList()
+        isFileSelectionMode = false
+        selectedFileIds = emptySet()
+        onRemoveFiles(targetIds)
+      },
+    )
+  }
+
   if (showDeleteConfirm && folder != null) {
-    AlertDialog(
-      onDismissRequest = { showDeleteConfirm = false },
-      title = { Text("Remove Folder from BeastLock?") },
-      text = {
-        Text(
-          text = if (folder.isInternalVault) {
-            "This deletes the private vault folder \"${folder.name}\" and its contents from BeastLock."
-          } else {
-            "BeastLock will unlock any encrypted files in \"${folder.name}\" first and stop managing it."
-          },
-        )
-      },
-      confirmButton = {
-        Button(
-          onClick = {
-            showDeleteConfirm = false
-            onRemoveFolder()
-            onBack()
-          },
-          modifier = Modifier.testTag("confirm_remove_folder"),
-        ) {
-          Text("Remove")
-        }
-      },
-      dismissButton = {
-        TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") }
+    ConfirmRemoveFoldersDialog(
+      folders = listOf(folder),
+      onDismiss = { showDeleteConfirm = false },
+      onConfirm = { decryptLockedSafFirst ->
+        showDeleteConfirm = false
+        onRemoveFolder(decryptLockedSafFirst)
+        onBack()
       },
     )
   }

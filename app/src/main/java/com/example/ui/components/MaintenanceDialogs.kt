@@ -1,5 +1,7 @@
 package com.example.ui.components
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,18 +16,23 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.CleaningServices
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.DriveFileMove
 import androidx.compose.material.icons.rounded.FolderZip
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -52,16 +59,21 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.local.VaultFolderEntity
+import com.example.data.storage.IntegrityDiagnosticReport
+import com.example.data.storage.IntegrityScanProgress
 import com.example.data.storage.MigrationExportFormat
 import com.example.data.storage.MigrationProgress
 import com.example.data.storage.MigrationResult
 import com.example.data.storage.OrphanCategory
 import com.example.data.storage.OrphanedFileCandidate
+import com.example.data.storage.VaultFileItem
+import com.example.ui.SelectiveLockPromptState
 
 @Composable
 fun OrphanCleanupDialog(
@@ -638,3 +650,794 @@ fun MigrationResultDialog(
     modifier = Modifier.testTag("migration_result_dialog"),
   )
 }
+
+@Composable
+fun IntegrityDiagnosticDialog(
+  isScanning: Boolean,
+  progress: IntegrityScanProgress?,
+  report: IntegrityDiagnosticReport?,
+  onRescan: () -> Unit,
+  onDismiss: () -> Unit,
+) {
+  val context = LocalContext.current
+  var copiedNames by remember(report) { mutableStateOf(false) }
+
+  val hasCorruption = (report?.corruptedFiles?.isNotEmpty() == true)
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    icon = {
+      Icon(
+        imageVector = when {
+          isScanning -> Icons.Rounded.VerifiedUser
+          hasCorruption -> Icons.Rounded.Warning
+          else -> Icons.Rounded.CheckCircle
+        },
+        contentDescription = null,
+        tint = when {
+          isScanning -> MaterialTheme.colorScheme.primary
+          hasCorruption -> MaterialTheme.colorScheme.error
+          else -> MaterialTheme.colorScheme.primary
+        },
+      )
+    },
+    title = {
+      Text(
+        when {
+          isScanning -> "Scanning Vault Integrity"
+          hasCorruption -> "Corrupted Files Detected"
+          else -> "Vault Integrity Diagnostic"
+        },
+      )
+    },
+    text = {
+      Column(
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = Modifier.fillMaxWidth(),
+      ) {
+        Text(
+          text = "Verifies VLK1 headers, AES-256-GCM chunk authentication tags, and EOF sentinels across every encrypted file without writing plaintext.",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        when {
+          isScanning -> {
+            Column(
+              verticalArrangement = Arrangement.spacedBy(8.dp),
+              modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 12.dp),
+            ) {
+              val total = progress?.totalFiles ?: 0
+              val scanned = progress?.scannedFiles ?: 0
+              if (total > 0) {
+                LinearProgressIndicator(
+                  progress = { (scanned.toFloat() / total.toFloat()).coerceIn(0f, 1f) },
+                  modifier = Modifier
+                    .fillMaxWidth()
+                    .height(8.dp)
+                    .clip(RoundedCornerShape(4.dp)),
+                )
+                Text(
+                  text = "$scanned / $total encrypted file(s) checked • ${progress?.corruptedSoFar ?: 0} corrupted",
+                  style = MaterialTheme.typography.labelSmall,
+                  color = MaterialTheme.colorScheme.primary,
+                )
+              } else {
+                LinearProgressIndicator(
+                  modifier = Modifier
+                    .fillMaxWidth()
+                    .height(8.dp)
+                    .clip(RoundedCornerShape(4.dp)),
+                )
+                Text(
+                  text = "Indexing encrypted vault folders...",
+                  style = MaterialTheme.typography.labelSmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              }
+              if (progress != null && progress.currentFileName.isNotBlank()) {
+                Text(
+                  text = "${progress.currentFolderName} • ${progress.currentFileName}",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis,
+                )
+              }
+            }
+          }
+
+          report == null -> {
+            Surface(
+              color = MaterialTheme.colorScheme.surfaceContainerHigh,
+              shape = MaterialTheme.shapes.medium,
+              modifier = Modifier.fillMaxWidth(),
+            ) {
+              Text(
+                text = "Tap Scan Now to check every .vlock file in your vault for header corruption, bit rot, or truncation.",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(14.dp),
+              )
+            }
+          }
+
+          else -> {
+            Row(
+              horizontalArrangement = Arrangement.spacedBy(8.dp),
+              modifier = Modifier.fillMaxWidth(),
+            ) {
+              DiagnosticStatPill(
+                label = "Checked",
+                value = "${report.totalEncryptedFiles}",
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f),
+              )
+              DiagnosticStatPill(
+                label = "Healthy",
+                value = "${report.healthyFiles}",
+                containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                modifier = Modifier.weight(1f),
+              )
+              DiagnosticStatPill(
+                label = "Corrupted",
+                value = "${report.corruptedFiles.size}",
+                containerColor = if (hasCorruption) {
+                  MaterialTheme.colorScheme.errorContainer
+                } else {
+                  MaterialTheme.colorScheme.surfaceContainerHigh
+                },
+                contentColor = if (hasCorruption) {
+                  MaterialTheme.colorScheme.onErrorContainer
+                } else {
+                  MaterialTheme.colorScheme.onSurface
+                },
+                modifier = Modifier.weight(1f),
+              )
+            }
+
+            if (report.skippedFolders.isNotEmpty()) {
+              Surface(
+                color = MaterialTheme.colorScheme.tertiaryContainer,
+                contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier.fillMaxWidth(),
+              ) {
+                Text(
+                  text = "Skipped ${report.skippedFolders.size} folder(s) with revoked SAF access: ${report.skippedFolders.joinToString(", ")}",
+                  style = MaterialTheme.typography.labelSmall,
+                  modifier = Modifier.padding(10.dp),
+                )
+              }
+            }
+
+            if (report.corruptedFiles.isEmpty()) {
+              Surface(
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f),
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier.fillMaxWidth(),
+              ) {
+                Column(
+                  horizontalAlignment = Alignment.CenterHorizontally,
+                  verticalArrangement = Arrangement.spacedBy(4.dp),
+                  modifier = Modifier.padding(14.dp),
+                ) {
+                  Icon(Icons.Rounded.CheckCircle, contentDescription = null, modifier = Modifier.size(26.dp))
+                  Text(
+                    text = if (report.totalEncryptedFiles == 0) {
+                      "No Encrypted Files to Scan"
+                    } else {
+                      "All Encrypted Files Verified"
+                    },
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                  )
+                  Text(
+                    text = if (report.totalEncryptedFiles == 0) {
+                      "Lock a folder or import files to verify cryptographic integrity."
+                    } else {
+                      "Scanned ${report.totalEncryptedFiles} file(s) across ${report.scannedFolders} folder(s) with 0 integrity failures."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                  )
+                }
+              }
+            } else {
+              Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth(),
+              ) {
+                Text(
+                  text = "Affected Files (${report.corruptedFiles.size})",
+                  style = MaterialTheme.typography.labelLarge,
+                  color = MaterialTheme.colorScheme.error,
+                )
+                TextButton(
+                  onClick = {
+                    val text = report.corruptedFiles.joinToString("\n") { item ->
+                      val sub = if (item.relativeSubPath.isBlank()) "" else "/${item.relativeSubPath}"
+                      "${item.affectedName} (${item.folderName}$sub • ${item.category.label})"
+                    }
+                    val cm = context.getSystemService(ClipboardManager::class.java)
+                    cm?.setPrimaryClip(ClipData.newPlainText("Corrupted Vault Files", text))
+                    copiedNames = true
+                  },
+                  modifier = Modifier.testTag("integrity_copy_names_button"),
+                ) {
+                  Icon(Icons.Rounded.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                  Spacer(modifier = Modifier.width(6.dp))
+                  Text(if (copiedNames) "Copied" else "Copy Names")
+                }
+              }
+
+              LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .heightIn(max = 260.dp)
+                  .testTag("integrity_corrupted_list"),
+              ) {
+                itemsIndexed(
+                  items = report.corruptedFiles,
+                  key = { _, item -> item.id },
+                ) { index, item ->
+                  Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier
+                      .fillMaxWidth()
+                      .testTag("integrity_corrupted_item_$index"),
+                  ) {
+                    Column(
+                      verticalArrangement = Arrangement.spacedBy(4.dp),
+                      modifier = Modifier.padding(10.dp),
+                    ) {
+                      Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.fillMaxWidth(),
+                      ) {
+                        Text(
+                          text = item.affectedName,
+                          style = MaterialTheme.typography.bodyMedium,
+                          fontWeight = FontWeight.SemiBold,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis,
+                          modifier = Modifier.weight(1f),
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                          text = formatByteSize(item.sizeBytes),
+                          style = MaterialTheme.typography.labelSmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                      }
+                      val pathInfo = if (item.relativeSubPath.isBlank()) {
+                        item.folderName
+                      } else {
+                        "${item.folderName}/${item.relativeSubPath}"
+                      }
+                      Text(
+                        text = if (item.affectedName != item.diskFileName) {
+                          "$pathInfo • ${item.diskFileName}"
+                        } else {
+                          pathInfo
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                      )
+                      Surface(
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                        shape = RoundedCornerShape(6.dp),
+                      ) {
+                        Text(
+                          text = item.category.label,
+                          style = MaterialTheme.typography.labelSmall,
+                          modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                        )
+                      }
+                      Text(
+                        text = item.reason,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                      )
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    confirmButton = {
+      Button(
+        onClick = onRescan,
+        enabled = !isScanning,
+        modifier = Modifier.testTag("integrity_rescan_button"),
+      ) {
+        Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(if (report == null) "Scan Now" else "Re-Scan")
+      }
+    },
+    dismissButton = {
+      TextButton(
+        onClick = onDismiss,
+        modifier = Modifier.testTag("integrity_close_button"),
+      ) {
+        Text(if (isScanning) "Cancel" else "Close")
+      }
+    },
+    modifier = Modifier.testTag("integrity_diagnostic_dialog"),
+  )
+}
+
+@Composable
+private fun DiagnosticStatPill(
+  label: String,
+  value: String,
+  containerColor: androidx.compose.ui.graphics.Color,
+  contentColor: androidx.compose.ui.graphics.Color,
+  modifier: Modifier = Modifier,
+) {
+  Surface(
+    color = containerColor,
+    contentColor = contentColor,
+    shape = MaterialTheme.shapes.small,
+    modifier = modifier,
+  ) {
+    Column(
+      horizontalAlignment = Alignment.CenterHorizontally,
+      verticalArrangement = Arrangement.spacedBy(2.dp),
+      modifier = Modifier.padding(vertical = 8.dp, horizontal = 6.dp),
+    ) {
+      Text(
+        text = value,
+        style = MaterialTheme.typography.titleMedium,
+        fontWeight = FontWeight.Bold,
+      )
+      Text(
+        text = label,
+        style = MaterialTheme.typography.labelSmall,
+      )
+    }
+  }
+}
+
+@Composable
+fun SelectiveLockFilesDialog(
+  prompt: SelectiveLockPromptState,
+  onConfirm: (selectedFileIds: Set<String>) -> Unit,
+  onDismiss: () -> Unit,
+) {
+  var selectedIds by remember(prompt.folder.id, prompt.plaintextFiles) {
+    mutableStateOf(prompt.plaintextFiles.map { it.id }.toSet())
+  }
+  val allSelected = prompt.plaintextFiles.isNotEmpty() &&
+    prompt.plaintextFiles.all { it.id in selectedIds }
+  val selectedBytes = remember(prompt.plaintextFiles, selectedIds) {
+    prompt.plaintextFiles.filter { it.id in selectedIds }.sumOf { it.sizeBytes }
+  }
+  val excludedCount = (prompt.plaintextFiles.size - selectedIds.size).coerceAtLeast(0)
+
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    icon = {
+      Icon(
+        imageVector = Icons.Rounded.Lock,
+        contentDescription = null,
+        tint = MaterialTheme.colorScheme.primary,
+      )
+    },
+    title = {
+      Text(
+        text = if (prompt.folder.isLocked) {
+          "Encrypt Files in \"${prompt.folder.name}\""
+        } else {
+          "Lock \"${prompt.folder.name}\""
+        },
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+      )
+    },
+    text = {
+      Column(
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = Modifier.fillMaxWidth(),
+      ) {
+        Text(
+          text = "Choose which files to encrypt with AES-256-GCM. Unchecked files stay unencrypted inside the folder.",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (prompt.isLoading) {
+          Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+              .fillMaxWidth()
+              .padding(vertical = 24.dp),
+          ) {
+            Column(
+              horizontalAlignment = Alignment.CenterHorizontally,
+              verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+              CircularProgressIndicator()
+              Text(
+                text = "Reading folder files...",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+          }
+        } else {
+          if (prompt.alreadyEncryptedCount > 0) {
+            Surface(
+              color = MaterialTheme.colorScheme.surfaceContainerHigh,
+              shape = MaterialTheme.shapes.small,
+              modifier = Modifier.fillMaxWidth(),
+            ) {
+              Text(
+                text = "${prompt.alreadyEncryptedCount} file(s) already encrypted in this folder",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+              )
+            }
+          }
+
+          Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier.fillMaxWidth(),
+          ) {
+            Column(modifier = Modifier.weight(1f)) {
+              Text(
+                text = "${selectedIds.size}/${prompt.plaintextFiles.size} to encrypt • ${formatByteSize(selectedBytes)}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+              )
+              if (excludedCount > 0) {
+                Text(
+                  text = "$excludedCount file(s) will stay unencrypted",
+                  style = MaterialTheme.typography.labelSmall,
+                  color = MaterialTheme.colorScheme.secondary,
+                )
+              }
+            }
+            TextButton(
+              onClick = {
+                selectedIds = if (allSelected) {
+                  emptySet()
+                } else {
+                  prompt.plaintextFiles.map { it.id }.toSet()
+                }
+              },
+              modifier = Modifier.testTag("selective_lock_select_all_button"),
+            ) {
+              Text(if (allSelected) "Deselect All" else "Select All")
+            }
+          }
+
+          LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier
+              .fillMaxWidth()
+              .heightIn(max = 260.dp)
+              .testTag("selective_lock_list"),
+          ) {
+            items(prompt.plaintextFiles, key = { it.id }) { file ->
+              val checked = file.id in selectedIds
+              val toggle = {
+                selectedIds = if (checked) selectedIds - file.id else selectedIds + file.id
+              }
+              Surface(
+                color = if (checked) {
+                  MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
+                } else {
+                  MaterialTheme.colorScheme.surfaceContainerHigh
+                },
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .clip(MaterialTheme.shapes.small)
+                  .clickable(onClick = toggle)
+                  .testTag("selective_lock_item_${file.displayName}"),
+              ) {
+                Row(
+                  verticalAlignment = Alignment.CenterVertically,
+                  modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                ) {
+                  Checkbox(
+                    checked = checked,
+                    onCheckedChange = { toggle() },
+                  )
+                  Icon(
+                    imageVector = Icons.Rounded.Description,
+                    contentDescription = null,
+                    tint = if (checked) {
+                      MaterialTheme.colorScheme.primary
+                    } else {
+                      MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier.size(18.dp),
+                  )
+                  Spacer(modifier = Modifier.width(8.dp))
+                  Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                      text = file.displayName,
+                      style = MaterialTheme.typography.bodyMedium,
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                      text = buildString {
+                        append(formatByteSize(file.sizeBytes))
+                        if (file.relativeSubPath.isNotEmpty()) {
+                          append(" • /${file.relativeSubPath}")
+                        }
+                        append(if (checked) " • Encrypt" else " • Keep plain")
+                      },
+                      style = MaterialTheme.typography.labelSmall,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis,
+                    )
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    confirmButton = {
+      Button(
+        onClick = { onConfirm(selectedIds) },
+        enabled = !prompt.isLoading && selectedIds.isNotEmpty(),
+        modifier = Modifier.testTag("selective_lock_confirm_button"),
+      ) {
+        Icon(Icons.Rounded.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
+        Spacer(modifier = Modifier.width(6.dp))
+        Text("Encrypt (${selectedIds.size})")
+      }
+    },
+    dismissButton = {
+      TextButton(
+        onClick = onDismiss,
+        modifier = Modifier.testTag("selective_lock_cancel_button"),
+      ) {
+        Text("Cancel")
+      }
+    },
+    modifier = Modifier.testTag("selective_lock_dialog"),
+  )
+}
+
+@Composable
+fun ConfirmRemoveFoldersDialog(
+  folders: List<VaultFolderEntity>,
+  onDismiss: () -> Unit,
+  onConfirm: (decryptLockedSafFirst: Boolean) -> Unit,
+) {
+  val hasLockedSaf = remember(folders) {
+    folders.any { !it.isInternalVault && (it.isLocked || it.encryptedFileCount > 0) }
+  }
+  val hasPrivate = remember(folders) { folders.any { it.isInternalVault } }
+  val hasSaf = remember(folders) { folders.any { !it.isInternalVault } }
+  var decryptSafFirst by remember(folders) { mutableStateOf(true) }
+
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    icon = {
+      Icon(
+        imageVector = Icons.Rounded.DeleteOutline,
+        contentDescription = null,
+        tint = MaterialTheme.colorScheme.error,
+      )
+    },
+    title = {
+      Text(
+        text = if (folders.size == 1) {
+          "Remove \"${folders.first().name}\"?"
+        } else {
+          "Remove ${folders.size} Folders from Vault?"
+        },
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+      )
+    },
+    text = {
+      Column(
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = Modifier.fillMaxWidth(),
+      ) {
+        Text(
+          text = buildString {
+            if (hasSaf) {
+              append("Device SAF folders will be unlinked from BeastLock's list. ")
+            }
+            if (hasPrivate) {
+              append("Private Vault folders and their sandboxed files will be permanently deleted.")
+            }
+          }.trim(),
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (folders.size > 1) {
+          Surface(
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            shape = MaterialTheme.shapes.small,
+            modifier = Modifier.fillMaxWidth(),
+          ) {
+            LazyColumn(
+              verticalArrangement = Arrangement.spacedBy(4.dp),
+              modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 140.dp)
+                .padding(10.dp),
+            ) {
+              items(folders, key = { it.id }) { folder ->
+                val kind = if (folder.isInternalVault) "Private Vault" else "Device SAF"
+                val lockLabel = if (folder.isLocked) "${folder.encryptedFileCount} encrypted" else "Unlocked"
+                Text(
+                  text = "• ${folder.name} ($kind • $lockLabel)",
+                  style = MaterialTheme.typography.labelMedium,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis,
+                )
+              }
+            }
+          }
+        }
+
+        if (hasLockedSaf) {
+          Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+              .fillMaxWidth()
+              .clip(MaterialTheme.shapes.small)
+              .clickable { decryptSafFirst = !decryptSafFirst }
+              .padding(vertical = 4.dp),
+          ) {
+            Column(modifier = Modifier.weight(1f)) {
+              Text(
+                text = "Decrypt locked device folder(s) first",
+                style = MaterialTheme.typography.titleSmall,
+              )
+              Text(
+                text = if (decryptSafFirst) {
+                  "Restores .vlock files to original files in-place before unlinking"
+                } else {
+                  "Unlinks from list only; .vlock files remain encrypted on device"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+            Switch(
+              checked = decryptSafFirst,
+              onCheckedChange = { decryptSafFirst = it },
+              modifier = Modifier.testTag("remove_folders_decrypt_switch"),
+            )
+          }
+        }
+      }
+    },
+    confirmButton = {
+      Button(
+        onClick = { onConfirm(decryptSafFirst) },
+        colors = ButtonDefaults.buttonColors(
+          containerColor = MaterialTheme.colorScheme.error,
+          contentColor = MaterialTheme.colorScheme.onError,
+        ),
+        modifier = Modifier.testTag("confirm_remove_folders_button"),
+      ) {
+        Text(if (folders.size == 1) "Remove" else "Remove (${folders.size})")
+      }
+    },
+    dismissButton = {
+      TextButton(
+        onClick = onDismiss,
+        modifier = Modifier.testTag("cancel_remove_folders_button"),
+      ) {
+        Text("Cancel")
+      }
+    },
+    modifier = Modifier.testTag("confirm_remove_folders_dialog"),
+  )
+}
+
+@Composable
+fun ConfirmRemoveFilesDialog(
+  files: List<VaultFileItem>,
+  onDismiss: () -> Unit,
+  onConfirm: () -> Unit,
+) {
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    icon = {
+      Icon(
+        imageVector = Icons.Rounded.DeleteOutline,
+        contentDescription = null,
+        tint = MaterialTheme.colorScheme.error,
+      )
+    },
+    title = {
+      Text(
+        text = if (files.size == 1) {
+          "Remove \"${files.first().displayName}\"?"
+        } else {
+          "Remove ${files.size} Files?"
+        },
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+      )
+    },
+    text = {
+      Column(
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = Modifier.fillMaxWidth(),
+      ) {
+        Text(
+          text = "Removes the selected file(s) from this folder and device storage without leaving copies.",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Surface(
+          color = MaterialTheme.colorScheme.surfaceContainerHigh,
+          shape = MaterialTheme.shapes.small,
+          modifier = Modifier.fillMaxWidth(),
+        ) {
+          LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+            modifier = Modifier
+              .fillMaxWidth()
+              .heightIn(max = 160.dp)
+              .padding(10.dp),
+          ) {
+            items(files, key = { it.id }) { file ->
+              Text(
+                text = "• ${file.displayName} (${formatByteSize(file.sizeBytes)})",
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+              )
+            }
+          }
+        }
+      }
+    },
+    confirmButton = {
+      Button(
+        onClick = onConfirm,
+        colors = ButtonDefaults.buttonColors(
+          containerColor = MaterialTheme.colorScheme.error,
+          contentColor = MaterialTheme.colorScheme.onError,
+        ),
+        modifier = Modifier.testTag("confirm_remove_files_button"),
+      ) {
+        Text(if (files.size == 1) "Remove" else "Remove (${files.size})")
+      }
+    },
+    dismissButton = {
+      TextButton(
+        onClick = onDismiss,
+        modifier = Modifier.testTag("cancel_remove_files_button"),
+      ) {
+        Text("Cancel")
+      }
+    },
+    modifier = Modifier.testTag("confirm_remove_files_dialog"),
+  )
+}
+

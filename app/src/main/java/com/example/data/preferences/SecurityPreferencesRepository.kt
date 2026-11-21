@@ -52,6 +52,12 @@ data class SecuritySettings(
   val pendingBatteryPausedReencrypt: Boolean = false,
   val hasPatternLock: Boolean = false,
   val preferPatternFallback: Boolean = false,
+  val googleDriveSyncConnected: Boolean = false,
+  val googleDriveAccountEmail: String = "",
+  val googleDriveAutoSyncEnabled: Boolean = false,
+  val lastGoogleDriveSyncAtMillis: Long = 0L,
+  val idleTimeoutEnabled: Boolean = true,
+  val idleTimeoutSeconds: Int = 120,
 )
 
 class SecurityPreferencesRepository(
@@ -100,6 +106,12 @@ class SecurityPreferencesRepository(
     val PATTERN_VERIFIER = stringPreferencesKey("pattern_verifier")
     val PATTERN_WRAPPED_DEK = stringPreferencesKey("pattern_wrapped_dek")
     val PREFER_PATTERN_FALLBACK = booleanPreferencesKey("prefer_pattern_fallback")
+    val GDRIVE_SYNC_CONNECTED = booleanPreferencesKey("gdrive_sync_connected")
+    val GDRIVE_ACCOUNT_EMAIL = stringPreferencesKey("gdrive_account_email")
+    val GDRIVE_AUTO_SYNC_ENABLED = booleanPreferencesKey("gdrive_auto_sync_enabled")
+    val LAST_GDRIVE_SYNC_AT = longPreferencesKey("last_gdrive_sync_at")
+    val IDLE_TIMEOUT_ENABLED = booleanPreferencesKey("idle_timeout_enabled")
+    val IDLE_TIMEOUT_SECONDS = intPreferencesKey("idle_timeout_seconds")
   }
 
   val securitySettings: Flow<SecuritySettings> = context.securityDataStore.data.map { prefs ->
@@ -146,6 +158,12 @@ class SecurityPreferencesRepository(
       pendingBatteryPausedReencrypt = prefs[Keys.PENDING_BATTERY_PAUSED_REENCRYPT] ?: false,
       hasPatternLock = !prefs[Keys.PATTERN_VERIFIER].isNullOrBlank() && !prefs[Keys.PATTERN_WRAPPED_DEK].isNullOrBlank(),
       preferPatternFallback = prefs[Keys.PREFER_PATTERN_FALLBACK] ?: false,
+      googleDriveSyncConnected = prefs[Keys.GDRIVE_SYNC_CONNECTED] ?: false,
+      googleDriveAccountEmail = prefs[Keys.GDRIVE_ACCOUNT_EMAIL] ?: "",
+      googleDriveAutoSyncEnabled = prefs[Keys.GDRIVE_AUTO_SYNC_ENABLED] ?: false,
+      lastGoogleDriveSyncAtMillis = prefs[Keys.LAST_GDRIVE_SYNC_AT] ?: 0L,
+      idleTimeoutEnabled = prefs[Keys.IDLE_TIMEOUT_ENABLED] ?: true,
+      idleTimeoutSeconds = (prefs[Keys.IDLE_TIMEOUT_SECONDS] ?: 120).coerceAtLeast(1),
     )
   }
 
@@ -467,6 +485,44 @@ class SecurityPreferencesRepository(
   suspend fun setPreferPatternFallback(prefer: Boolean) {
     context.securityDataStore.edit { prefs ->
       prefs[Keys.PREFER_PATTERN_FALLBACK] = prefer
+    }
+  }
+
+  suspend fun setGoogleDriveConnection(connected: Boolean, email: String = "") {
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.GDRIVE_SYNC_CONNECTED] = connected
+      if (email.isNotBlank()) {
+        prefs[Keys.GDRIVE_ACCOUNT_EMAIL] = email
+      } else if (!connected) {
+        prefs.remove(Keys.GDRIVE_ACCOUNT_EMAIL)
+      }
+      if (!connected) {
+        prefs[Keys.GDRIVE_AUTO_SYNC_ENABLED] = false
+      }
+    }
+  }
+
+  suspend fun setGoogleDriveAutoSyncEnabled(enabled: Boolean) {
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.GDRIVE_AUTO_SYNC_ENABLED] = enabled
+    }
+  }
+
+  suspend fun recordGoogleDriveSyncTimestamp(timestampMillis: Long) {
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.LAST_GDRIVE_SYNC_AT] = timestampMillis
+    }
+  }
+
+  suspend fun setIdleTimeoutEnabled(enabled: Boolean) {
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.IDLE_TIMEOUT_ENABLED] = enabled
+    }
+  }
+
+  suspend fun setIdleTimeoutSeconds(seconds: Int) {
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.IDLE_TIMEOUT_SECONDS] = seconds.coerceAtLeast(1)
     }
   }
 

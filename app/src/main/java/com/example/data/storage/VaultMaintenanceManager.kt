@@ -5,6 +5,7 @@ import android.net.Uri
 import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
 import com.example.crypto.AesFolderCipher
+import com.example.crypto.IntegrityFailureCategory
 import com.example.data.audit.AuditCategory
 import com.example.data.audit.EncryptedAuditLogRepository
 import com.example.data.backup.CloudBackupManager
@@ -73,6 +74,39 @@ data class MigrationResult(
   val firstError: String? = null,
 )
 
+data class CorruptedFileReport(
+  val id: String,
+  val affectedName: String,
+  val diskFileName: String,
+  val folderId: String,
+  val folderName: String,
+  val relativeSubPath: String,
+  val sizeBytes: Long,
+  val category: IntegrityFailureCategory,
+  val reason: String,
+  val isInternalVault: Boolean,
+)
+
+data class IntegrityScanProgress(
+  val currentFolderName: String,
+  val currentFileName: String,
+  val scannedFiles: Int,
+  val totalFiles: Int,
+  val corruptedSoFar: Int,
+)
+
+data class IntegrityDiagnosticReport(
+  val scannedAtMillis: Long,
+  val scannedFolders: Int,
+  val totalEncryptedFiles: Int,
+  val healthyFiles: Int,
+  val corruptedFiles: List<CorruptedFileReport>,
+  val skippedFolders: List<String> = emptyList(),
+) {
+  val affectedNames: List<String>
+    get() = corruptedFiles.map { it.affectedName }
+}
+
 /**
  * Handles BeastLock storage hygiene (scanning and clearing orphaned/temporary files from
  * incomplete re-encryption or interrupted cloud sync) and exit-strategy plaintext migration.
@@ -90,6 +124,215 @@ class VaultMaintenanceManager(
     val sizeBytes: Long,
     val openInput: () -> InputStream?,
   )
+
+  private data class EncryptedScanTarget(
+    val id: String,
+    val folder: VaultFolderEntity,
+    val diskFileName: String,
+    val relativeSubPath: String,
+    val sizeBytes: Long,
+    val openInput: () -> InputStream?,
+  )
+
+  suspend fun scanVaultIntegrity(
+    masterDek: SecretKey,
+    onProgress: (IntegrityScanProgress) -> Unit = {},
+  ): IntegrityDiagnosticReport = withContext(Dispatchers.IO) {
+    val folders = vaultDao.getAllFoldersOnce()
+    val targets = mutableListOf<EncryptedScanTarget>()
+    val skippedFolders = mutableListOf<String>()
+
+    for (folder in folders) {
+      currentCoroutineContext().ensureActive()
+      if (folder.isInternalVault) {
+        val root = File(File(context.filesDir, "vaults"), folder.id)
+        if (root.exists()) {
+          root.walkTopDown()
+            .filter {
+              it.isFile &&
+                !isScratchOrMarker(it.name) &&
+                it.name.endsWith(AesFolderCipher.ENCRYPTED_EXTENSION)
+            }
+            .forEach { file ->
+              val rel = file.parentFile?.relativeToOrSelf(root)?.path
+                ?.takeUnless { it == "." || it.isBlank() }
+                ?: ""
+              targets.add(
+                EncryptedScanTarget(
+                  id = "file:${file.absolutePath}",
+                  folder = folder,
+                  diskFileName = file.name,
+                  relativeSubPath = rel,
+                  sizeBytes = file.length(),
+                  openInput = { file.inputStream().buffered() },
+                ),
+              )
+            }
+        }
+      } else {
+        val tree = runCatching {
+          DocumentFile.fromTreeUri(context, Uri.parse(folder.treeUri))
+        }.getOrNull()
+        if (tree == null) {
+          skippedFolders.add(folder.name)
+        } else {
+          collectSafEncryptedTargets(folder, tree, "", targets)
+        }
+      }
+    }
+
+    val totalEncrypted = targets.size
+    val folderKeyCache = HashMap<String, Result<SecretKey>>()
+    val corrupted = mutableListOf<CorruptedFileReport>()
+    var healthyCount = 0
+    var scannedCount = 0
+
+    for (target in targets) {
+      currentCoroutineContext().ensureActive()
+      onProgress(
+        IntegrityScanProgress(
+          currentFolderName = target.folder.name,
+          currentFileName = target.diskFileName,
+          scannedFiles = scannedCount,
+          totalFiles = totalEncrypted,
+          corruptedSoFar = corrupted.size,
+        ),
+      )
+
+      val keyResult = folderKeyCache.getOrPut(target.folder.id) {
+        runCatching { resolveFolderKey(target.folder, masterDek) }
+      }
+      val folderKey = keyResult.getOrNull()
+      if (folderKey == null) {
+        val fallbackName = target.diskFileName
+        corrupted.add(
+          CorruptedFileReport(
+            id = target.id,
+            affectedName = fallbackName,
+            diskFileName = target.diskFileName,
+            folderId = target.folder.id,
+            folderName = target.folder.name,
+            relativeSubPath = target.relativeSubPath,
+            sizeBytes = target.sizeBytes,
+            category = IntegrityFailureCategory.KEY_UNWRAP_FAILED,
+            reason = keyResult.exceptionOrNull()?.message ?: "Unable to unwrap folder encryption key",
+            isInternalVault = target.folder.isInternalVault,
+          ),
+        )
+        scannedCount++
+        continue
+      }
+
+      val stream = runCatching { target.openInput() }.getOrNull()
+      if (stream == null) {
+        corrupted.add(
+          CorruptedFileReport(
+            id = target.id,
+            affectedName = target.diskFileName,
+            diskFileName = target.diskFileName,
+            folderId = target.folder.id,
+            folderName = target.folder.name,
+            relativeSubPath = target.relativeSubPath,
+            sizeBytes = target.sizeBytes,
+            category = IntegrityFailureCategory.UNREADABLE_FILE,
+            reason = "Unable to open encrypted file stream",
+            isInternalVault = target.folder.isInternalVault,
+          ),
+        )
+        scannedCount++
+        continue
+      }
+
+      val verification = stream.use { input ->
+        AesFolderCipher.verifyEncryptedStream(input, folderKey)
+      }
+      if (verification.isValid) {
+        healthyCount++
+      } else {
+        val affectedName = verification.recoveredOriginalName?.takeIf { it.isNotBlank() }
+          ?: target.diskFileName
+        corrupted.add(
+          CorruptedFileReport(
+            id = target.id,
+            affectedName = affectedName,
+            diskFileName = target.diskFileName,
+            folderId = target.folder.id,
+            folderName = target.folder.name,
+            relativeSubPath = target.relativeSubPath,
+            sizeBytes = target.sizeBytes,
+            category = verification.failureCategory ?: IntegrityFailureCategory.CORRUPTED_CHUNK,
+            reason = verification.failureReason ?: "Encrypted stream integrity check failed",
+            isInternalVault = target.folder.isInternalVault,
+          ),
+        )
+      }
+      scannedCount++
+    }
+
+    onProgress(
+      IntegrityScanProgress(
+        currentFolderName = "Complete",
+        currentFileName = "",
+        scannedFiles = scannedCount,
+        totalFiles = totalEncrypted,
+        corruptedSoFar = corrupted.size,
+      ),
+    )
+
+    val report = IntegrityDiagnosticReport(
+      scannedAtMillis = System.currentTimeMillis(),
+      scannedFolders = folders.size,
+      totalEncryptedFiles = totalEncrypted,
+      healthyFiles = healthyCount,
+      corruptedFiles = corrupted,
+      skippedFolders = skippedFolders,
+    )
+
+    val affectedSummary = if (corrupted.isEmpty()) {
+      "Verified $healthyCount/$totalEncrypted encrypted file(s) across ${folders.size} folder(s) — 0 corrupted"
+    } else {
+      val previewNames = corrupted.take(5).joinToString(", ") { it.affectedName }
+      val extra = if (corrupted.size > 5) " (+${corrupted.size - 5} more)" else ""
+      "Detected ${corrupted.size} corrupted file(s) out of $totalEncrypted: $previewNames$extra"
+    }
+    auditLogRepo?.recordEvent(
+      action = "INTEGRITY_SCAN",
+      folderName = "Vault Diagnostics",
+      details = affectedSummary,
+      category = AuditCategory.CRYPTO_OPERATION,
+      isWarning = corrupted.isNotEmpty() || skippedFolders.isNotEmpty(),
+    )
+
+    report
+  }
+
+  private fun collectSafEncryptedTargets(
+    folder: VaultFolderEntity,
+    dir: DocumentFile,
+    relPath: String,
+    out: MutableList<EncryptedScanTarget>,
+  ) {
+    for (child in dir.listFiles()) {
+      val name = child.name ?: continue
+      if (isScratchOrMarker(name)) continue
+      if (child.isDirectory) {
+        val nextRel = if (relPath.isEmpty()) sanitizeSegment(name) else "$relPath/${sanitizeSegment(name)}"
+        collectSafEncryptedTargets(folder, child, nextRel, out)
+      } else if (child.isFile && name.endsWith(AesFolderCipher.ENCRYPTED_EXTENSION)) {
+        val uri = child.uri
+        out.add(
+          EncryptedScanTarget(
+            id = "saf:$uri",
+            folder = folder,
+            diskFileName = name,
+            relativeSubPath = relPath,
+            sizeBytes = child.length(),
+            openInput = { context.contentResolver.openInputStream(uri)?.buffered() },
+          ),
+        )
+      }
+    }
+  }
 
   suspend fun scanOrphanedFiles(
     autoBackupTreeUri: String = "",

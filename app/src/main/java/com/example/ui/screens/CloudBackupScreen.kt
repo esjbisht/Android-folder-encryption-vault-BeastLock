@@ -24,19 +24,27 @@ import androidx.compose.material.icons.rounded.AddToDrive
 import androidx.compose.material.icons.rounded.BatteryAlert
 import androidx.compose.material.icons.rounded.CloudDone
 import androidx.compose.material.icons.rounded.CloudDownload
+import androidx.compose.material.icons.rounded.CloudOff
 import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.CloudUpload
+import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -51,6 +59,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.data.backup.DriveVaultBackupItem
 import com.example.data.local.BackupRecordEntity
 import com.example.data.local.VaultFolderEntity
 import com.example.data.preferences.SecuritySettings
@@ -65,10 +74,21 @@ import java.util.Locale
 fun CloudBackupScreen(
   folders: List<VaultFolderEntity>,
   backupRecords: List<BackupRecordEntity>,
+  driveBackups: List<DriveVaultBackupItem>,
+  isDriveSyncBusy: Boolean,
+  pendingDriveRestoreItem: DriveVaultBackupItem?,
   securitySettings: SecuritySettings,
   devicePowerState: DevicePowerState,
   isBatterySaverBlockingTasks: Boolean,
   pendingRestoreUriRequiringPin: Uri?,
+  onConnectGoogleDrive: () -> Unit,
+  onDisconnectGoogleDrive: () -> Unit,
+  onRefreshGoogleDriveBackups: () -> Unit,
+  onSyncGoogleDriveNow: (selectedFolderIds: Set<String>?) -> Unit,
+  onToggleGoogleDriveAutoSync: (Boolean) -> Unit,
+  onRestoreGoogleDriveBackup: (item: DriveVaultBackupItem, backupPin: String?) -> Unit,
+  onDeleteGoogleDriveBackup: (item: DriveVaultBackupItem) -> Unit,
+  onDismissPendingDriveRestorePin: () -> Unit,
   onExportBackup: (destinationUri: Uri, providerLabel: String, selectedFolderIds: Set<String>?) -> Unit,
   onRestoreBackup: (backupUri: Uri, backupPin: String?) -> Unit,
   onConfigureAutoBackupTree: (treeUri: Uri, providerLabel: String) -> Unit,
@@ -148,10 +168,248 @@ fun CloudBackupScreen(
               )
               Spacer(modifier = Modifier.height(4.dp))
               Text(
-                text = "Backups bundle only AES-256-GCM encrypted payloads (.vlkbak). Google Drive, Dropbox, or any cloud provider never sees plaintext files or filenames.",
+                text = "Backups bundle only AES-256-GCM encrypted payloads (.vlkbak). Google Drive appDataFolder, Dropbox, or any cloud provider never sees plaintext files or filenames.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.9f),
               )
+            }
+          }
+        }
+      }
+
+      // Direct Google Drive API Encrypted Sync Card
+      item(key = "google_drive_api_sync") {
+        val subsetForDrive = if (selectedFolderIds.size == folders.size) null else selectedFolderIds
+        Card(
+          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+          modifier = Modifier
+            .fillMaxWidth()
+            .testTag("google_drive_sync_card"),
+        ) {
+          Column(
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier.padding(16.dp),
+          ) {
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.SpaceBetween,
+              modifier = Modifier.fillMaxWidth(),
+            ) {
+              Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f),
+              ) {
+                Surface(
+                  color = MaterialTheme.colorScheme.primaryContainer,
+                  contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                  shape = MaterialTheme.shapes.small,
+                  modifier = Modifier.size(40.dp),
+                ) {
+                  Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Rounded.AddToDrive, contentDescription = null)
+                  }
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Column {
+                  Text(
+                    text = "Google Drive Encrypted Sync",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                  )
+                  Text(
+                    text = if (securitySettings.googleDriveSyncConnected) {
+                      val account = securitySettings.googleDriveAccountEmail.ifBlank { "Google Account Linked" }
+                      val syncedAt = if (securitySettings.lastGoogleDriveSyncAtMillis > 0L) {
+                        " • Synced ${formatTimestamp(securitySettings.lastGoogleDriveSyncAtMillis)}"
+                      } else ""
+                      "$account$syncedAt"
+                    } else {
+                      "Cross-device sync using hidden Drive appDataFolder"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                  )
+                }
+              }
+
+              if (securitySettings.googleDriveSyncConnected) {
+                IconButton(
+                  onClick = onRefreshGoogleDriveBackups,
+                  enabled = !isDriveSyncBusy,
+                  modifier = Modifier.testTag("refresh_google_drive_button"),
+                ) {
+                  if (isDriveSyncBusy) {
+                    CircularProgressIndicator(
+                      strokeWidth = 2.dp,
+                      modifier = Modifier.size(20.dp),
+                    )
+                  } else {
+                    Icon(
+                      imageVector = Icons.Rounded.Refresh,
+                      contentDescription = "Refresh Google Drive snapshots",
+                    )
+                  }
+                }
+              }
+            }
+
+            if (!securitySettings.googleDriveSyncConnected) {
+              Text(
+                text = "Authorize BeastLock with Google Drive to securely store and restore encrypted .vlkbak vault snapshots across Android devices.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+              Button(
+                onClick = onConnectGoogleDrive,
+                enabled = !isDriveSyncBusy,
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .height(48.dp)
+                  .testTag("connect_google_drive_button"),
+              ) {
+                Icon(Icons.Rounded.AddToDrive, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(if (isDriveSyncBusy) "Authorizing Drive..." else "Connect Google Drive")
+              }
+            } else {
+              Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+              ) {
+                Column(modifier = Modifier.weight(1f)) {
+                  Text(
+                    text = "Auto-Sync Encrypted Vault via Drive",
+                    style = MaterialTheme.typography.titleSmall,
+                  )
+                  Text(
+                    text = "Automatically updates BeastLock_AutoSync.vlkbak after folder encryption or imports",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                }
+                Switch(
+                  checked = securitySettings.googleDriveAutoSyncEnabled,
+                  onCheckedChange = onToggleGoogleDriveAutoSync,
+                  modifier = Modifier.testTag("google_drive_auto_sync_switch"),
+                )
+              }
+
+              Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth(),
+              ) {
+                Button(
+                  onClick = { onSyncGoogleDriveNow(subsetForDrive) },
+                  enabled = !isDriveSyncBusy && folders.isNotEmpty() && selectedFolderIds.isNotEmpty(),
+                  modifier = Modifier
+                    .weight(1f)
+                    .height(48.dp)
+                    .testTag("sync_google_drive_now_button"),
+                ) {
+                  Icon(Icons.Rounded.CloudUpload, contentDescription = null, modifier = Modifier.size(18.dp))
+                  Spacer(modifier = Modifier.width(8.dp))
+                  Text("Sync to Drive Now", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                OutlinedButton(
+                  onClick = onDisconnectGoogleDrive,
+                  enabled = !isDriveSyncBusy,
+                  modifier = Modifier
+                    .height(48.dp)
+                    .testTag("disconnect_google_drive_button"),
+                ) {
+                  Icon(Icons.Rounded.CloudOff, contentDescription = null, modifier = Modifier.size(18.dp))
+                  Spacer(modifier = Modifier.width(6.dp))
+                  Text("Disconnect")
+                }
+              }
+
+              HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+              Text(
+                text = "DRIVE APPDATA SNAPSHOTS (${driveBackups.size})",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+              )
+
+              if (driveBackups.isEmpty()) {
+                Text(
+                  text = "No encrypted snapshots found in Drive appDataFolder yet. Tap Sync to Drive Now or Refresh.",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              } else {
+                driveBackups.forEach { item ->
+                  Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier
+                      .fillMaxWidth()
+                      .testTag("drive_backup_item_${item.id}"),
+                  ) {
+                    Row(
+                      verticalAlignment = Alignment.CenterVertically,
+                      modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    ) {
+                      Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                          text = item.name,
+                          style = MaterialTheme.typography.titleSmall,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis,
+                        )
+                        val countInfo = if (item.folderCount > 0 || item.fileCount > 0) {
+                          "${item.folderCount} folders • ${item.fileCount} files • "
+                        } else ""
+                        val deviceInfo = if (item.deviceModel.isNotBlank()) " • ${item.deviceModel}" else ""
+                        Text(
+                          text = "$countInfo${formatByteSize(item.sizeBytes)}$deviceInfo",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis,
+                        )
+                        if (item.sha256Checksum.isNotBlank() || item.modifiedTimeIso.isNotBlank()) {
+                          Text(
+                            text = buildString {
+                              if (item.sha256Checksum.isNotBlank()) append("SHA-256 ${item.sha256Checksum}")
+                              if (item.sha256Checksum.isNotBlank() && item.modifiedTimeIso.isNotBlank()) append(" • ")
+                              if (item.modifiedTimeIso.isNotBlank()) append(item.modifiedTimeIso.take(16).replace("T", " "))
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                          )
+                        }
+                      }
+                      Spacer(modifier = Modifier.width(6.dp))
+                      FilledTonalButton(
+                        onClick = { onRestoreGoogleDriveBackup(item, null) },
+                        enabled = !isDriveSyncBusy,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.testTag("restore_drive_backup_${item.id}"),
+                      ) {
+                        Text("Restore")
+                      }
+                      IconButton(
+                        onClick = { onDeleteGoogleDriveBackup(item) },
+                        enabled = !isDriveSyncBusy,
+                        modifier = Modifier.testTag("delete_drive_backup_${item.id}"),
+                      ) {
+                        Icon(
+                          imageVector = Icons.Rounded.DeleteOutline,
+                          contentDescription = "Delete Drive backup ${item.name}",
+                          tint = MaterialTheme.colorScheme.error,
+                        )
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -482,6 +740,15 @@ fun CloudBackupScreen(
       onDismiss = onDismissPendingRestorePin,
       onConfirmPin = { pin ->
         onRestoreBackup(pendingRestoreUriRequiringPin, pin)
+      },
+    )
+  }
+
+  if (pendingDriveRestoreItem != null) {
+    RestoreArchivePinDialog(
+      onDismiss = onDismissPendingDriveRestorePin,
+      onConfirmPin = { pin ->
+        onRestoreGoogleDriveBackup(pendingDriveRestoreItem, pin)
       },
     )
   }

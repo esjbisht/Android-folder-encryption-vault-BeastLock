@@ -3,6 +3,7 @@ package com.example.data.storage
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
@@ -52,6 +53,20 @@ data class BatchFolderResult(
   val totalBytes: Long,
   val firstError: String? = null,
   val skippedCount: Int = 0,
+)
+
+data class ImportFilesResult(
+  val importedCount: Int,
+  val movedWithoutCopyCount: Int,
+  val readOnlySourceCount: Int,
+)
+
+data class DecryptAnyFolderResult(
+  val folderName: String,
+  val decryptedFiles: Int,
+  val decryptedBytes: Long,
+  val alreadyPlainFiles: Int,
+  val wasRegisteredInVault: Boolean,
 )
 
 sealed interface RotateFolderOutcome {
@@ -131,6 +146,11 @@ class FolderLockerRepository(
             "BATCH_KEY_ROTATED",
             "FILES_BATCH_RENAMED",
             "FOLDERS_BATCH_RENAMED",
+            "FILES_ENCRYPTED",
+            "FILE_DECRYPTED",
+            "ANY_FOLDER_DECRYPTED",
+            "FILES_REMOVED",
+            "FOLDERS_BATCH_REMOVED",
           ) ->
             AuditCategory.CRYPTO_OPERATION
           else -> AuditCategory.ACCESS_EVENT
@@ -188,7 +208,7 @@ class FolderLockerRepository(
         return@runCatching refreshFolderMetricsInternal(existing, dek = null)
       }
 
-      val docTree = DocumentFile.fromTreeUri(context, treeUri)
+      val docTree = resolveTreeDocumentFile(treeUri)
         ?: error("Unable to open selected folder")
       val displayName = docTree.name?.takeIf { it.isNotBlank() } ?: "Protected Folder"
       val stats = inspectSafStats(docTree)
@@ -262,14 +282,29 @@ class FolderLockerRepository(
     folderId: String,
     uris: List<Uri>,
     dek: SecretKey?,
-  ): Result<Int> = withContext(Dispatchers.IO) {
+  ): Result<Int> = importFilesWithReport(
+    folderId = folderId,
+    uris = uris,
+    dek = dek,
+    moveOriginals = false,
+  ).map { it.importedCount }
+
+  suspend fun importFilesWithReport(
+    folderId: String,
+    uris: List<Uri>,
+    dek: SecretKey?,
+    moveOriginals: Boolean = true,
+  ): Result<ImportFilesResult> = withContext(Dispatchers.IO) {
     runCatching {
       val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
       val folderKey = dek?.let { resolveFolderKey(folder, it) }
       var imported = 0
+      var movedCount = 0
+      var readOnlyCount = 0
       for (sourceUri in uris) {
-        val (fileName, mimeType) = queryUriMetadata(sourceUri)
+        val (fileName, mimeType, knownSize) = queryUriMetadata(sourceUri)
         val inputStream = context.contentResolver.openInputStream(sourceUri) ?: continue
+        var writeCompleted = false
         inputStream.use { input ->
           if (folder.isInternalVault) {
             val dir = internalFolderDir(folder.id)
@@ -281,71 +316,184 @@ class FolderLockerRepository(
                 uniqueLocalFile(dir, "$fileName${AesFolderCipher.ENCRYPTED_EXTENSION}").name
               }
               val targetFile = File(dir, targetName)
-              val tempBytes = input.readBytes()
-              targetFile.outputStream().use { out ->
-                AesFolderCipher.encryptStream(
-                  input = ByteArrayInputStream(tempBytes),
-                  output = out,
-                  key = folderKey,
-                  metadata = EncryptedFileMetadata(
-                    originalName = fileName,
-                    mimeType = mimeType,
-                    originalSize = tempBytes.size.toLong(),
-                    encryptedAt = System.currentTimeMillis(),
-                  ),
-                )
+              val tempOut = File(dir, ".tmp_${UUID.randomUUID()}")
+              if (knownSize != null && knownSize >= 0L) {
+                // Direct single-pass stream into encrypted container without staging copy
+                try {
+                  tempOut.outputStream().use { out ->
+                    AesFolderCipher.encryptStream(
+                      input = input,
+                      output = out,
+                      key = folderKey,
+                      metadata = EncryptedFileMetadata(
+                        originalName = fileName,
+                        mimeType = mimeType,
+                        originalSize = knownSize,
+                        encryptedAt = System.currentTimeMillis(),
+                      ),
+                    )
+                  }
+                  if (!tempOut.renameTo(targetFile)) {
+                    tempOut.copyTo(targetFile, overwrite = true)
+                    tempOut.delete()
+                  }
+                  writeCompleted = true
+                } catch (t: Throwable) {
+                  tempOut.delete()
+                  throw t
+                }
+              } else {
+                val stagingFile = File(context.cacheDir, ".tmp_import_${UUID.randomUUID()}")
+                try {
+                  val plainSize = stagingFile.outputStream().use { stagingOut ->
+                    input.copyTo(stagingOut, bufferSize = 64 * 1024)
+                  }
+                  try {
+                    stagingFile.inputStream().use { stagedIn ->
+                      tempOut.outputStream().use { out ->
+                        AesFolderCipher.encryptStream(
+                          input = stagedIn,
+                          output = out,
+                          key = folderKey,
+                          metadata = EncryptedFileMetadata(
+                            originalName = fileName,
+                            mimeType = mimeType,
+                            originalSize = plainSize,
+                            encryptedAt = System.currentTimeMillis(),
+                          ),
+                        )
+                      }
+                    }
+                    if (!tempOut.renameTo(targetFile)) {
+                      tempOut.copyTo(targetFile, overwrite = true)
+                      tempOut.delete()
+                    }
+                    writeCompleted = true
+                  } catch (t: Throwable) {
+                    tempOut.delete()
+                    throw t
+                  }
+                } finally {
+                  stagingFile.delete()
+                }
               }
             } else {
               val targetFile = uniqueLocalFile(dir, fileName)
-              targetFile.outputStream().use { out -> input.copyTo(out) }
+              targetFile.outputStream().use { out -> input.copyTo(out, bufferSize = 64 * 1024) }
+              writeCompleted = true
             }
             imported++
           } else {
-            val tree = DocumentFile.fromTreeUri(context, Uri.parse(folder.treeUri))
+            val tree = resolveTreeDocumentFile(Uri.parse(folder.treeUri))
               ?: error("Folder access permission lost")
             if (folder.isLocked && folderKey != null) {
-              val tempBytes = input.readBytes()
               val targetName = if (folder.obfuscateFilenames) {
                 "${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}"
               } else {
-                "$fileName${AesFolderCipher.ENCRYPTED_EXTENSION}"
+                uniqueSafName(tree, "$fileName${AesFolderCipher.ENCRYPTED_EXTENSION}")
               }
-              val created = tree.createFile("application/octet-stream", targetName)
+              val created = createSafFile(tree, "application/octet-stream", targetName)
                 ?: error("Failed to create encrypted file")
-              context.contentResolver.openOutputStream(created.uri)?.use { out ->
-                AesFolderCipher.encryptStream(
-                  input = ByteArrayInputStream(tempBytes),
-                  output = out,
-                  key = folderKey,
-                  metadata = EncryptedFileMetadata(
-                    originalName = fileName,
-                    mimeType = mimeType,
-                    originalSize = tempBytes.size.toLong(),
-                    encryptedAt = System.currentTimeMillis(),
-                  ),
-                )
+              if (knownSize != null && knownSize >= 0L) {
+                try {
+                  val outStream = context.contentResolver.openOutputStream(created.uri)
+                    ?: error("Unable to open output stream for $targetName")
+                  outStream.use { out ->
+                    AesFolderCipher.encryptStream(
+                      input = input,
+                      output = out,
+                      key = folderKey,
+                      metadata = EncryptedFileMetadata(
+                        originalName = fileName,
+                        mimeType = mimeType,
+                        originalSize = knownSize,
+                        encryptedAt = System.currentTimeMillis(),
+                      ),
+                    )
+                  }
+                  writeCompleted = true
+                } catch (t: Throwable) {
+                  created.delete()
+                  throw t
+                }
+              } else {
+                val stagingFile = File(context.cacheDir, ".tmp_import_${UUID.randomUUID()}")
+                try {
+                  val plainSize = stagingFile.outputStream().use { stagingOut ->
+                    input.copyTo(stagingOut, bufferSize = 64 * 1024)
+                  }
+                  try {
+                    val outStream = context.contentResolver.openOutputStream(created.uri)
+                      ?: error("Unable to open output stream for $targetName")
+                    outStream.use { out ->
+                      stagingFile.inputStream().use { stagedIn ->
+                        AesFolderCipher.encryptStream(
+                          input = stagedIn,
+                          output = out,
+                          key = folderKey,
+                          metadata = EncryptedFileMetadata(
+                            originalName = fileName,
+                            mimeType = mimeType,
+                            originalSize = plainSize,
+                            encryptedAt = System.currentTimeMillis(),
+                          ),
+                        )
+                      }
+                    }
+                    writeCompleted = true
+                  } catch (t: Throwable) {
+                    created.delete()
+                    throw t
+                  }
+                } finally {
+                  stagingFile.delete()
+                }
               }
             } else {
-              val created = tree.createFile(mimeType, fileName)
+              val created = createSafFile(tree, mimeType, uniqueSafName(tree, fileName))
                 ?: error("Failed to import file into folder")
-              context.contentResolver.openOutputStream(created.uri)?.use { out ->
-                input.copyTo(out)
+              try {
+                val outStream = context.contentResolver.openOutputStream(created.uri)
+                  ?: error("Unable to open output stream for $fileName")
+                outStream.use { out ->
+                  input.copyTo(out, bufferSize = 64 * 1024)
+                }
+                writeCompleted = true
+              } catch (t: Throwable) {
+                created.delete()
+                throw t
               }
             }
             imported++
           }
         }
+        if (writeCompleted && moveOriginals) {
+          if (tryDeleteExternalSourceUri(sourceUri)) {
+            movedCount++
+          } else {
+            readOnlyCount++
+          }
+        }
       }
       refreshFolderMetricsInternal(folder, dek)
       if (imported > 0) {
+        val moveNote = when {
+          moveOriginals && movedCount == imported -> " (moved without duplicate copies)"
+          moveOriginals && movedCount > 0 -> " ($movedCount moved, $readOnlyCount from read-only picker)"
+          else -> ""
+        }
         logEvent(
           folderId = folder.id,
           folderName = folder.name,
           action = "FILE_IMPORTED",
-          details = "Imported $imported file(s)${if (folder.isLocked) " and encrypted immediately" else ""}",
+          details = "Imported $imported file(s)${if (folder.isLocked) " and encrypted immediately" else ""}$moveNote",
         )
       }
-      imported
+      ImportFilesResult(
+        importedCount = imported,
+        movedWithoutCopyCount = movedCount,
+        readOnlySourceCount = readOnlyCount,
+      )
     }
   }
 
@@ -361,7 +509,7 @@ class FolderLockerRepository(
           collectInternalFiles(folder.id, root, root, folderKey, results)
           results.sortedWith(compareByDescending<VaultFileItem> { it.isEncrypted }.thenBy { it.displayName.lowercase() })
         } else {
-          val tree = DocumentFile.fromTreeUri(context, Uri.parse(folder.treeUri))
+          val tree = resolveTreeDocumentFile(Uri.parse(folder.treeUri))
             ?: error("Permission to access folder was revoked")
           val results = mutableListOf<VaultFileItem>()
           collectSafFiles(folder.id, tree, "", folderKey, results)
@@ -373,6 +521,7 @@ class FolderLockerRepository(
   suspend fun lockFolder(
     folderId: String,
     dek: SecretKey,
+    selectedFileIds: Set<String>? = null,
     onProgress: (EncryptionProgress) -> Unit = {},
   ): Result<VaultFolderEntity> = withContext(Dispatchers.IO) {
     runCatching {
@@ -388,7 +537,8 @@ class FolderLockerRepository(
           .filter {
             it.isFile &&
               !it.name.endsWith(AesFolderCipher.ENCRYPTED_EXTENSION) &&
-              !isInternalScratchFile(it.name)
+              !isInternalScratchFile(it.name) &&
+              (selectedFileIds == null || it.absolutePath in selectedFileIds)
           }
           .toList()
         val totalBytes = plainFiles.sumOf { it.length() }
@@ -405,6 +555,7 @@ class FolderLockerRepository(
               totalBytes = totalBytes,
             ),
           )
+          val origBytes = file.length()
           val encryptedName = if (folder.obfuscateFilenames) {
             "${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}"
           } else {
@@ -413,36 +564,53 @@ class FolderLockerRepository(
           val targetFile = uniqueLocalFile(file.parentFile ?: root, encryptedName)
           val tempFile = File(file.parentFile ?: root, ".tmp_${UUID.randomUUID()}")
           val mime = guessMimeType(file.name)
-          file.inputStream().use { input ->
-            tempFile.outputStream().use { output ->
-              AesFolderCipher.encryptStream(
-                input = input,
-                output = output,
-                key = folderKey,
-                metadata = EncryptedFileMetadata(
-                  originalName = file.name,
-                  mimeType = mime,
-                  originalSize = file.length(),
-                  encryptedAt = System.currentTimeMillis(),
-                ),
-              )
+          try {
+            file.inputStream().use { input ->
+              tempFile.outputStream().use { output ->
+                AesFolderCipher.encryptStream(
+                  input = input,
+                  output = output,
+                  key = folderKey,
+                  metadata = EncryptedFileMetadata(
+                    originalName = file.name,
+                    mimeType = mime,
+                    originalSize = origBytes,
+                    encryptedAt = System.currentTimeMillis(),
+                  ),
+                )
+              }
             }
-          }
-          if (!tempFile.renameTo(targetFile)) {
-            tempFile.copyTo(targetFile, overwrite = true)
+            if (!tempFile.renameTo(targetFile)) {
+              tempFile.copyTo(targetFile, overwrite = true)
+              tempFile.delete()
+            }
+            if (!file.delete() && file.exists()) {
+              targetFile.delete()
+              error("Could not remove original file '${file.name}' without leaving a duplicate copy")
+            }
+          } catch (t: Throwable) {
             tempFile.delete()
+            throw t
           }
-          processedBytes += file.length()
-          file.delete()
+          processedBytes += origBytes
           processed++
         }
-        val nomedia = File(root, NOMEDIA_FILE)
-        if (!nomedia.exists()) nomedia.createNewFile()
+        val hasEncrypted = processed > 0 || root.walkTopDown()
+          .any { it.isFile && it.name.endsWith(AesFolderCipher.ENCRYPTED_EXTENSION) }
+        if (selectedFileIds == null || hasEncrypted) {
+          val nomedia = File(root, NOMEDIA_FILE)
+          if (!nomedia.exists()) nomedia.createNewFile()
+        }
       } else {
-        val tree = DocumentFile.fromTreeUri(context, Uri.parse(folder.treeUri))
+        val tree = resolveTreeDocumentFile(Uri.parse(folder.treeUri))
           ?: error("Folder access permission unavailable")
-        val plainDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
-        gatherPlainSafDocs(tree, plainDocs)
+        val allPlainDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
+        gatherPlainSafDocs(tree, allPlainDocs)
+        val plainDocs = if (selectedFileIds == null) {
+          allPlainDocs
+        } else {
+          allPlainDocs.filter { (doc, _) -> doc.uri.toString() in selectedFileIds }
+        }
         val totalBytes = plainDocs.sumOf { it.first.length() }
 
         for ((doc, parent) in plainDocs) {
@@ -462,15 +630,19 @@ class FolderLockerRepository(
           val targetName = if (folder.obfuscateFilenames) {
             "${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}"
           } else {
-            "$origName${AesFolderCipher.ENCRYPTED_EXTENSION}"
+            uniqueSafName(parent, "$origName${AesFolderCipher.ENCRYPTED_EXTENSION}")
           }
-          val outDoc = parent.createFile("application/octet-stream", targetName)
+          val outDoc = createSafFile(parent, "application/octet-stream", targetName)
             ?: error("Could not create encrypted file in folder")
           val mime = doc.type ?: guessMimeType(origName)
           var encryptedOk = false
           try {
-            context.contentResolver.openInputStream(doc.uri)?.use { input ->
-              context.contentResolver.openOutputStream(outDoc.uri)?.use { output ->
+            val inStream = context.contentResolver.openInputStream(doc.uri)
+              ?: error("Cannot read source file $origName")
+            inStream.use { input ->
+              val outStream = context.contentResolver.openOutputStream(outDoc.uri)
+                ?: error("Cannot write encrypted file $targetName")
+              outStream.use { output ->
                 AesFolderCipher.encryptStream(
                   input = input,
                   output = output,
@@ -485,29 +657,178 @@ class FolderLockerRepository(
                 encryptedOk = true
               }
             }
+            if (encryptedOk && !deleteSafDocStrict(doc)) {
+              error("Could not remove original file '$origName' — aborted to prevent duplicate copy")
+            }
           } catch (t: Throwable) {
-            outDoc.delete()
+            deleteSafDocStrict(outDoc)
             throw t
-          }
-          if (encryptedOk) {
-            doc.delete()
           }
           processedBytes += origSize
           processed++
         }
-        if (tree.findFile(NOMEDIA_FILE) == null) {
-          tree.createFile("application/octet-stream", NOMEDIA_FILE)
+        val remainingEnc = mutableListOf<Pair<DocumentFile, DocumentFile>>()
+        gatherEncryptedSafDocs(tree, remainingEnc)
+        if ((selectedFileIds == null || remainingEnc.isNotEmpty()) && tree.findFile(NOMEDIA_FILE) == null) {
+          createSafFile(tree, "application/octet-stream", NOMEDIA_FILE)
         }
       }
 
-      val updated = refreshFolderMetricsInternal(folder.copy(isLocked = true), dek)
-        .copy(isLocked = true, lastActionTimestamp = System.currentTimeMillis())
+      val refreshed = refreshFolderMetricsInternal(folder.copy(isLocked = true), dek)
+      val keepLocked = refreshed.encryptedFileCount > 0 || selectedFileIds == null
+      val updated = refreshed.copy(
+        isLocked = keepLocked,
+        lastActionTimestamp = System.currentTimeMillis(),
+      )
+      vaultDao.upsertFolder(updated)
+      val remainingPlain = (updated.fileCount - updated.encryptedFileCount).coerceAtLeast(0)
+      val exclusionNote = if (remainingPlain > 0) "; $remainingPlain kept unencrypted" else ""
+      logEvent(
+        folderId = updated.id,
+        folderName = updated.name,
+        action = if (folder.isLocked && selectedFileIds != null) "FILES_ENCRYPTED" else "LOCKED",
+        details = "AES-256-GCM encrypted $processed file(s) (${formatSize(processedBytes)})$exclusionNote",
+      )
+      updated
+    }
+  }
+
+  suspend fun decryptFilesInFolder(
+    folderId: String,
+    fileIds: Set<String>,
+    dek: SecretKey,
+    onProgress: (EncryptionProgress) -> Unit = {},
+  ): Result<VaultFolderEntity> = withContext(Dispatchers.IO) {
+    runCatching {
+      require(fileIds.isNotEmpty()) { "Select at least one encrypted file to decrypt" }
+      val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
+      val folderKey = resolveFolderKey(folder, dek)
+      var processed = 0
+      var processedBytes = 0L
+
+      if (folder.isInternalVault) {
+        val root = internalFolderDir(folder.id)
+        if (!root.exists()) root.mkdirs()
+        val encryptedFiles = root.walkTopDown()
+          .filter {
+            it.isFile &&
+              it.name.endsWith(AesFolderCipher.ENCRYPTED_EXTENSION) &&
+              it.absolutePath in fileIds
+          }
+          .toList()
+        val totalBytes = encryptedFiles.sumOf { it.length() }
+
+        for (encFile in encryptedFiles) {
+          val parent = encFile.parentFile ?: root
+          val tempPlain = File(parent, ".dec_${UUID.randomUUID()}")
+          var meta: EncryptedFileMetadata? = null
+          try {
+            encFile.inputStream().use { input ->
+              tempPlain.outputStream().use { output ->
+                meta = AesFolderCipher.decryptStream(input, output, folderKey)
+              }
+            }
+          } catch (t: Throwable) {
+            tempPlain.delete()
+            throw t
+          }
+          val resolvedMeta = meta ?: error("Missing metadata after decryption")
+          onProgress(
+            EncryptionProgress(
+              folderName = folder.name,
+              isLocking = false,
+              currentFileName = resolvedMeta.originalName,
+              processedFiles = processed,
+              totalFiles = encryptedFiles.size,
+              processedBytes = processedBytes,
+              totalBytes = totalBytes,
+            ),
+          )
+          val encLen = encFile.length()
+          val restoredFile = uniqueLocalFile(parent, sanitizeFileName(resolvedMeta.originalName))
+          if (!tempPlain.renameTo(restoredFile)) {
+            tempPlain.copyTo(restoredFile, overwrite = true)
+            tempPlain.delete()
+          }
+          if (!encFile.delete() && encFile.exists()) {
+            restoredFile.delete()
+            error("Could not remove encrypted source '${encFile.name}' without leaving a duplicate copy")
+          }
+          processedBytes += encLen
+          processed++
+        }
+        val anyEncryptedRemaining = root.walkTopDown()
+          .any { it.isFile && it.name.endsWith(AesFolderCipher.ENCRYPTED_EXTENSION) }
+        if (!anyEncryptedRemaining) {
+          File(root, NOMEDIA_FILE).takeIf { it.exists() }?.delete()
+        }
+      } else {
+        val tree = resolveTreeDocumentFile(Uri.parse(folder.treeUri))
+          ?: error("Folder access permission unavailable")
+        val allEncryptedDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
+        gatherEncryptedSafDocs(tree, allEncryptedDocs)
+        val encryptedDocs = allEncryptedDocs.filter { (doc, _) -> doc.uri.toString() in fileIds }
+        val totalBytes = encryptedDocs.sumOf { it.first.length() }
+
+        for ((encDoc, parent) in encryptedDocs) {
+          val meta = context.contentResolver.openInputStream(encDoc.uri)?.use { input ->
+            AesFolderCipher.readMetadata(input, folderKey)
+          } ?: error("Cannot read encrypted header")
+
+          onProgress(
+            EncryptionProgress(
+              folderName = folder.name,
+              isLocking = false,
+              currentFileName = meta.originalName,
+              processedFiles = processed,
+              totalFiles = encryptedDocs.size,
+              processedBytes = processedBytes,
+              totalBytes = totalBytes,
+            ),
+          )
+
+          val safeName = uniqueSafName(parent, sanitizeFileName(meta.originalName))
+          val targetDoc = createSafFile(parent, meta.mimeType.ifBlank { "application/octet-stream" }, safeName)
+            ?: error("Could not restore decrypted file")
+
+          var decryptedOk = false
+          val encLen = encDoc.length()
+          try {
+            val inStream = context.contentResolver.openInputStream(encDoc.uri)
+              ?: error("Cannot read encrypted file ${encDoc.name ?: safeName}")
+            inStream.use { input ->
+              val outStream = context.contentResolver.openOutputStream(targetDoc.uri)
+                ?: error("Cannot write decrypted file $safeName")
+              outStream.use { output ->
+                AesFolderCipher.decryptStream(input, output, folderKey)
+                decryptedOk = true
+              }
+            }
+            if (decryptedOk && !deleteSafDocStrict(encDoc)) {
+              error("Could not remove encrypted file '${encDoc.name ?: safeName}' — aborted to prevent duplicate copy")
+            }
+          } catch (t: Throwable) {
+            deleteSafDocStrict(targetDoc)
+            throw t
+          }
+          processedBytes += encLen
+          processed++
+        }
+        val remainingEncrypted = mutableListOf<Pair<DocumentFile, DocumentFile>>()
+        gatherEncryptedSafDocs(tree, remainingEncrypted)
+        if (remainingEncrypted.isEmpty()) {
+          tree.findFile(NOMEDIA_FILE)?.let { deleteSafDocStrict(it) }
+        }
+      }
+
+      val updated = refreshFolderMetricsInternal(folder, dek)
+        .copy(lastActionTimestamp = System.currentTimeMillis())
       vaultDao.upsertFolder(updated)
       logEvent(
         folderId = updated.id,
         folderName = updated.name,
-        action = "LOCKED",
-        details = "AES-256-GCM encrypted $processed file(s) (${formatSize(processedBytes)})",
+        action = "FILE_DECRYPTED",
+        details = "Verified GCM tags & decrypted $processed selected file(s) (${formatSize(processedBytes)})",
       )
       updated
     }
@@ -558,18 +879,22 @@ class FolderLockerRepository(
               totalBytes = totalBytes,
             ),
           )
+          val encLen = encFile.length()
           val restoredFile = uniqueLocalFile(parent, sanitizeFileName(resolvedMeta.originalName))
           if (!tempPlain.renameTo(restoredFile)) {
             tempPlain.copyTo(restoredFile, overwrite = true)
             tempPlain.delete()
           }
-          processedBytes += encFile.length()
-          encFile.delete()
+          if (!encFile.delete() && encFile.exists()) {
+            restoredFile.delete()
+            error("Could not remove encrypted source '${encFile.name}' without leaving a duplicate copy")
+          }
+          processedBytes += encLen
           processed++
         }
         File(root, NOMEDIA_FILE).takeIf { it.exists() }?.delete()
       } else {
-        val tree = DocumentFile.fromTreeUri(context, Uri.parse(folder.treeUri))
+        val tree = resolveTreeDocumentFile(Uri.parse(folder.treeUri))
           ?: error("Folder access permission unavailable")
         val encryptedDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
         gatherEncryptedSafDocs(tree, encryptedDocs)
@@ -592,29 +917,34 @@ class FolderLockerRepository(
             ),
           )
 
-          val safeName = sanitizeFileName(meta.originalName)
-          val targetDoc = parent.createFile(meta.mimeType.ifBlank { "application/octet-stream" }, safeName)
+          val safeName = uniqueSafName(parent, sanitizeFileName(meta.originalName))
+          val targetDoc = createSafFile(parent, meta.mimeType.ifBlank { "application/octet-stream" }, safeName)
             ?: error("Could not restore decrypted file")
 
           var decryptedOk = false
+          val encLen = encDoc.length()
           try {
-            context.contentResolver.openInputStream(encDoc.uri)?.use { input ->
-              context.contentResolver.openOutputStream(targetDoc.uri)?.use { output ->
+            val inStream = context.contentResolver.openInputStream(encDoc.uri)
+              ?: error("Cannot read encrypted file ${encDoc.name ?: safeName}")
+            inStream.use { input ->
+              val outStream = context.contentResolver.openOutputStream(targetDoc.uri)
+                ?: error("Cannot write decrypted file $safeName")
+              outStream.use { output ->
                 AesFolderCipher.decryptStream(input, output, folderKey)
                 decryptedOk = true
               }
             }
+            if (decryptedOk && !deleteSafDocStrict(encDoc)) {
+              error("Could not remove encrypted file '${encDoc.name ?: safeName}' — aborted to prevent duplicate copy")
+            }
           } catch (t: Throwable) {
-            targetDoc.delete()
+            deleteSafDocStrict(targetDoc)
             throw t
           }
-          if (decryptedOk) {
-            processedBytes += encDoc.length()
-            encDoc.delete()
-          }
+          processedBytes += encLen
           processed++
         }
-        tree.findFile(NOMEDIA_FILE)?.delete()
+        tree.findFile(NOMEDIA_FILE)?.let { deleteSafDocStrict(it) }
       }
 
       val updated = refreshFolderMetricsInternal(folder.copy(isLocked = false), dek)
@@ -630,6 +960,108 @@ class FolderLockerRepository(
     }
   }
 
+  suspend fun decryptAnySafFolder(
+    treeUri: Uri,
+    dek: SecretKey,
+    onProgress: (EncryptionProgress) -> Unit = {},
+  ): Result<DecryptAnyFolderResult> = withContext(Dispatchers.IO) {
+    runCatching {
+      try {
+        context.contentResolver.takePersistableUriPermission(
+          treeUri,
+          Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+        )
+      } catch (_: SecurityException) {
+        // Transient provider grant fallback
+      }
+
+      val existing = vaultDao.getFolderByUri(treeUri.toString())
+      val folderKey = if (existing != null) resolveFolderKey(existing, dek) else dek
+      val tree = resolveTreeDocumentFile(treeUri)
+        ?: error("Unable to open selected device folder")
+      val displayName = existing?.name ?: tree.name?.takeIf { it.isNotBlank() } ?: "Device Folder"
+
+      val encryptedDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
+      val plainDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
+      gatherEncryptedSafDocs(tree, encryptedDocs)
+      gatherPlainSafDocs(tree, plainDocs)
+
+      val totalBytes = encryptedDocs.sumOf { it.first.length() }
+      var processed = 0
+      var processedBytes = 0L
+
+      for ((encDoc, parent) in encryptedDocs) {
+        val meta = context.contentResolver.openInputStream(encDoc.uri)?.use { input ->
+          AesFolderCipher.readMetadata(input, folderKey)
+        } ?: error("Cannot read encrypted header in \"${encDoc.name ?: "file"}\" (wrong key or tampered file)")
+
+        onProgress(
+          EncryptionProgress(
+            folderName = displayName,
+            isLocking = false,
+            currentFileName = meta.originalName,
+            processedFiles = processed,
+            totalFiles = encryptedDocs.size,
+            processedBytes = processedBytes,
+            totalBytes = totalBytes,
+          ),
+        )
+
+        val safeName = uniqueSafName(parent, sanitizeFileName(meta.originalName))
+        val targetDoc = createSafFile(parent, meta.mimeType.ifBlank { "application/octet-stream" }, safeName)
+          ?: error("Could not write decrypted file $safeName")
+
+        val encLen = encDoc.length()
+        var decryptedOk = false
+        try {
+          val inStream = context.contentResolver.openInputStream(encDoc.uri)
+            ?: error("Cannot read encrypted file ${encDoc.name ?: safeName}")
+          inStream.use { input ->
+            val outStream = context.contentResolver.openOutputStream(targetDoc.uri)
+              ?: error("Cannot write decrypted file $safeName")
+              outStream.use { output ->
+              AesFolderCipher.decryptStream(input, output, folderKey)
+              decryptedOk = true
+            }
+          }
+          if (decryptedOk && !deleteSafDocStrict(encDoc)) {
+            error("Could not delete encrypted file '${encDoc.name ?: safeName}' — aborted to avoid duplicate copy")
+          }
+        } catch (t: Throwable) {
+          deleteSafDocStrict(targetDoc)
+          throw t
+        }
+        processedBytes += encLen
+        processed++
+      }
+
+      if (processed > 0) {
+        tree.findFile(NOMEDIA_FILE)?.let { deleteSafDocStrict(it) }
+      }
+      if (existing != null) {
+        refreshFolderMetricsInternal(existing.copy(isLocked = false), dek)
+          .copy(isLocked = false, lastActionTimestamp = System.currentTimeMillis())
+          .let { vaultDao.upsertFolder(it) }
+      }
+      if (processed > 0) {
+        logEvent(
+          folderId = existing?.id,
+          folderName = displayName,
+          action = "ANY_FOLDER_DECRYPTED",
+          details = "In-place decrypted $processed encrypted file(s) (${formatSize(processedBytes)}) in device folder",
+        )
+      }
+
+      DecryptAnyFolderResult(
+        folderName = displayName,
+        decryptedFiles = processed,
+        decryptedBytes = processedBytes,
+        alreadyPlainFiles = plainDocs.size,
+        wasRegisteredInVault = existing != null,
+      )
+    }
+  }
+
   suspend fun lockFoldersBatch(
     folderIds: List<String>,
     dek: SecretKey,
@@ -641,7 +1073,8 @@ class FolderLockerRepository(
     var totalBytes = 0L
     var firstError: String? = null
 
-    val targets = folderIds.mapNotNull { vaultDao.getFolderById(it) }.filter { !it.isLocked }
+    val targets = folderIds.mapNotNull { vaultDao.getFolderById(it) }
+      .filter { !it.isLocked || it.encryptedFileCount < it.fileCount }
     targets.forEachIndexed { index, folder ->
       val prefix = "[${index + 1}/${targets.size}] ${folder.name}"
       onProgress(
@@ -697,7 +1130,8 @@ class FolderLockerRepository(
     var totalBytes = 0L
     var firstError: String? = null
 
-    val targets = folderIds.mapNotNull { vaultDao.getFolderById(it) }.filter { it.isLocked }
+    val targets = folderIds.mapNotNull { vaultDao.getFolderById(it) }
+      .filter { it.isLocked || it.encryptedFileCount > 0 }
     targets.forEachIndexed { index, folder ->
       val prefix = "[${index + 1}/${targets.size}] ${folder.name}"
       onProgress(
@@ -895,7 +1329,7 @@ class FolderLockerRepository(
           if (!nomedia.exists()) nomedia.createNewFile()
         }
       } else {
-        val tree = DocumentFile.fromTreeUri(context, Uri.parse(folder.treeUri))
+        val tree = resolveTreeDocumentFile(Uri.parse(folder.treeUri))
           ?: error("Folder access permission unavailable")
         val encryptedDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
         val plainDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
@@ -1281,7 +1715,7 @@ class FolderLockerRepository(
           }
         }
       } else {
-        val tree = DocumentFile.fromTreeUri(context, Uri.parse(folder.treeUri))
+        val tree = resolveTreeDocumentFile(Uri.parse(folder.treeUri))
           ?: error("Folder access permission unavailable")
         val allSafDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
         gatherAllSafDocs(tree, allSafDocs)
@@ -1584,20 +2018,161 @@ class FolderLockerRepository(
     return updatedCount
   }
 
-  suspend fun removeFolderFromVault(folderId: String, dek: SecretKey?) {
-    val folder = vaultDao.getFolderById(folderId) ?: return
-    if (folder.isLocked && dek != null) {
-      unlockFolder(folderId, dek)
+  suspend fun removeFilesInFolder(
+    folderId: String,
+    fileIds: Set<String>,
+  ): Result<VaultFolderEntity> = withContext(Dispatchers.IO) {
+    runCatching {
+      require(fileIds.isNotEmpty()) { "Select at least one file to remove" }
+      val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
+      var removed = 0
+      var removedBytes = 0L
+
+      if (folder.isInternalVault) {
+        val root = internalFolderDir(folder.id)
+        if (!root.exists()) root.mkdirs()
+        val matching = root.walkTopDown()
+          .filter { it.isFile && !isInternalScratchFile(it.name) && it.absolutePath in fileIds }
+          .toList()
+        for (file in matching) {
+          val size = file.length()
+          if (!file.delete() && file.exists()) {
+            error("Unable to delete '${file.name}'")
+          }
+          removedBytes += size
+          removed++
+        }
+        val anyEncRemaining = root.walkTopDown()
+          .any { it.isFile && it.name.endsWith(AesFolderCipher.ENCRYPTED_EXTENSION) }
+        if (!anyEncRemaining) {
+          File(root, NOMEDIA_FILE).takeIf { it.exists() }?.delete()
+        }
+      } else {
+        val tree = resolveTreeDocumentFile(Uri.parse(folder.treeUri))
+          ?: error("Folder access permission unavailable")
+        val allDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
+        gatherAllSafDocs(tree, allDocs)
+        val matching = allDocs.filter { (doc, _) -> doc.uri.toString() in fileIds }
+        for ((doc, _) in matching) {
+          val size = doc.length()
+          if (!deleteSafDocStrict(doc)) {
+            error("Unable to delete '${doc.name ?: "file"}'")
+          }
+          removedBytes += size
+          removed++
+        }
+        val remainingEnc = mutableListOf<Pair<DocumentFile, DocumentFile>>()
+        gatherEncryptedSafDocs(tree, remainingEnc)
+        if (remainingEnc.isEmpty()) {
+          tree.findFile(NOMEDIA_FILE)?.let { deleteSafDocStrict(it) }
+        }
+      }
+
+      val refreshed = refreshFolderMetricsInternal(folder, dek = null)
+      val finalEntity = refreshed.copy(
+        isLocked = if (refreshed.encryptedFileCount == 0) false else refreshed.isLocked,
+        lastActionTimestamp = System.currentTimeMillis(),
+      )
+      vaultDao.upsertFolder(finalEntity)
+      if (removed > 0) {
+        logEvent(
+          folderId = finalEntity.id,
+          folderName = finalEntity.name,
+          action = "FILES_REMOVED",
+          details = "Removed $removed file(s) (${formatSize(removedBytes)}) from folder list",
+        )
+      }
+      finalEntity
     }
+  }
+
+  suspend fun removeFolderFromVault(
+    folderId: String,
+    dek: SecretKey?,
+    decryptLockedSafFirst: Boolean = true,
+  ) {
+    val folder = vaultDao.getFolderById(folderId) ?: return
     if (folder.isInternalVault) {
       internalFolderDir(folder.id).deleteRecursively()
+    } else if (decryptLockedSafFirst && (folder.isLocked || folder.encryptedFileCount > 0) && dek != null) {
+      unlockFolder(folderId, dek).getOrThrow()
     }
     vaultDao.deleteFolderById(folderId)
+    val note = when {
+      folder.isInternalVault -> "Deleted sandboxed private vault folder and contents"
+      decryptLockedSafFirst && folder.encryptedFileCount > 0 ->
+        "Decrypted device folder in-place and removed from BeastLock list"
+      else -> "Unlinked device folder from BeastLock list"
+    }
     logEvent(
       folderId = null,
       folderName = folder.name,
       action = "FOLDER_REMOVED",
-      details = "Removed folder from BeastLock index",
+      details = note,
+    )
+  }
+
+  suspend fun removeFoldersBatch(
+    folderIds: List<String>,
+    dek: SecretKey?,
+    decryptLockedSafFirst: Boolean = true,
+    onProgress: (EncryptionProgress) -> Unit = {},
+  ): BatchFolderResult {
+    var succeeded = 0
+    var failed = 0
+    var totalFiles = 0
+    var totalBytes = 0L
+    var firstError: String? = null
+
+    val targets = folderIds.mapNotNull { vaultDao.getFolderById(it) }
+    targets.forEachIndexed { index, folder ->
+      onProgress(
+        EncryptionProgress(
+          folderName = "[${index + 1}/${targets.size}] ${folder.name}",
+          isLocking = false,
+          currentFileName = if (!folder.isInternalVault && decryptLockedSafFirst && folder.isLocked) {
+            "Decrypting before removing..."
+          } else {
+            "Removing from vault..."
+          },
+          processedFiles = index,
+          totalFiles = targets.size,
+          processedBytes = totalBytes,
+          totalBytes = targets.sumOf { it.totalBytes },
+        ),
+      )
+      runCatching {
+        removeFolderFromVault(
+          folderId = folder.id,
+          dek = dek,
+          decryptLockedSafFirst = decryptLockedSafFirst,
+        )
+      }.onSuccess {
+        succeeded++
+        totalFiles += folder.fileCount
+        totalBytes += folder.totalBytes
+      }.onFailure { err ->
+        failed++
+        if (firstError == null) firstError = err.message ?: "Failed to remove ${folder.name}"
+      }
+    }
+
+    if (succeeded > 0 || failed > 0) {
+      logEvent(
+        folderName = "Batch Remove",
+        action = "FOLDERS_BATCH_REMOVED",
+        details = "Removed $succeeded folder(s) from vault list${if (failed > 0) "; $failed failed" else ""}",
+        category = AuditCategory.CRYPTO_OPERATION,
+        isWarning = failed > 0,
+      )
+    }
+
+    return BatchFolderResult(
+      succeededCount = succeeded,
+      failedCount = failed,
+      totalFiles = totalFiles,
+      totalBytes = totalBytes,
+      firstError = firstError,
     )
   }
 
@@ -1613,13 +2188,14 @@ class FolderLockerRepository(
     val stats = if (folder.isInternalVault) {
       inspectInternalStats(internalFolderDir(folder.id))
     } else {
-      val tree = DocumentFile.fromTreeUri(context, Uri.parse(folder.treeUri))
+      val tree = resolveTreeDocumentFile(Uri.parse(folder.treeUri))
       if (tree != null) inspectSafStats(tree) else FolderStats(0, 0, 0L, 0L, 0L)
     }
     val totalFiles = stats.plainCount + stats.encryptedCount
     val lockedState = when {
       stats.encryptedCount > 0 && stats.plainCount == 0 -> true
       stats.plainCount > 0 && stats.encryptedCount == 0 -> false
+      stats.encryptedCount == 0 && stats.plainCount == 0 -> false
       else -> folder.isLocked
     }
     val updated = folder.copy(
@@ -1838,19 +2414,104 @@ class FolderLockerRepository(
     }
   }
 
-  private fun queryUriMetadata(uri: Uri): Pair<String, String> {
+  private fun resolveTreeDocumentFile(treeUri: Uri): DocumentFile? {
+    return if (treeUri.scheme == "file") {
+      treeUri.path?.let { DocumentFile.fromFile(File(it)) }
+    } else {
+      DocumentFile.fromTreeUri(context, treeUri)
+    }
+  }
+
+  private fun createSafFile(
+    parent: DocumentFile,
+    mimeType: String,
+    exactName: String,
+  ): DocumentFile? {
+    if (parent.uri.scheme == "file") {
+      val dir = parent.uri.path?.let { File(it) } ?: return null
+      if (!dir.exists()) dir.mkdirs()
+      val target = File(dir, exactName)
+      return if (target.createNewFile() || target.exists()) DocumentFile.fromFile(target) else null
+    }
+    return parent.createFile(mimeType, exactName)
+  }
+
+  private fun deleteSafDocStrict(doc: DocumentFile): Boolean {
+    if (!doc.exists()) return true
+    if (runCatching { doc.delete() }.getOrDefault(false) && !doc.exists()) return true
+    val contractDeleted = runCatching {
+      DocumentsContract.deleteDocument(context.contentResolver, doc.uri)
+    }.getOrDefault(false)
+    return contractDeleted || !doc.exists()
+  }
+
+  private fun tryDeleteExternalSourceUri(uri: Uri): Boolean {
+    return when (uri.scheme) {
+      "file" -> uri.path?.let { path ->
+        val file = File(path)
+        file.delete() || !file.exists()
+      } ?: false
+      else -> {
+        val docDeleted = runCatching {
+          DocumentsContract.deleteDocument(context.contentResolver, uri)
+        }.getOrDefault(false)
+        if (docDeleted) {
+          true
+        } else {
+          runCatching {
+            DocumentFile.fromSingleUri(context, uri)?.delete() == true
+          }.getOrDefault(false)
+        }
+      }
+    }
+  }
+
+  private fun uniqueSafName(parent: DocumentFile, desiredName: String): String {
+    if (parent.findFile(desiredName) == null) return desiredName
+    val dot = desiredName.lastIndexOf('.')
+    val base = if (dot > 0) desiredName.substring(0, dot) else desiredName
+    val ext = if (dot > 0) desiredName.substring(dot) else ""
+    var counter = 1
+    var candidate = "${base}_$counter$ext"
+    while (parent.findFile(candidate) != null) {
+      counter++
+      candidate = "${base}_$counter$ext"
+    }
+    return candidate
+  }
+
+  private fun queryUriMetadata(uri: Uri): Triple<String, String, Long?> {
     var name = "imported_file_${System.currentTimeMillis()}"
-    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-      ?.use { cursor ->
+    var size: Long? = null
+    if (uri.scheme == "file") {
+      uri.path?.let { path ->
+        val f = File(path)
+        if (f.name.isNotBlank()) name = f.name
+        if (f.exists()) size = f.length()
+      }
+    } else {
+      context.contentResolver.query(
+        uri,
+        arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+        null,
+        null,
+        null,
+      )?.use { cursor ->
         if (cursor.moveToFirst()) {
-          val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-          if (idx >= 0) {
-            cursor.getString(idx)?.takeIf { it.isNotBlank() }?.let { name = it }
+          val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+          if (nameIdx >= 0) {
+            cursor.getString(nameIdx)?.takeIf { it.isNotBlank() }?.let { name = it }
+          }
+          val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+          if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+            val s = cursor.getLong(sizeIdx)
+            if (s >= 0L) size = s
           }
         }
       }
+    }
     val mime = context.contentResolver.getType(uri) ?: guessMimeType(name)
-    return sanitizeFileName(name) to mime
+    return Triple(sanitizeFileName(name), mime, size)
   }
 
   private fun uniqueLocalFile(dir: File, desiredName: String): File {

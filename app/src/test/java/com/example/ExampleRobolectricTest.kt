@@ -14,8 +14,17 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.setMain
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.ResponseBody.Companion.toResponseBody
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -1188,6 +1197,1036 @@ class ExampleRobolectricTest {
       assertEquals(true, "FILES_BATCH_RENAMED" in auditActions)
       assertEquals(true, "FOLDERS_BATCH_RENAMED" in auditActions)
     } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun `dashboard search filters folders by name and locked or unlocked status in real time`() {
+    val folders = listOf(
+      com.example.data.local.VaultFolderEntity(
+        id = "f1",
+        name = "Tax Docs",
+        treeUri = "app-internal://f1",
+        isInternalVault = true,
+        isLocked = true,
+        fileCount = 3,
+        encryptedFileCount = 3,
+        totalBytes = 1024L,
+        lastActionTimestamp = 1_700_000_000_000L,
+        createdAt = 1_700_000_000_000L,
+      ),
+      com.example.data.local.VaultFolderEntity(
+        id = "f2",
+        name = "Personal Photos",
+        treeUri = "app-internal://f2",
+        isInternalVault = true,
+        isLocked = false,
+        fileCount = 5,
+        encryptedFileCount = 0,
+        totalBytes = 2048L,
+        lastActionTimestamp = 1_700_000_000_000L,
+        createdAt = 1_700_000_000_000L,
+      ),
+      com.example.data.local.VaultFolderEntity(
+        id = "f3",
+        name = "Crypto Keys",
+        treeUri = "app-internal://f3",
+        isInternalVault = true,
+        isLocked = true,
+        fileCount = 2,
+        encryptedFileCount = 2,
+        totalBytes = 512L,
+        lastActionTimestamp = 1_700_000_000_000L,
+        createdAt = 1_700_000_000_000L,
+      ),
+      com.example.data.local.VaultFolderEntity(
+        id = "f4",
+        name = "Receipts Open",
+        treeUri = "app-internal://f4",
+        isInternalVault = true,
+        isLocked = false,
+        fileCount = 4,
+        encryptedFileCount = 0,
+        totalBytes = 4096L,
+        lastActionTimestamp = 1_700_000_000_000L,
+        createdAt = 1_700_000_000_000L,
+      ),
+    )
+
+    val base = com.example.ui.VaultUiState(folders = folders)
+    assertEquals(4, base.filteredFolders.size)
+
+    // Filter by folder name (case-insensitive)
+    assertEquals(listOf("f1"), base.copy(searchQuery = "tax").filteredFolders.map { it.id })
+
+    // Filter by exact locked/unlocked status words
+    assertEquals(listOf("f1", "f3"), base.copy(searchQuery = "locked").filteredFolders.map { it.id })
+    assertEquals(listOf("f2", "f4"), base.copy(searchQuery = "unlocked").filteredFolders.map { it.id })
+
+    // Filter in real time while typing prefixes (>= 3 chars) without "loc" accidentally matching "unlocked"
+    assertEquals(listOf("f1", "f3"), base.copy(searchQuery = "loc").filteredFolders.map { it.id })
+    assertEquals(listOf("f2", "f4"), base.copy(searchQuery = "unl").filteredFolders.map { it.id })
+
+    // Explicit status qualifier & multi-token AND filtering (name + status)
+    assertEquals(listOf("f1", "f3"), base.copy(searchQuery = "status:locked").filteredFolders.map { it.id })
+    assertEquals(listOf("f2", "f4"), base.copy(searchQuery = "status:unlocked").filteredFolders.map { it.id })
+    assertEquals(listOf("f1"), base.copy(searchQuery = "tax locked").filteredFolders.map { it.id })
+    assertEquals(emptyList<String>(), base.copy(searchQuery = "photos locked").filteredFolders.map { it.id })
+
+    // Combined with FilterChip
+    assertEquals(
+      listOf("f4"),
+      base.copy(
+        folderFilter = com.example.ui.FolderFilter.UNLOCKED,
+        searchQuery = "receipts",
+      ).filteredFolders.map { it.id },
+    )
+  }
+
+  @Test
+  fun `Google Drive API encrypted sync uploads zero-knowledge vlkbak, updates snapshot, restores cross-device, and deletes`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = androidx.room.Room.inMemoryDatabaseBuilder(
+      context,
+      com.example.data.local.VaultDatabase::class.java,
+    ).allowMainThreadQueries().build()
+
+    class StoredDriveEntry(
+      val id: String,
+      val name: String,
+      val bytes: ByteArray,
+      val appProperties: Map<String, String>,
+    )
+    val remoteFiles = linkedMapOf<String, StoredDriveEntry>()
+    var nextId = 1
+
+    val mockClient = okhttp3.OkHttpClient.Builder()
+      .addInterceptor { chain ->
+        val req = chain.request()
+        val auth = req.header("Authorization") ?: ""
+        if (auth != "Bearer valid-drive-token") {
+          return@addInterceptor okhttp3.Response.Builder()
+            .request(req)
+            .protocol(okhttp3.Protocol.HTTP_1_1)
+            .code(401)
+            .message("Unauthorized")
+            .body("""{"error":"invalid_token"}""".toResponseBody(null))
+            .build()
+        }
+
+        val url = req.url.toString()
+        val path = req.url.encodedPath
+        val jsonMedia = "application/json; charset=utf-8".toMediaTypeOrNull()
+
+        fun okJson(body: String, code: Int = 200): okhttp3.Response =
+          okhttp3.Response.Builder()
+            .request(req)
+            .protocol(okhttp3.Protocol.HTTP_1_1)
+            .code(code)
+            .message("OK")
+            .body(body.toResponseBody(jsonMedia))
+            .build()
+
+        when {
+          req.method == "GET" && path.endsWith("/about") -> {
+            okJson("""{"user":{"displayName":"BeastLock User","emailAddress":"vault.user@gmail.com"}}""")
+          }
+          (req.method == "POST" || req.method == "PATCH") && path.contains("/upload/drive/v3/files") -> {
+            val multipart = req.body as okhttp3.MultipartBody
+            val metaBuf = okio.Buffer()
+            multipart.part(0).body.writeTo(metaBuf)
+            val metaJson = kotlinx.serialization.json.Json.parseToJsonElement(metaBuf.readUtf8())
+            val obj = metaJson as kotlinx.serialization.json.JsonObject
+            val fileName = obj["name"]?.let { (it as kotlinx.serialization.json.JsonPrimitive).content } ?: "backup.vlkbak"
+            val propsObj = obj["appProperties"] as? kotlinx.serialization.json.JsonObject
+            val props = propsObj?.mapValues { (_, v) -> (v as kotlinx.serialization.json.JsonPrimitive).content } ?: emptyMap()
+
+            val dataBuf = okio.Buffer()
+            multipart.part(1).body.writeTo(dataBuf)
+            val archiveBytes = dataBuf.readByteArray()
+
+            val targetId = if (req.method == "PATCH") {
+              path.substringAfterLast("/")
+            } else {
+              "drive-file-${nextId++}"
+            }
+            remoteFiles[targetId] = StoredDriveEntry(
+              id = targetId,
+              name = fileName,
+              bytes = archiveBytes,
+              appProperties = props,
+            )
+            val metaResp = com.example.data.backup.DriveFileMetadata(
+              id = targetId,
+              name = fileName,
+              size = archiveBytes.size.toString(),
+              modifiedTime = "2026-11-18T23:00:00Z",
+              appProperties = props,
+            )
+            okJson(kotlinx.serialization.json.Json.encodeToString(com.example.data.backup.DriveFileMetadata.serializer(), metaResp))
+          }
+          req.method == "GET" && path.endsWith("/files") -> {
+            val listResp = com.example.data.backup.DriveFileListResponse(
+              files = remoteFiles.values.map {
+                com.example.data.backup.DriveFileMetadata(
+                  id = it.id,
+                  name = it.name,
+                  size = it.bytes.size.toString(),
+                  modifiedTime = "2026-11-18T23:00:00Z",
+                  appProperties = it.appProperties,
+                )
+              },
+            )
+            okJson(kotlinx.serialization.json.Json.encodeToString(com.example.data.backup.DriveFileListResponse.serializer(), listResp))
+          }
+          req.method == "GET" && url.contains("alt=media") -> {
+            val id = path.substringAfterLast("/")
+            val entry = remoteFiles[id] ?: return@addInterceptor okJson("{}", 404)
+            okhttp3.Response.Builder()
+              .request(req)
+              .protocol(okhttp3.Protocol.HTTP_1_1)
+              .code(200)
+              .message("OK")
+              .body(entry.bytes.toResponseBody("application/octet-stream".toMediaTypeOrNull()))
+              .build()
+          }
+          req.method == "DELETE" && path.contains("/files/") -> {
+            val id = path.substringAfterLast("/")
+            remoteFiles.remove(id)
+            okhttp3.Response.Builder()
+              .request(req)
+              .protocol(okhttp3.Protocol.HTTP_1_1)
+              .code(204)
+              .message("No Content")
+              .body(ByteArray(0).toResponseBody(null))
+              .build()
+          }
+          else -> okJson("{}", 404)
+        }
+      }
+      .build()
+
+    try {
+      val testKeystoreKey = AesFolderCipher.generateAes256Key()
+      val keystore = com.example.crypto.KeystoreManager(context, overrideTestMasterKey = testKeystoreKey)
+      val prefs = com.example.data.preferences.SecurityPreferencesRepository(context, keystore)
+      val auditKey = AesFolderCipher.generateAes256Key()
+      val auditRepo = com.example.data.audit.EncryptedAuditLogRepository(context, keystore, overrideTestKey = auditKey)
+      val repo = com.example.data.storage.FolderLockerRepository(context, db.vaultDao(), auditRepo)
+      val driveClient = com.example.data.backup.GoogleDriveApiClient(httpClient = mockClient)
+      val backupManager = com.example.data.backup.CloudBackupManager(context, db.vaultDao(), prefs, auditRepo, driveClient)
+
+      val originalMasterDek = prefs.initializeVault(
+        pin = "778899",
+        enableBiometrics = false,
+        question1 = "City?",
+        answer1 = "Kyoto",
+        question2 = "Pet?",
+        answer2 = "Kuma",
+      )
+
+      // 1. Account lookup & expired token check
+      assertEquals("vault.user@gmail.com", backupManager.fetchGoogleDriveAccountEmail("valid-drive-token"))
+      val expiredResult = backupManager.listGoogleDriveBackups("expired-token")
+      assertEquals(true, expiredResult.exceptionOrNull() is com.example.data.backup.DriveAuthExpiredException)
+
+      // 2. Create encrypted folder and sync to Drive API
+      val folder = repo.createInternalVaultFolder("DriveSynced", obfuscateDefault = true).getOrThrow()
+      val folderDir = java.io.File(java.io.File(context.filesDir, "vaults"), folder.id)
+      java.io.File(folderDir, "drive_secret.txt").writeText("Top Secret Drive Payload")
+      repo.lockFolder(folder.id, originalMasterDek).getOrThrow()
+
+      val firstSync = backupManager.syncVaultToGoogleDrive(
+        accessToken = "valid-drive-token",
+        dek = originalMasterDek,
+      ).getOrThrow()!!
+      assertEquals("Google Drive API", firstSync.record.providerName)
+      assertEquals(1, firstSync.record.folderCount)
+      assertEquals(1, firstSync.record.fileCount)
+      assertEquals(1, remoteFiles.size)
+
+      // Verify uploaded archive is zero-knowledge (plaintext never appears in uploaded payload)
+      val uploadedBytes = remoteFiles.values.first().bytes
+      assertEquals(false, uploadedBytes.toString(Charsets.UTF_8).contains("Top Secret Drive Payload"))
+
+      // 3. Re-sync updates existing BeastLock_AutoSync.vlkbak via PATCH without creating duplicate files
+      val secondSync = backupManager.syncVaultToGoogleDrive(
+        accessToken = "valid-drive-token",
+        dek = originalMasterDek,
+      ).getOrThrow()!!
+      assertEquals(1, remoteFiles.size)
+      assertEquals(true, secondSync.record.sha256Checksum.isNotBlank())
+
+      // 4. List remote Drive snapshots
+      val listed = backupManager.listGoogleDriveBackups("valid-drive-token").getOrThrow()
+      assertEquals(1, listed.size)
+      val item = listed.first()
+      assertEquals(com.example.data.backup.CloudBackupManager.AUTO_SYNC_ARCHIVE_NAME, item.name)
+      assertEquals(secondSync.record.sha256Checksum, item.sha256Checksum)
+      assertEquals(1, item.folderCount)
+      assertEquals(1, item.fileCount)
+
+      // 5. Cross-device restore onto a new vault DEK requires backup Master PIN, then recovers exact content
+      val secondDeviceDek = AesFolderCipher.generateAes256Key()
+      val needPin = backupManager.restoreFromGoogleDrive(
+        accessToken = "valid-drive-token",
+        driveFileId = item.id,
+        fileName = item.name,
+        currentDek = secondDeviceDek,
+      ).getOrThrow()
+      assertEquals(true, needPin.requiresBackupPin)
+
+      val restored = backupManager.restoreFromGoogleDrive(
+        accessToken = "valid-drive-token",
+        driveFileId = item.id,
+        fileName = item.name,
+        currentDek = secondDeviceDek,
+        backupPinIfDifferentKey = "778899",
+      ).getOrThrow()
+      assertEquals(false, restored.requiresBackupPin)
+      assertEquals(1, restored.restoredFolders)
+      assertEquals(1, restored.restoredFiles)
+
+      val restoredFolder = db.vaultDao().getAllFoldersOnce().first { it.name.contains("(Restored)") }
+      repo.unlockFolder(restoredFolder.id, secondDeviceDek).getOrThrow()
+      val restoredFile = java.io.File(java.io.File(java.io.File(context.filesDir, "vaults"), restoredFolder.id), "drive_secret.txt")
+      assertEquals("Top Secret Drive Payload", restoredFile.readText())
+
+      // 6. Delete remote snapshot from Drive appDataFolder
+      backupManager.deleteGoogleDriveBackup("valid-drive-token", item.id).getOrThrow()
+      assertEquals(0, backupManager.listGoogleDriveBackups("valid-drive-token").getOrThrow().size)
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun `idle timeout preference defaults and updates persist cleanly in DataStore`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val keystore = com.example.crypto.KeystoreManager(
+      context,
+      overrideTestMasterKey = AesFolderCipher.generateAes256Key(),
+    )
+    val prefs = com.example.data.preferences.SecurityPreferencesRepository(context, keystore)
+
+    val initial = prefs.securitySettings.first()
+    assertEquals(true, initial.idleTimeoutEnabled)
+    assertEquals(120, initial.idleTimeoutSeconds)
+
+    prefs.setIdleTimeoutSeconds(45)
+    prefs.setIdleTimeoutEnabled(false)
+    val updated = prefs.securitySettings.first()
+    assertEquals(false, updated.idleTimeoutEnabled)
+    assertEquals(45, updated.idleTimeoutSeconds)
+
+    prefs.setIdleTimeoutSeconds(0)
+    assertEquals(1, prefs.securitySettings.first().idleTimeoutSeconds)
+  }
+
+  @OptIn(ExperimentalCoroutinesApi::class)
+  @Test
+  fun `foreground idle timeout locks vault after inactivity, resets on user interaction, and stops when disabled`() = kotlinx.coroutines.test.runTest {
+    val testDispatcher = StandardTestDispatcher(testScheduler)
+    Dispatchers.setMain(testDispatcher)
+    val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+    val store = androidx.lifecycle.ViewModelStore()
+    try {
+      val testKey = AesFolderCipher.generateAes256Key()
+      val viewModel = com.example.ui.VaultViewModel.createForTest(app, testKey)
+      store.put("idle_test", viewModel)
+
+      fun pumpUntil(timeoutMs: Long = 3_000L, predicate: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!predicate() && System.currentTimeMillis() < deadline) {
+          testScheduler.runCurrent()
+          if (predicate()) break
+          Thread.sleep(15)
+        }
+        testScheduler.runCurrent()
+      }
+
+      viewModel.completeOnboarding(
+        pin = "123456",
+        enableBiometrics = false,
+        question1 = "City?",
+        answer1 = "Osaka",
+        question2 = "Pet?",
+        answer2 = "Mochi",
+      )
+      pumpUntil { viewModel.uiState.value.sessionState == com.example.ui.VaultSessionState.Unlocked }
+      assertEquals(com.example.ui.VaultSessionState.Unlocked, viewModel.uiState.value.sessionState)
+
+      viewModel.setIdleTimeoutEnabled(true)
+      viewModel.setIdleTimeoutSeconds(5)
+      pumpUntil { viewModel.uiState.value.securitySettings.idleTimeoutSeconds == 5 }
+
+      // Advance 3s (< 5s): vault remains unlocked
+      advanceTimeBy(3_000L)
+      runCurrent()
+      assertEquals(com.example.ui.VaultSessionState.Unlocked, viewModel.uiState.value.sessionState)
+
+      // User interaction resets the 5s timer; advancing another 3s (6s total) keeps vault unlocked
+      viewModel.onUserInteraction()
+      advanceTimeBy(3_000L)
+      runCurrent()
+      assertEquals(com.example.ui.VaultSessionState.Unlocked, viewModel.uiState.value.sessionState)
+
+      // Advancing past 5s without interaction triggers IDLE_LOCK
+      advanceTimeBy(2_500L)
+      pumpUntil { viewModel.uiState.value.sessionState == com.example.ui.VaultSessionState.Locked }
+      assertEquals(com.example.ui.VaultSessionState.Locked, viewModel.uiState.value.sessionState)
+      pumpUntil { viewModel.uiState.value.securitySettings.wasAutoLocked }
+      assertEquals(true, viewModel.uiState.value.securitySettings.wasAutoLocked)
+      assertEquals(
+        true,
+        viewModel.uiState.value.securitySettings.lastAutoLockSummary.contains("inactivity"),
+      )
+      assertEquals(
+        true,
+        viewModel.uiState.value.auditLogSnapshot.entries.any { it.action == "IDLE_LOCK" },
+      )
+
+      // Re-unlock and disable idle timeout -> vault stays unlocked indefinitely
+      viewModel.unlockWithPin("123456")
+      pumpUntil { viewModel.uiState.value.sessionState == com.example.ui.VaultSessionState.Unlocked }
+      viewModel.setIdleTimeoutEnabled(false)
+      pumpUntil { !viewModel.uiState.value.securitySettings.idleTimeoutEnabled }
+
+      advanceTimeBy(30_000L)
+      runCurrent()
+      assertEquals(com.example.ui.VaultSessionState.Unlocked, viewModel.uiState.value.sessionState)
+    } finally {
+      store.clear()
+      Dispatchers.resetMain()
+    }
+  }
+
+  @Test
+  fun `verifyEncryptedStream validates healthy streams and diagnoses header, chunk, truncation, and trailing corruption`() {
+    val key = AesFolderCipher.generateAes256Key()
+    val wrongKey = AesFolderCipher.generateAes256Key()
+    val payload = ByteArray(40_000) { idx -> (idx * 7 % 251).toByte() }
+    val meta = EncryptedFileMetadata(
+      originalName = "board_minutes.pdf",
+      mimeType = "application/pdf",
+      originalSize = payload.size.toLong(),
+      encryptedAt = 1_710_000_000_000L,
+    )
+
+    val encryptedOut = ByteArrayOutputStream()
+    AesFolderCipher.encryptStream(
+      input = ByteArrayInputStream(payload),
+      output = encryptedOut,
+      key = key,
+      metadata = meta,
+      chunkSize = 8 * 1024,
+    )
+    val validBytes = encryptedOut.toByteArray()
+
+    // 1. Healthy multi-chunk file passes
+    val ok = AesFolderCipher.verifyEncryptedStream(ByteArrayInputStream(validBytes), key)
+    assertEquals(true, ok.isValid)
+    assertEquals("board_minutes.pdf", ok.recoveredOriginalName)
+    assertEquals(5L, ok.chunkCount)
+    assertEquals(payload.size.toLong(), ok.verifiedPlainBytes)
+
+    // 2. Empty 0-byte encrypted file passes
+    val emptyOut = ByteArrayOutputStream()
+    AesFolderCipher.encryptStream(
+      input = ByteArrayInputStream(ByteArray(0)),
+      output = emptyOut,
+      key = key,
+      metadata = EncryptedFileMetadata("empty.txt", "text/plain", 0L, 1L),
+    )
+    val emptyCheck = AesFolderCipher.verifyEncryptedStream(ByteArrayInputStream(emptyOut.toByteArray()), key)
+    assertEquals(true, emptyCheck.isValid)
+    assertEquals("empty.txt", emptyCheck.recoveredOriginalName)
+    assertEquals(0L, emptyCheck.chunkCount)
+
+    // 3. Invalid magic signature
+    val badSig = validBytes.copyOf().apply { this[0] = 'X'.code.toByte() }
+    val sigRes = AesFolderCipher.verifyEncryptedStream(ByteArrayInputStream(badSig), key)
+    assertEquals(false, sigRes.isValid)
+    assertEquals(com.example.crypto.IntegrityFailureCategory.INVALID_SIGNATURE, sigRes.failureCategory)
+
+    // 4. Bit-flip in payload chunk near end still recovers originalName from verified header
+    val badChunk = validBytes.copyOf()
+    badChunk[badChunk.size - 40] = (badChunk[badChunk.size - 40].toInt() xor 0xFF).toByte()
+    val chunkRes = AesFolderCipher.verifyEncryptedStream(ByteArrayInputStream(badChunk), key)
+    assertEquals(false, chunkRes.isValid)
+    assertEquals("board_minutes.pdf", chunkRes.recoveredOriginalName)
+    assertEquals(com.example.crypto.IntegrityFailureCategory.CHUNK_AUTH_FAILED, chunkRes.failureCategory)
+
+    // 5. Truncated file missing EOF sentinel reports TRUNCATED_FILE and recovers originalName
+    val truncated = validBytes.copyOfRange(0, validBytes.size - 12)
+    val truncRes = AesFolderCipher.verifyEncryptedStream(ByteArrayInputStream(truncated), key)
+    assertEquals(false, truncRes.isValid)
+    assertEquals("board_minutes.pdf", truncRes.recoveredOriginalName)
+    assertEquals(com.example.crypto.IntegrityFailureCategory.TRUNCATED_FILE, truncRes.failureCategory)
+
+    // 6. Trailing corrupted bytes after EOF sentinel report TRAILING_DATA
+    val trailing = validBytes + byteArrayOf(0x01, 0x02, 0x03)
+    val trailRes = AesFolderCipher.verifyEncryptedStream(ByteArrayInputStream(trailing), key)
+    assertEquals(false, trailRes.isValid)
+    assertEquals("board_minutes.pdf", trailRes.recoveredOriginalName)
+    assertEquals(com.example.crypto.IntegrityFailureCategory.TRAILING_DATA, trailRes.failureCategory)
+
+    // 7. Wrong decryption key fails at header authentication
+    val wrongKeyRes = AesFolderCipher.verifyEncryptedStream(ByteArrayInputStream(validBytes), wrongKey)
+    assertEquals(false, wrongKeyRes.isValid)
+    assertEquals(com.example.crypto.IntegrityFailureCategory.HEADER_AUTH_FAILED, wrongKeyRes.failureCategory)
+  }
+
+  @Test
+  fun `scanVaultIntegrity identifies affected corrupted names across normal and key-rotated obfuscated folders`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = androidx.room.Room.inMemoryDatabaseBuilder(
+      context,
+      com.example.data.local.VaultDatabase::class.java,
+    ).allowMainThreadQueries().build()
+
+    try {
+      val masterDek = AesFolderCipher.generateAes256Key()
+      val keystore = com.example.crypto.KeystoreManager(context, overrideTestMasterKey = masterDek)
+      val auditRepo = com.example.data.audit.EncryptedAuditLogRepository(
+        context,
+        keystore,
+        overrideTestKey = masterDek,
+      )
+      val folderRepo = com.example.data.storage.FolderLockerRepository(context, db.vaultDao(), auditRepo)
+      val maintenance = com.example.data.storage.VaultMaintenanceManager(context, db.vaultDao(), auditRepo)
+
+      // Folder 1: standard master DEK
+      val f1 = folderRepo.createInternalVaultFolder("Finance", obfuscateDefault = false).getOrThrow()
+      val dir1 = java.io.File(java.io.File(context.filesDir, "vaults"), f1.id)
+      dir1.mkdirs()
+      java.io.File(dir1, "tax_2025.txt").writeText("Healthy financial ledger content")
+      java.io.File(dir1, "payroll_corrupted.csv").writeText("User,Salary\nAlice,120000\n".repeat(40))
+      folderRepo.lockFolder(f1.id, masterDek).getOrThrow()
+
+      // Folder 2: key-rotated + obfuscated UUID filenames
+      val f2 = folderRepo.createInternalVaultFolder("Passport Scans", obfuscateDefault = true).getOrThrow()
+      val dir2 = java.io.File(java.io.File(context.filesDir, "vaults"), f2.id)
+      dir2.mkdirs()
+      java.io.File(dir2, "passport_front.jpg").writeBytes(ByteArray(3_000) { 0x5A })
+      java.io.File(dir2, "visa_truncated.pdf").writeBytes(ByteArray(2_000) { 0x33 })
+      folderRepo.lockFolder(f2.id, masterDek).getOrThrow()
+      folderRepo.reencryptFoldersBatch(listOf(f2.id), masterDek, encryptUnlockedFolders = false)
+
+      // Corrupt 1 encrypted file in Folder 1 (payload bit flip)
+      val corruptedTarget1 = dir1.listFiles()!!.first { it.name.startsWith("payroll_corrupted") && it.name.endsWith(".vlock") }
+      val bytes1 = corruptedTarget1.readBytes()
+      bytes1[bytes1.size - 28] = (bytes1[bytes1.size - 28].toInt() xor 0x7F).toByte()
+      corruptedTarget1.writeBytes(bytes1)
+
+      // Corrupt 1 obfuscated file in Folder 2 (truncate EOF) & inject a fake corrupted-header .vlock file
+      val updatedF2 = db.vaultDao().getFolderById(f2.id)!!
+      val folder2Key = AesFolderCipher.unwrapDekWithKey(updatedF2.wrappedFolderKey!!, masterDek)
+      val f2EncryptedFiles = dir2.listFiles()!!.filter { it.name.endsWith(".vlock") }
+      val visaFile = f2EncryptedFiles.first { file ->
+        file.inputStream().use { AesFolderCipher.readMetadata(it, folder2Key).originalName == "visa_truncated.pdf" }
+      }
+      val visaBytes = visaFile.readBytes()
+      visaFile.writeBytes(visaBytes.copyOfRange(0, visaBytes.size - 10))
+      java.io.File(dir2, "broken_header.vlock").writeBytes("NOT_VLK1_GARBAGE".toByteArray())
+
+      val report = maintenance.scanVaultIntegrity(masterDek)
+
+      assertEquals(2, report.scannedFolders)
+      assertEquals(5, report.totalEncryptedFiles)
+      assertEquals(2, report.healthyFiles)
+      assertEquals(3, report.corruptedFiles.size)
+
+      val affected = report.affectedNames.toSet()
+      assertEquals(
+        setOf("payroll_corrupted.csv", "visa_truncated.pdf", "broken_header.vlock"),
+        affected,
+      )
+
+      val visaReport = report.corruptedFiles.first { it.affectedName == "visa_truncated.pdf" }
+      assertEquals(com.example.crypto.IntegrityFailureCategory.TRUNCATED_FILE, visaReport.category)
+      assertEquals("Passport Scans", visaReport.folderName)
+
+      val auditEntries = auditRepo.snapshot.value.entries
+      assertEquals(
+        true,
+        auditEntries.any { it.action == "INTEGRITY_SCAN" && it.isWarning && it.details.contains("visa_truncated.pdf") },
+      )
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun `bounded preview aborts oversized streams, streaming import encrypts cleanly, and file backup roundtrips`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = androidx.room.Room.inMemoryDatabaseBuilder(
+      context,
+      com.example.data.local.VaultDatabase::class.java,
+    ).allowMainThreadQueries().build()
+
+    try {
+      val testMasterKey = AesFolderCipher.generateAes256Key()
+      val keystore = com.example.crypto.KeystoreManager(context, overrideTestMasterKey = testMasterKey)
+      val auditRepo = com.example.data.audit.EncryptedAuditLogRepository(context, keystore, overrideTestKey = testMasterKey)
+      val prefsRepo = com.example.data.preferences.SecurityPreferencesRepository(context, keystore)
+      val dek = prefsRepo.initializeVault(
+        pin = "246810",
+        enableBiometrics = false,
+        question1 = "Q1",
+        answer1 = "A1",
+        question2 = "Q2",
+        answer2 = "A2",
+      )
+      val folderRepo = com.example.data.storage.FolderLockerRepository(context, db.vaultDao(), auditRepo)
+      val backupManager = com.example.data.backup.CloudBackupManager(context, db.vaultDao(), prefsRepo, auditRepo)
+
+      // 1. Bounded preview enforces maxBytes without full buffer
+      val largePayload = ByteArray(4096) { 0x41 }
+      val encOut = ByteArrayOutputStream()
+      AesFolderCipher.encryptStream(
+        input = ByteArrayInputStream(largePayload),
+        output = encOut,
+        key = dek,
+        metadata = EncryptedFileMetadata("big_preview.bin", "application/octet-stream", largePayload.size.toLong(), 1L),
+        chunkSize = 1024,
+      )
+      assertThrows(IllegalArgumentException::class.java) {
+        AesFolderCipher.decryptToByteArray(ByteArrayInputStream(encOut.toByteArray()), dek, maxBytes = 1024)
+      }
+
+      // 2. Streaming import into locked internal folder
+      val srcFile = java.io.File(context.cacheDir, "streamed_source.txt")
+      srcFile.writeText("Streamed encrypted payload verification")
+      val vaultFolder = folderRepo.createInternalVaultFolder("Stream Import", obfuscateDefault = true).getOrThrow()
+      folderRepo.lockFolder(vaultFolder.id, dek).getOrThrow()
+      val importedCount = folderRepo.importFilesIntoFolder(
+        vaultFolder.id,
+        listOf(android.net.Uri.fromFile(srcFile)),
+        dek,
+      ).getOrThrow()
+      assertEquals(1, importedCount)
+      srcFile.delete()
+
+      // 3. file:// URI CloudBackupManager export & restore compatibility
+      val backupFile = java.io.File(context.cacheDir, "portable_roundtrip.vlkbak")
+      val exportRes = backupManager.exportEncryptedBackup(
+        destinationUri = android.net.Uri.fromFile(backupFile),
+        providerLabel = "Local Portable",
+        dek = dek,
+      ).getOrThrow()
+      assertEquals(1, exportRes.record.fileCount)
+      assertEquals(true, backupFile.exists() && backupFile.length() > 0L)
+
+      val restoreRes = backupManager.restoreEncryptedBackup(
+        backupUri = android.net.Uri.fromFile(backupFile),
+        currentDek = dek,
+      ).getOrThrow()
+      assertEquals(1, restoreRes.restoredFolders)
+      assertEquals(1, restoreRes.restoredFiles)
+      backupFile.delete()
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun `selective lockFolder encrypts chosen files while preserving unchecked plaintext files and locked status`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = androidx.room.Room.inMemoryDatabaseBuilder(
+      context,
+      com.example.data.local.VaultDatabase::class.java,
+    ).allowMainThreadQueries().build()
+
+    try {
+      val testMasterKey = AesFolderCipher.generateAes256Key()
+      val keystore = com.example.crypto.KeystoreManager(context, overrideTestMasterKey = testMasterKey)
+      val auditRepo = com.example.data.audit.EncryptedAuditLogRepository(context, keystore, overrideTestKey = testMasterKey)
+      val folderRepo = com.example.data.storage.FolderLockerRepository(context, db.vaultDao(), auditRepo)
+      val dek = AesFolderCipher.generateAes256Key()
+
+      val folder = folderRepo.createInternalVaultFolder("SelectiveVault", obfuscateDefault = true).getOrThrow()
+      val dir = java.io.File(java.io.File(context.filesDir, "vaults"), folder.id)
+      dir.mkdirs()
+
+      val f1 = java.io.File(dir, "contract.pdf").apply { writeText("Confidential Contract Bytes") }
+      val f2 = java.io.File(dir, "receipt.txt").apply { writeText("Coffee Shop Receipt") }
+      val f3 = java.io.File(dir, "public_readme.txt").apply { writeText("Keep Me Plaintext") }
+
+      // Encrypt only contract.pdf and receipt.txt; leave public_readme.txt unencrypted
+      val locked = folderRepo.lockFolder(
+        folderId = folder.id,
+        dek = dek,
+        selectedFileIds = setOf(f1.absolutePath, f2.absolutePath),
+      ).getOrThrow()
+
+      assertEquals(true, locked.isLocked)
+      assertEquals(3, locked.fileCount)
+      assertEquals(2, locked.encryptedFileCount)
+      assertEquals(false, f1.exists())
+      assertEquals(false, f2.exists())
+      assertEquals(true, f3.exists())
+      assertEquals("Keep Me Plaintext", f3.readText())
+      assertEquals(true, java.io.File(dir, ".nomedia").exists())
+
+      val items = folderRepo.listFolderFiles(folder.id, dek).getOrThrow()
+      assertEquals(3, items.size)
+      assertEquals(2, items.count { it.isEncrypted })
+      assertEquals(1, items.count { !it.isEncrypted && it.displayName == "public_readme.txt" })
+
+      // Encrypt the remaining plaintext file selectively afterwards
+      val plainItem = items.first { !it.isEncrypted }
+      val lockedAll = folderRepo.lockFolder(
+        folderId = folder.id,
+        dek = dek,
+        selectedFileIds = setOf(plainItem.id),
+      ).getOrThrow()
+
+      assertEquals(true, lockedAll.isLocked)
+      assertEquals(3, lockedAll.encryptedFileCount)
+      assertEquals(false, f3.exists())
+
+      val auditEntries = auditRepo.snapshot.value.entries
+      assertEquals(true, auditEntries.any { it.action == "LOCKED" && it.details.contains("1 kept unencrypted") })
+      assertEquals(true, auditEntries.any { it.action == "FILES_ENCRYPTED" })
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun `decryptFilesInFolder decrypts single and batch files inside a locked folder and unlocks only when empty of ciphertext`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = androidx.room.Room.inMemoryDatabaseBuilder(
+      context,
+      com.example.data.local.VaultDatabase::class.java,
+    ).allowMainThreadQueries().build()
+
+    try {
+      val testMasterKey = AesFolderCipher.generateAes256Key()
+      val keystore = com.example.crypto.KeystoreManager(context, overrideTestMasterKey = testMasterKey)
+      val auditRepo = com.example.data.audit.EncryptedAuditLogRepository(context, keystore, overrideTestKey = testMasterKey)
+      val folderRepo = com.example.data.storage.FolderLockerRepository(context, db.vaultDao(), auditRepo)
+      val dek = AesFolderCipher.generateAes256Key()
+
+      val folder = folderRepo.createInternalVaultFolder("PartialDecryptVault", obfuscateDefault = true).getOrThrow()
+      val dir = java.io.File(java.io.File(context.filesDir, "vaults"), folder.id)
+      dir.mkdirs()
+
+      java.io.File(dir, "alpha.txt").writeText("Alpha Secret")
+      java.io.File(dir, "beta.txt").writeText("Beta Secret")
+      java.io.File(dir, "gamma.txt").writeText("Gamma Secret")
+
+      folderRepo.lockFolder(folder.id, dek).getOrThrow()
+      val lockedItems = folderRepo.listFolderFiles(folder.id, dek).getOrThrow()
+      assertEquals(3, lockedItems.count { it.isEncrypted })
+
+      // 1. Single-file decrypt on alpha.txt keeps folder locked with 2 encrypted files remaining
+      val alphaItem = lockedItems.first { it.displayName == "alpha.txt" }
+      val afterSingle = folderRepo.decryptFilesInFolder(folder.id, setOf(alphaItem.id), dek).getOrThrow()
+
+      assertEquals(true, afterSingle.isLocked)
+      assertEquals(3, afterSingle.fileCount)
+      assertEquals(2, afterSingle.encryptedFileCount)
+      assertEquals(true, java.io.File(dir, ".nomedia").exists())
+      assertEquals("Alpha Secret", java.io.File(dir, "alpha.txt").readText())
+
+      // 2. Batch-decrypt the remaining 2 encrypted files -> removes .nomedia and transitions folder to unlocked
+      val remainingEncIds = folderRepo.listFolderFiles(folder.id, dek).getOrThrow()
+        .filter { it.isEncrypted }
+        .map { it.id }
+        .toSet()
+      assertEquals(2, remainingEncIds.size)
+
+      val afterBatch = folderRepo.decryptFilesInFolder(folder.id, remainingEncIds, dek).getOrThrow()
+      assertEquals(false, afterBatch.isLocked)
+      assertEquals(0, afterBatch.encryptedFileCount)
+      assertEquals(3, afterBatch.fileCount)
+      assertEquals(false, java.io.File(dir, ".nomedia").exists())
+      assertEquals("Beta Secret", java.io.File(dir, "beta.txt").readText())
+      assertEquals("Gamma Secret", java.io.File(dir, "gamma.txt").readText())
+
+      val auditEntries = auditRepo.snapshot.value.entries
+      assertEquals(true, auditEntries.count { it.action == "FILE_DECRYPTED" } >= 2)
+    } finally {
+      db.close()
+    }
+  }
+
+  @OptIn(ExperimentalCoroutinesApi::class)
+  @Test
+  fun `VaultViewModel selective lock prompt lists plaintext files and supports partial encryption and batch decryption`() = kotlinx.coroutines.test.runTest {
+    val testDispatcher = StandardTestDispatcher(testScheduler)
+    Dispatchers.setMain(testDispatcher)
+    val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+    val store = androidx.lifecycle.ViewModelStore()
+
+    try {
+      val testKey = AesFolderCipher.generateAes256Key()
+      val viewModel = com.example.ui.VaultViewModel.createForTest(app, testKey)
+      store.put("selective_vm_test", viewModel)
+
+      fun pumpUntil(timeoutMs: Long = 3_000L, predicate: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!predicate() && System.currentTimeMillis() < deadline) {
+          testScheduler.runCurrent()
+          if (predicate()) break
+          Thread.sleep(15)
+        }
+        testScheduler.runCurrent()
+      }
+
+      viewModel.completeOnboarding(
+        pin = "654321",
+        enableBiometrics = false,
+        question1 = "Q1",
+        answer1 = "A1",
+        question2 = "Q2",
+        answer2 = "A2",
+      )
+      pumpUntil { viewModel.uiState.value.sessionState == com.example.ui.VaultSessionState.Unlocked }
+
+      viewModel.createPrivateFolder("WorkFolder")
+      pumpUntil { viewModel.uiState.value.folders.any { it.name == "WorkFolder" } }
+      val folder = viewModel.uiState.value.folders.first { it.name == "WorkFolder" }
+
+      val dir = java.io.File(java.io.File(app.filesDir, "vaults"), folder.id)
+      dir.mkdirs()
+      val keepPlain = java.io.File(dir, "notes_open.txt").apply { writeText("Open Notes") }
+      val encryptTarget = java.io.File(dir, "salary.csv").apply { writeText("Base,Bonus") }
+
+      viewModel.requestLockFolderWithSelection(folder.id, reloadDetail = true)
+      pumpUntil {
+        val prompt = viewModel.uiState.value.selectiveLockPrompt
+        prompt != null && !prompt.isLoading
+      }
+
+      val prompt = viewModel.uiState.value.selectiveLockPrompt!!
+      assertEquals(2, prompt.plaintextFiles.size)
+      val salaryItem = prompt.plaintextFiles.first { it.displayName == "salary.csv" }
+
+      viewModel.lockFolder(
+        folderId = folder.id,
+        reloadDetail = true,
+        selectedFileIds = setOf(salaryItem.id),
+      )
+      pumpUntil {
+        viewModel.uiState.value.selectiveLockPrompt == null &&
+          viewModel.uiState.value.activeFolderFiles.size == 2 &&
+          viewModel.uiState.value.activeFolderFiles.any { it.displayName == "salary.csv" && it.isEncrypted }
+      }
+
+      assertEquals(false, encryptTarget.exists())
+      assertEquals(true, keepPlain.exists())
+      val updatedFolder = viewModel.uiState.value.folders.first { it.id == folder.id }
+      assertEquals(true, updatedFolder.isLocked)
+      assertEquals(1, updatedFolder.encryptedFileCount)
+
+      val encSalaryId = viewModel.uiState.value.activeFolderFiles.first { it.isEncrypted }.id
+      viewModel.decryptFilesInFolder(folder.id, setOf(encSalaryId), reloadDetail = true)
+      pumpUntil {
+        viewModel.uiState.value.activeFolderFiles.all { !it.isEncrypted } &&
+          viewModel.uiState.value.folders.first { it.id == folder.id }.isLocked == false
+      }
+
+      assertEquals("Base,Bonus", encryptTarget.readText())
+    } finally {
+      store.clear()
+      Dispatchers.resetMain()
+    }
+  }
+
+  @Test
+  fun `decryptAnySafFolder decrypts unregistered external folder in-place without leaving copies`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = androidx.room.Room.inMemoryDatabaseBuilder(
+      context,
+      com.example.data.local.VaultDatabase::class.java,
+    ).allowMainThreadQueries().build()
+    val externalDir = java.io.File(context.cacheDir, "unregistered_device_folder_${System.nanoTime()}")
+    externalDir.mkdirs()
+
+    try {
+      val repo = com.example.data.storage.FolderLockerRepository(context, db.vaultDao())
+      val dek = AesFolderCipher.generateAes256Key()
+
+      val payload1 = "Classified receipt 2026".toByteArray()
+      val encFile1 = java.io.File(externalDir, "obf_111.vlock")
+      encFile1.outputStream().use { out ->
+        AesFolderCipher.encryptStream(
+          input = ByteArrayInputStream(payload1),
+          output = out,
+          key = dek,
+          metadata = EncryptedFileMetadata("receipt.txt", "text/plain", payload1.size.toLong(), 100L),
+        )
+      }
+
+      val subDir = java.io.File(externalDir, "Nested").apply { mkdirs() }
+      val payload2 = "Quarterly budget".toByteArray()
+      val encFile2 = java.io.File(subDir, "budget.csv.vlock")
+      encFile2.outputStream().use { out ->
+        AesFolderCipher.encryptStream(
+          input = ByteArrayInputStream(payload2),
+          output = out,
+          key = dek,
+          metadata = EncryptedFileMetadata("budget.csv", "text/csv", payload2.size.toLong(), 101L),
+        )
+      }
+
+      val nomedia = java.io.File(externalDir, ".nomedia").apply { writeText("") }
+      val plainAlready = java.io.File(externalDir, "readme.txt").apply { writeText("Already plain") }
+
+      val result = repo.decryptAnySafFolder(android.net.Uri.fromFile(externalDir), dek).getOrThrow()
+
+      assertEquals(2, result.decryptedFiles)
+      assertEquals(1, result.alreadyPlainFiles)
+      assertEquals(false, result.wasRegisteredInVault)
+
+      // Exact decrypted files restored and zero .vlock / .nomedia copies remain
+      assertEquals(false, encFile1.exists())
+      assertEquals(false, encFile2.exists())
+      assertEquals(false, nomedia.exists())
+      assertEquals("Classified receipt 2026", java.io.File(externalDir, "receipt.txt").readText())
+      assertEquals("Quarterly budget", java.io.File(subDir, "budget.csv").readText())
+      assertEquals("Already plain", plainAlready.readText())
+
+      val logs = db.vaultDao().observeAuditLogs().first()
+      assertEquals(true, logs.any { it.action == "ANY_FOLDER_DECRYPTED" })
+    } finally {
+      externalDir.deleteRecursively()
+      db.close()
+    }
+  }
+
+  @Test
+  fun `SAF import move lock and unlock leave zero duplicate copies`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = androidx.room.Room.inMemoryDatabaseBuilder(
+      context,
+      com.example.data.local.VaultDatabase::class.java,
+    ).allowMainThreadQueries().build()
+    val deviceDir = java.io.File(context.cacheDir, "saf_device_${System.nanoTime()}").apply { mkdirs() }
+    val externalDrop = java.io.File(context.cacheDir, "drop_source_${System.nanoTime()}").apply { mkdirs() }
+
+    try {
+      val repo = com.example.data.storage.FolderLockerRepository(context, db.vaultDao())
+      val dek = AesFolderCipher.generateAes256Key()
+      val plainDoc = java.io.File(deviceDir, "taxes.pdf").apply { writeText("PDF-CONTENT-2026") }
+
+      val registered = repo.registerSafFolder(
+        treeUri = android.net.Uri.fromFile(deviceDir),
+        obfuscateDefault = false,
+        requireBioDefault = false,
+      ).getOrThrow()
+
+      // Lock folder -> plaintext removed, .vlock created
+      val locked = repo.lockFolder(registered.id, dek).getOrThrow()
+      assertEquals(true, locked.isLocked)
+      assertEquals(1, locked.encryptedFileCount)
+      assertEquals(false, plainDoc.exists())
+      val encryptedTarget = java.io.File(deviceDir, "taxes.pdf.vlock")
+      assertEquals(true, encryptedTarget.exists())
+
+      // Move-import external file into locked SAF folder -> immediately encrypted, original deleted
+      val externalSource = java.io.File(externalDrop, "passport.txt").apply { writeText("ID-9988") }
+      val importReport = repo.importFilesWithReport(
+        folderId = registered.id,
+        uris = listOf(android.net.Uri.fromFile(externalSource)),
+        dek = dek,
+        moveOriginals = true,
+      ).getOrThrow()
+      assertEquals(1, importReport.importedCount)
+      assertEquals(1, importReport.movedWithoutCopyCount)
+      assertEquals(0, importReport.readOnlySourceCount)
+      assertEquals(false, externalSource.exists())
+
+      val encryptedPassport = java.io.File(deviceDir, "passport.txt.vlock")
+      assertEquals(true, encryptedPassport.exists())
+
+      // Unlock folder -> both restored to plaintext, zero .vlock files remain
+      val unlocked = repo.unlockFolder(registered.id, dek).getOrThrow()
+      assertEquals(false, unlocked.isLocked)
+      assertEquals(0, unlocked.encryptedFileCount)
+      assertEquals(2, unlocked.fileCount)
+      assertEquals(false, encryptedTarget.exists())
+      assertEquals(false, encryptedPassport.exists())
+      assertEquals("PDF-CONTENT-2026", java.io.File(deviceDir, "taxes.pdf").readText())
+      assertEquals("ID-9988", java.io.File(deviceDir, "passport.txt").readText())
+    } finally {
+      deviceDir.deleteRecursively()
+      externalDrop.deleteRecursively()
+      db.close()
+    }
+  }
+
+  @Test
+  fun `removeFilesInFolder and removeFoldersBatch delete or unlink according to option`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = androidx.room.Room.inMemoryDatabaseBuilder(
+      context,
+      com.example.data.local.VaultDatabase::class.java,
+    ).allowMainThreadQueries().build()
+    val safDirA = java.io.File(context.cacheDir, "saf_remove_a_${System.nanoTime()}").apply { mkdirs() }
+    val safDirB = java.io.File(context.cacheDir, "saf_remove_b_${System.nanoTime()}").apply { mkdirs() }
+
+    try {
+      val repo = com.example.data.storage.FolderLockerRepository(context, db.vaultDao())
+      val dek = AesFolderCipher.generateAes256Key()
+
+      // Private vault folder: test selective file removal
+      val privFolder = repo.createInternalVaultFolder("PrivDrop", obfuscateDefault = false).getOrThrow()
+      val privDir = java.io.File(java.io.File(context.filesDir, "vaults"), privFolder.id)
+      val f1 = java.io.File(privDir, "one.txt").apply { writeText("111") }
+      val f2 = java.io.File(privDir, "two.txt").apply { writeText("222") }
+      repo.lockFolder(privFolder.id, dek).getOrThrow()
+      val itemsBefore = repo.listFolderFiles(privFolder.id, dek).getOrThrow()
+      assertEquals(2, itemsBefore.size)
+
+      val oneItem = itemsBefore.first { it.displayName == "one.txt" }
+      val afterOneRemoved = repo.removeFilesInFolder(privFolder.id, setOf(oneItem.id)).getOrThrow()
+      assertEquals(1, afterOneRemoved.fileCount)
+      assertEquals(true, java.io.File(privDir, "two.txt.vlock").exists())
+
+      // Removing last encrypted file also clears .nomedia and marks folder unlocked
+      val twoItem = repo.listFolderFiles(privFolder.id, dek).getOrThrow().first()
+      val afterAllRemoved = repo.removeFilesInFolder(privFolder.id, setOf(twoItem.id)).getOrThrow()
+      assertEquals(0, afterAllRemoved.fileCount)
+      assertEquals(false, afterAllRemoved.isLocked)
+      assertEquals(false, java.io.File(privDir, ".nomedia").exists())
+
+      // SAF Folder A removed with decryptLockedSafFirst = true -> decrypted on disk & removed from DB
+      java.io.File(safDirA, "a.txt").writeText("Alpha")
+      val regA = repo.registerSafFolder(android.net.Uri.fromFile(safDirA), obfuscateDefault = false).getOrThrow()
+      repo.lockFolder(regA.id, dek).getOrThrow()
+      assertEquals(true, java.io.File(safDirA, "a.txt.vlock").exists())
+
+      val batchDecrypted = repo.removeFoldersBatch(
+        folderIds = listOf(regA.id, privFolder.id),
+        dek = dek,
+        decryptLockedSafFirst = true,
+      )
+      assertEquals(2, batchDecrypted.succeededCount)
+      assertEquals(0, batchDecrypted.failedCount)
+      assertEquals("Alpha", java.io.File(safDirA, "a.txt").readText())
+      assertEquals(false, java.io.File(safDirA, "a.txt.vlock").exists())
+      assertEquals(false, privDir.exists())
+      assertEquals(null, db.vaultDao().getFolderById(regA.id))
+
+      // SAF Folder B removed with decryptLockedSafFirst = false -> unlinked while keeping .vlock encrypted on disk
+      java.io.File(safDirB, "b.txt").writeText("Beta")
+      val regB = repo.registerSafFolder(android.net.Uri.fromFile(safDirB), obfuscateDefault = false).getOrThrow()
+      repo.lockFolder(regB.id, dek).getOrThrow()
+      repo.removeFolderFromVault(regB.id, dek, decryptLockedSafFirst = false)
+      assertEquals(true, java.io.File(safDirB, "b.txt.vlock").exists())
+      assertEquals(false, java.io.File(safDirB, "b.txt").exists())
+      assertEquals(null, db.vaultDao().getFolderById(regB.id))
+
+      assertEquals(false, f1.exists())
+      assertEquals(false, f2.exists())
+    } finally {
+      safDirA.deleteRecursively()
+      safDirB.deleteRecursively()
       db.close()
     }
   }

@@ -11,6 +11,9 @@ import com.example.data.audit.AuditExportFormat
 import com.example.data.audit.AuditExportScope
 import com.example.data.audit.EncryptedAuditLogRepository
 import com.example.data.backup.CloudBackupManager
+import com.example.data.backup.DriveAuthExpiredException
+import com.example.data.backup.DriveVaultBackupItem
+import com.example.data.backup.GoogleDriveAuthHelper
 import com.example.data.local.VaultDatabase
 import com.example.data.preferences.SecurityPreferencesRepository
 import com.example.data.preferences.SecuritySettings
@@ -24,11 +27,14 @@ import com.example.security.PanicSensitivity
 import com.example.security.QuickTileCommand
 import com.example.security.VaultQuickActionBus
 import com.example.ui.theme.ThemeMode
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import javax.crypto.SecretKey
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -36,17 +42,27 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-class VaultViewModel(application: Application) : AndroidViewModel(application) {
+class VaultViewModel private constructor(
+  application: Application,
+  private val keystoreManager: KeystoreManager,
+  overrideAuditKey: SecretKey?,
+) : AndroidViewModel(application) {
 
-  private val keystoreManager = KeystoreManager(application)
+  constructor(application: Application) : this(
+    application = application,
+    keystoreManager = KeystoreManager(application),
+    overrideAuditKey = null,
+  )
+
   private val database = VaultDatabase.getInstance(application)
   private val vaultDao = database.vaultDao()
-  private val auditLogRepo = EncryptedAuditLogRepository(application, keystoreManager)
+  private val auditLogRepo = EncryptedAuditLogRepository(application, keystoreManager, overrideTestKey = overrideAuditKey)
   private val prefsRepo = SecurityPreferencesRepository(application, keystoreManager)
   private val folderRepo = FolderLockerRepository(application, vaultDao, auditLogRepo)
   private val cloudBackupManager = CloudBackupManager(application, vaultDao, prefsRepo, auditLogRepo)
@@ -54,10 +70,20 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
   private val batteryMonitor = BatteryPowerMonitor(application)
 
   private var sessionDek: SecretKey? = null
+  private var driveAccessToken: String? = null
   private var backgroundedAtMillis: Long = 0L
   private var autoLockJob: Job? = null
   private var migrationJob: Job? = null
+  private var integrityScanJob: Job? = null
   private var lastBlockingState: Boolean = false
+  private val idleResetSignal = MutableSharedFlow<Long>(
+    replay = 1,
+    onBufferOverflow = BufferOverflow.DROP_OLDEST,
+  )
+  @Volatile
+  private var idleSequence: Long = 0L
+  @Volatile
+  private var isAppInForeground: Boolean = true
 
   private val _uiState = MutableStateFlow(
     VaultUiState(
@@ -69,6 +95,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
   private val _panicEvents = MutableSharedFlow<Boolean>(extraBufferCapacity = 1)
   val panicEvents: SharedFlow<Boolean> = _panicEvents.asSharedFlow()
+
+  private val _driveReauthRequired = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+  val driveReauthRequired: SharedFlow<Unit> = _driveReauthRequired.asSharedFlow()
 
   init {
     batteryMonitor.start()
@@ -127,6 +156,29 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
       }
     }
+    viewModelScope.launch {
+      idleResetSignal.collectLatest {
+        val settings = _uiState.value.securitySettings
+        if (!isAppInForeground || sessionDek == null || !settings.idleTimeoutEnabled || settings.idleTimeoutSeconds <= 0) {
+          return@collectLatest
+        }
+        var remainingMs = settings.idleTimeoutSeconds.toLong() * 1000L
+        while (remainingMs > 0L) {
+          val stepMs = remainingMs.coerceAtMost(5_000L)
+          delay(stepMs)
+          val latestSettings = _uiState.value.securitySettings
+          if (!isAppInForeground || sessionDek == null || !latestSettings.idleTimeoutEnabled || latestSettings.idleTimeoutSeconds <= 0) {
+            return@collectLatest
+          }
+          if (isBusyWithForegroundWork()) {
+            remainingMs = latestSettings.idleTimeoutSeconds.toLong() * 1000L
+          } else {
+            remainingMs -= stepMs
+          }
+        }
+        performIdleTimeoutLock(_uiState.value.securitySettings.idleTimeoutSeconds)
+      }
+    }
   }
 
   override fun onCleared() {
@@ -162,10 +214,12 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
           it.copy(
             sessionState = VaultSessionState.Unlocked,
+            securitySettings = it.securitySettings.copy(isVaultInitialized = true),
             authError = null,
             statusMessage = "Vault initialized with AES-256-GCM encryption",
           )
         }
+        resetIdleTimer()
       }.onFailure { err ->
         _uiState.update { it.copy(errorMessage = err.message ?: "Vault initialization failed") }
       }
@@ -321,7 +375,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     val statusMsg = when {
       catchUpSealedCount > 0 -> "Auto-lock sealed $catchUpSealedCount folder(s) after background timeout"
       wasPanicLockedNotice -> "Vault re-authenticated after Panic Mode seal"
-      wasAutoLockedNotice -> "Vault authenticated after background auto-lock"
+      wasAutoLockedNotice -> "Vault authenticated after automatic lock"
       else -> null
     }
     _uiState.update {
@@ -331,6 +385,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         statusMessage = statusMsg ?: it.statusMessage,
       )
     }
+    resetIdleTimer()
     if (settings.pendingBatteryPausedAutoSync && !pausedByBattery) {
       resumeBatteryPausedWorkIfReady(settings, batteryMonitor.powerState.value)
     }
@@ -366,6 +421,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             statusMessage = "Master PIN reset and vault unlocked",
           )
         }
+        resetIdleTimer()
       } else {
         auditLogRepo.recordEvent(
           action = "RECOVERY_FAILED",
@@ -385,6 +441,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     autoLockJob?.cancel()
     autoLockJob = null
     sessionDek = null
+    driveAccessToken = null
+    cancelIdleTimer()
     VaultQuickActionBus.updateVaultState(
       unlocked = false,
       panicExitToHome = _uiState.value.securitySettings.panicExitToDeviceHome,
@@ -413,6 +471,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         activeFolderFiles = emptyList(),
         securePreview = null,
         pendingRestoreUriRequiringPin = null,
+        pendingDriveRestoreItem = null,
         isSelectionMode = false,
         selectedFolderIds = emptySet(),
         authError = null,
@@ -431,6 +490,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     autoLockJob = null
     backgroundedAtMillis = 0L
     sessionDek = null
+    driveAccessToken = null
+    cancelIdleTimer()
     VaultQuickActionBus.updateVaultState(
       unlocked = false,
       panicExitToHome = settings.panicExitToDeviceHome,
@@ -447,6 +508,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         activeFolderFiles = emptyList(),
         securePreview = null,
         pendingRestoreUriRequiringPin = null,
+        pendingDriveRestoreItem = null,
         isSelectionMode = false,
         selectedFolderIds = emptySet(),
         authError = null,
@@ -492,7 +554,34 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     }
   }
 
+  fun onUserInteraction() {
+    if (isAppInForeground && sessionDek != null) {
+      resetIdleTimer()
+    }
+  }
+
+  private fun resetIdleTimer() {
+    idleResetSignal.tryEmit(++idleSequence)
+  }
+
+  private fun cancelIdleTimer() {
+    idleResetSignal.tryEmit(++idleSequence)
+  }
+
+  private fun isBusyWithForegroundWork(): Boolean {
+    val state = _uiState.value
+    return state.encryptionProgress != null ||
+      state.cloudBackupProgress != null ||
+      state.migrationProgress != null ||
+      state.isAutoLockReencrypting ||
+      state.isCleaningOrphans ||
+      state.isScanningIntegrity
+  }
+
   fun onAppBackgrounded() {
+    isAppInForeground = false
+    cancelIdleTimer()
+
     val settings = _uiState.value.securitySettings
     if (!settings.autoLockEnabled || sessionDek == null) return
 
@@ -511,6 +600,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
   }
 
   fun onAppForegrounded() {
+    isAppInForeground = true
     autoLockJob?.cancel()
     autoLockJob = null
 
@@ -520,6 +610,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     if (!settings.autoLockEnabled) {
       viewModelScope.launch { prefsRepo.recordBackgroundedAt(0L) }
+      if (sessionDek != null) resetIdleTimer()
       return
     }
 
@@ -532,13 +623,17 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
       } else {
         viewModelScope.launch { prefsRepo.recordBackgroundedAt(0L) }
+        resetIdleTimer()
       }
+    } else if (dek != null) {
+      resetIdleTimer()
     }
   }
 
   private suspend fun performAutoLock(elapsedSeconds: Int) {
     val dek = sessionDek ?: return
     val settings = _uiState.value.securitySettings
+    cancelIdleTimer()
 
     withContext(NonCancellable) {
       _uiState.update { it.copy(isAutoLockReencrypting = true) }
@@ -578,6 +673,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
       prefsRepo.markAutoLocked(wasAutoLocked = true, summary = summary)
 
       sessionDek = null
+      driveAccessToken = null
       VaultQuickActionBus.updateVaultState(
         unlocked = false,
         panicExitToHome = settings.panicExitToDeviceHome,
@@ -586,13 +682,85 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
       _uiState.update {
         it.copy(
           isAutoLockReencrypting = false,
-          sessionState = if (settings.isVaultInitialized) {
+          sessionState = if (settings.isVaultInitialized || it.sessionState == VaultSessionState.Unlocked) {
             VaultSessionState.Locked
           } else {
             VaultSessionState.NeedsOnboarding
           },
           activeFolderFiles = emptyList(),
           securePreview = null,
+          pendingRestoreUriRequiringPin = null,
+          pendingDriveRestoreItem = null,
+          isSelectionMode = false,
+          selectedFolderIds = emptySet(),
+          authError = null,
+        )
+      }
+    }
+  }
+
+  private suspend fun performIdleTimeoutLock(timeoutSeconds: Int) {
+    val dek = sessionDek ?: return
+    val settings = _uiState.value.securitySettings
+    if (!isAppInForeground || !settings.idleTimeoutEnabled) return
+
+    cancelIdleTimer()
+    withContext(NonCancellable) {
+      _uiState.update { it.copy(isAutoLockReencrypting = true) }
+
+      val pausedByBattery = isBatterySaverBlockingNow()
+      val reencryptedCount = if (settings.autoLockReencryptFolders && !pausedByBattery) {
+        reencryptAllUnlockedFolders(dek)
+      } else {
+        0
+      }
+
+      if (settings.autoLockReencryptFolders && pausedByBattery) {
+        prefsRepo.setPendingBatteryPausedReencrypt(true)
+        val pState = batteryMonitor.powerState.value
+        auditLogRepo.recordEvent(
+          action = "BATTERY_SAVER_PAUSED",
+          folderName = "Idle Timeout Re-Encryption",
+          details = "Session locked due to inactivity; heavy folder re-encryption paused (${pState.batteryPercent}%${if (pState.isSystemPowerSaveMode) ", Power Save active" else ""}) until charged > 20%",
+          category = AuditCategory.CRYPTO_OPERATION,
+        )
+      }
+
+      val durationText = formatDurationLabel(timeoutSeconds)
+      val summary = when {
+        reencryptedCount > 0 -> "Re-encrypted $reencryptedCount folder(s) after $durationText of inactivity"
+        settings.autoLockReencryptFolders && pausedByBattery ->
+          "Vault sealed after $durationText of inactivity (folder re-encryption paused by Battery Saver)"
+        else -> "Vault sealed after $durationText of inactivity"
+      }
+
+      auditLogRepo.recordEvent(
+        action = "IDLE_LOCK",
+        folderName = "Idle Timeout",
+        details = summary,
+        category = AuditCategory.ACCESS_EVENT,
+      )
+      prefsRepo.markAutoLocked(wasAutoLocked = true, summary = summary)
+
+      sessionDek = null
+      driveAccessToken = null
+      VaultQuickActionBus.updateVaultState(
+        unlocked = false,
+        panicExitToHome = settings.panicExitToDeviceHome,
+        context = getApplication(),
+      )
+      _uiState.update {
+        it.copy(
+          isAutoLockReencrypting = false,
+          sessionState = if (settings.isVaultInitialized || it.sessionState == VaultSessionState.Unlocked) {
+            VaultSessionState.Locked
+          } else {
+            VaultSessionState.NeedsOnboarding
+          },
+          activeFolderFiles = emptyList(),
+          securePreview = null,
+          pendingRestoreUriRequiringPin = null,
+          pendingDriveRestoreItem = null,
           isSelectionMode = false,
           selectedFolderIds = emptySet(),
           authError = null,
@@ -632,6 +800,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
       folderRepo.registerSafFolder(treeUri, obfuscateDefault = obfuscate)
         .onSuccess { folder ->
           _uiState.update { it.copy(statusMessage = "Added \"${folder.name}\" to BeastLock") }
+          if (folder.fileCount > 0 && !folder.isLocked) {
+            requestLockFolderWithSelection(folder.id, reloadDetail = false)
+          }
         }
         .onFailure { err ->
           _uiState.update { it.copy(errorMessage = err.message ?: "Failed to register folder") }
@@ -652,15 +823,27 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     }
   }
 
-  fun importFiles(folderId: String, uris: List<Uri>) {
+  fun importFiles(
+    folderId: String,
+    uris: List<Uri>,
+    moveOriginals: Boolean = true,
+  ) {
     if (uris.isEmpty()) return
     viewModelScope.launch {
-      folderRepo.importFilesIntoFolder(folderId, uris, sessionDek)
-        .onSuccess { count ->
+      folderRepo.importFilesWithReport(folderId, uris, sessionDek, moveOriginals = moveOriginals)
+        .onSuccess { res ->
           loadFolderFiles(folderId)
-          _uiState.update { it.copy(statusMessage = "Imported $count file(s)") }
+          val msg = when {
+            res.importedCount == 0 -> "No files were imported"
+            moveOriginals && res.movedWithoutCopyCount == res.importedCount ->
+              "Added ${res.importedCount} file(s) (moved without copies)"
+            moveOriginals && res.movedWithoutCopyCount > 0 ->
+              "Added ${res.importedCount} file(s) (${res.movedWithoutCopyCount} moved, ${res.readOnlySourceCount} from read-only picker)"
+            else -> "Added ${res.importedCount} file(s)"
+          }
+          _uiState.update { it.copy(statusMessage = msg) }
           val dek = sessionDek
-          if (dek != null) {
+          if (dek != null && res.importedCount > 0) {
             maybeRunAutoCloudSync(dek, onlyIfFolderSyncEnabledId = folderId)
           }
         }
@@ -689,16 +872,82 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     }
   }
 
-  fun lockFolder(folderId: String, reloadDetail: Boolean = false) {
+  fun requestLockFolderWithSelection(folderId: String, reloadDetail: Boolean = false) {
+    val folder = _uiState.value.folders.find { it.id == folderId } ?: return
+    viewModelScope.launch {
+      _uiState.update {
+        it.copy(
+          selectiveLockPrompt = SelectiveLockPromptState(
+            folder = folder,
+            isLoading = true,
+            reloadDetailAfterLock = reloadDetail,
+          ),
+        )
+      }
+      folderRepo.listFolderFiles(folderId, sessionDek)
+        .onSuccess { files ->
+          val plaintext = files.filter { !it.isEncrypted }
+          val encryptedCount = files.count { it.isEncrypted }
+          if (plaintext.isEmpty()) {
+            _uiState.update { it.copy(selectiveLockPrompt = null) }
+            if (!folder.isLocked) {
+              lockFolder(folderId, reloadDetail = reloadDetail)
+            } else {
+              _uiState.update {
+                it.copy(statusMessage = "All files in \"${folder.name}\" are already encrypted")
+              }
+            }
+          } else {
+            _uiState.update {
+              it.copy(
+                selectiveLockPrompt = SelectiveLockPromptState(
+                  folder = folder,
+                  plaintextFiles = plaintext,
+                  alreadyEncryptedCount = encryptedCount,
+                  isLoading = false,
+                  reloadDetailAfterLock = reloadDetail,
+                ),
+              )
+            }
+          }
+        }
+        .onFailure { err ->
+          _uiState.update {
+            it.copy(
+              selectiveLockPrompt = null,
+              errorMessage = err.message ?: "Could not inspect folder contents",
+            )
+          }
+        }
+    }
+  }
+
+  fun dismissSelectiveLockPrompt() {
+    _uiState.update { it.copy(selectiveLockPrompt = null) }
+  }
+
+  fun lockFolder(
+    folderId: String,
+    reloadDetail: Boolean = false,
+    selectedFileIds: Set<String>? = null,
+  ) {
     val dek = sessionDek ?: return
     viewModelScope.launch {
-      folderRepo.lockFolder(folderId, dek) { progress ->
+      _uiState.update { it.copy(selectiveLockPrompt = null) }
+      folderRepo.lockFolder(folderId, dek, selectedFileIds = selectedFileIds) { progress ->
         _uiState.update { it.copy(encryptionProgress = progress) }
       }.onSuccess { updated ->
+        val remainingPlain = (updated.fileCount - updated.encryptedFileCount).coerceAtLeast(0)
+        val msg = when {
+          selectedFileIds != null && remainingPlain > 0 ->
+            "Encrypted ${updated.encryptedFileCount}/${updated.fileCount} file(s) in \"${updated.name}\" ($remainingPlain kept unencrypted)"
+          else ->
+            "Locked \"${updated.name}\" with AES-256-GCM"
+        }
         _uiState.update {
           it.copy(
             encryptionProgress = null,
-            statusMessage = "Locked \"${updated.name}\" with AES-256-GCM",
+            statusMessage = msg,
           )
         }
         if (reloadDetail) loadFolderFiles(folderId)
@@ -737,6 +986,92 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
           )
         }
       }
+    }
+  }
+
+  fun decryptFilesInFolder(
+    folderId: String,
+    fileIds: Set<String>,
+    reloadDetail: Boolean = true,
+  ) {
+    if (fileIds.isEmpty()) return
+    val dek = sessionDek ?: return
+    viewModelScope.launch {
+      folderRepo.decryptFilesInFolder(folderId, fileIds, dek) { progress ->
+        _uiState.update { it.copy(encryptionProgress = progress) }
+      }.onSuccess { updated ->
+        val msg = if (updated.isLocked) {
+          "Decrypted ${fileIds.size} file(s) • ${updated.encryptedFileCount} still encrypted"
+        } else {
+          "Decrypted ${fileIds.size} file(s) in \"${updated.name}\""
+        }
+        _uiState.update {
+          it.copy(
+            encryptionProgress = null,
+            statusMessage = msg,
+          )
+        }
+        if (reloadDetail) loadFolderFiles(folderId)
+      }.onFailure { err ->
+        _uiState.update {
+          it.copy(
+            encryptionProgress = null,
+            errorMessage = err.message ?: "File decryption failed — key or tag mismatch",
+          )
+        }
+      }
+    }
+  }
+
+  fun decryptAnyDeviceFolder(treeUri: Uri) {
+    val dek = sessionDek ?: return
+    viewModelScope.launch {
+      folderRepo.decryptAnySafFolder(treeUri, dek) { progress ->
+        _uiState.update { it.copy(encryptionProgress = progress) }
+      }.onSuccess { res ->
+        val msg = if (res.decryptedFiles > 0) {
+          "Decrypted ${res.decryptedFiles} file(s) in \"${res.folderName}\" in-place (no copies left)"
+        } else {
+          "No encrypted .vlock files found in \"${res.folderName}\""
+        }
+        _uiState.update {
+          it.copy(
+            encryptionProgress = null,
+            statusMessage = msg,
+          )
+        }
+      }.onFailure { err ->
+        _uiState.update {
+          it.copy(
+            encryptionProgress = null,
+            errorMessage = err.message ?: "Could not decrypt device folder",
+          )
+        }
+      }
+    }
+  }
+
+  fun removeFilesInFolder(
+    folderId: String,
+    fileIds: Set<String>,
+    reloadDetail: Boolean = true,
+  ) {
+    if (fileIds.isEmpty()) return
+    viewModelScope.launch {
+      folderRepo.removeFilesInFolder(folderId, fileIds)
+        .onSuccess { updated ->
+          if (reloadDetail) loadFolderFiles(folderId)
+          _uiState.update {
+            it.copy(
+              statusMessage = "Removed ${fileIds.size} file(s) from \"${updated.name}\"",
+            )
+          }
+        }
+        .onFailure { err ->
+          _uiState.update {
+            it.copy(errorMessage = err.message ?: "Failed to remove selected file(s)")
+          }
+        }
     }
   }
 
@@ -1102,12 +1437,25 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     return settings.batterySaverModeEnabled && power.isBatterySaverPaused
   }
 
+  private suspend fun resolveDriveToken(): String? {
+    val existing = driveAccessToken
+    if (!existing.isNullOrBlank()) return existing
+    val silent = GoogleDriveAuthHelper.trySilentToken(getApplication())
+    if (!silent.isNullOrBlank()) {
+      driveAccessToken = silent
+    }
+    return silent
+  }
+
   private fun maybeRunAutoCloudSync(
     dek: SecretKey,
     onlyIfFolderSyncEnabledId: String? = null,
   ) {
     val settings = _uiState.value.securitySettings
-    if (settings.autoBackupTreeUri.isBlank()) return
+    val hasSafSync = settings.autoBackupTreeUri.isNotBlank()
+    val hasDriveSync = settings.googleDriveSyncConnected && settings.googleDriveAutoSyncEnabled
+    if (!hasSafSync && !hasDriveSync) return
+
     if (onlyIfFolderSyncEnabledId != null) {
       val f = _uiState.value.folders.find { it.id == onlyIfFolderSyncEnabledId }
       if (f == null || !f.autoCloudBackupSync) return
@@ -1118,9 +1466,10 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         val alreadyPending = settings.pendingBatteryPausedAutoSync
         prefsRepo.setPendingBatteryPausedAutoSync(true)
         if (!alreadyPending) {
+          val providerLabel = if (hasDriveSync) "Google Drive API" else settings.autoBackupProviderLabel
           auditLogRepo.recordEvent(
             action = "BATTERY_SAVER_PAUSED",
-            folderName = settings.autoBackupProviderLabel,
+            folderName = providerLabel,
             details = "Automatic cloud backup sync paused (${pState.batteryPercent}%${if (pState.isSystemPowerSaveMode) ", Power Save active" else ""}); will resume once charged > 20%",
             category = AuditCategory.CLOUD_SYNC,
           )
@@ -1135,11 +1484,31 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     }
     viewModelScope.launch {
       prefsRepo.setPendingBatteryPausedAutoSync(false)
-      cloudBackupManager.syncAutoBackupToTree(
-        treeUri = Uri.parse(settings.autoBackupTreeUri),
-        providerLabel = settings.autoBackupProviderLabel,
-        dek = dek,
-      )
+      if (hasSafSync) {
+        cloudBackupManager.syncAutoBackupToTree(
+          treeUri = Uri.parse(settings.autoBackupTreeUri),
+          providerLabel = settings.autoBackupProviderLabel,
+          dek = dek,
+        )
+      }
+      if (hasDriveSync) {
+        val token = resolveDriveToken()
+        if (!token.isNullOrBlank()) {
+          cloudBackupManager.syncVaultToGoogleDrive(
+            accessToken = token,
+            dek = dek,
+            onlyAutoSyncEnabled = true,
+          ).onSuccess {
+            cloudBackupManager.listGoogleDriveBackups(token).onSuccess { list ->
+              _uiState.update { it.copy(driveBackups = list) }
+            }
+          }.onFailure { err ->
+            if (err is DriveAuthExpiredException) {
+              driveAccessToken = null
+            }
+          }
+        }
+      }
     }
   }
 
@@ -1165,24 +1534,46 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
       }
     }
-    if (settings.pendingBatteryPausedAutoSync && settings.autoBackupTreeUri.isNotBlank()) {
+    val hasSafSync = settings.autoBackupTreeUri.isNotBlank()
+    val hasDriveSync = settings.googleDriveSyncConnected && settings.googleDriveAutoSyncEnabled
+    if (settings.pendingBatteryPausedAutoSync && (hasSafSync || hasDriveSync)) {
       viewModelScope.launch {
         prefsRepo.setPendingBatteryPausedAutoSync(false)
+        val providerLabel = if (hasDriveSync) "Google Drive API" else settings.autoBackupProviderLabel
         auditLogRepo.recordEvent(
           action = "BATTERY_SAVER_RESUMED",
-          folderName = settings.autoBackupProviderLabel,
+          folderName = providerLabel,
           details = "Battery recovered (${powerState.batteryPercent}%) — resuming queued automatic cloud sync",
           category = AuditCategory.CLOUD_SYNC,
         )
-        cloudBackupManager.syncAutoBackupToTree(
-          treeUri = Uri.parse(settings.autoBackupTreeUri),
-          providerLabel = settings.autoBackupProviderLabel,
-          dek = dek,
-        ).onSuccess { res ->
-          if (res != null) {
-            _uiState.update {
-              it.copy(statusMessage = "Battery > 20% — Resumed queued cloud sync (${res.record.fileCount} files)")
+        var resumedFileCount: Int? = null
+        if (hasSafSync) {
+          cloudBackupManager.syncAutoBackupToTree(
+            treeUri = Uri.parse(settings.autoBackupTreeUri),
+            providerLabel = settings.autoBackupProviderLabel,
+            dek = dek,
+          ).onSuccess { res ->
+            if (res != null) resumedFileCount = res.record.fileCount
+          }
+        }
+        if (hasDriveSync) {
+          val token = resolveDriveToken()
+          if (!token.isNullOrBlank()) {
+            cloudBackupManager.syncVaultToGoogleDrive(
+              accessToken = token,
+              dek = dek,
+              onlyAutoSyncEnabled = true,
+            ).onSuccess { res ->
+              if (res != null) resumedFileCount = res.record.fileCount
+              cloudBackupManager.listGoogleDriveBackups(token).onSuccess { list ->
+                _uiState.update { it.copy(driveBackups = list) }
+              }
             }
+          }
+        }
+        resumedFileCount?.let { count ->
+          _uiState.update {
+            it.copy(statusMessage = "Battery > 20% — Resumed queued cloud sync ($count files)")
           }
         }
       }
@@ -1199,13 +1590,59 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     }
   }
 
-  fun removeFolder(folderId: String) {
+  fun removeFolder(
+    folderId: String,
+    decryptLockedSafFirst: Boolean = true,
+  ) {
     viewModelScope.launch {
-      folderRepo.removeFolderFromVault(folderId, sessionDek)
+      runCatching {
+        folderRepo.removeFolderFromVault(
+          folderId = folderId,
+          dek = sessionDek,
+          decryptLockedSafFirst = decryptLockedSafFirst,
+        )
+      }.onSuccess {
+        _uiState.update {
+          it.copy(
+            selectedFolderIds = it.selectedFolderIds - folderId,
+            activeFolderFiles = emptyList(),
+            securePreview = null,
+            statusMessage = "Folder removed from BeastLock",
+          )
+        }
+      }.onFailure { err ->
+        _uiState.update {
+          it.copy(errorMessage = err.message ?: "Failed to remove folder from BeastLock")
+        }
+      }
+    }
+  }
+
+  fun removeSelectedFolders(decryptLockedSafFirst: Boolean = true) {
+    val ids = _uiState.value.selectedFolderIds.toList()
+    if (ids.isEmpty()) return
+    viewModelScope.launch {
+      val result = folderRepo.removeFoldersBatch(
+        folderIds = ids,
+        dek = sessionDek,
+        decryptLockedSafFirst = decryptLockedSafFirst,
+      ) { progress ->
+        _uiState.update { it.copy(encryptionProgress = progress) }
+      }
+      val msg = if (result.failedCount > 0) {
+        "Removed ${result.succeededCount} folder(s); ${result.failedCount} failed (${result.firstError.orEmpty()})"
+      } else {
+        "Removed ${result.succeededCount} folder(s) from BeastLock list"
+      }
       _uiState.update {
         it.copy(
-          selectedFolderIds = it.selectedFolderIds - folderId,
-          statusMessage = "Folder removed from BeastLock",
+          encryptionProgress = null,
+          isSelectionMode = false,
+          selectedFolderIds = emptySet(),
+          activeFolderFiles = emptyList(),
+          securePreview = null,
+          statusMessage = if (result.failedCount == 0) msg else null,
+          errorMessage = if (result.failedCount > 0) msg else null,
         )
       }
     }
@@ -1317,6 +1754,301 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
   fun dismissPendingRestorePinPrompt() {
     _uiState.update { it.copy(pendingRestoreUriRequiringPin = null) }
+  }
+
+  fun onGoogleDriveAuthorized(accessToken: String) {
+    driveAccessToken = accessToken
+    viewModelScope.launch {
+      _uiState.update { it.copy(isDriveSyncBusy = true) }
+      val email = cloudBackupManager.fetchGoogleDriveAccountEmail(accessToken).orEmpty()
+      prefsRepo.setGoogleDriveConnection(connected = true, email = email)
+      auditLogRepo.recordEvent(
+        action = "GOOGLE_DRIVE_CONNECTED",
+        folderName = "Google Drive",
+        details = if (email.isNotBlank()) {
+          "Authorized encrypted Google Drive appDataFolder sync for $email"
+        } else {
+          "Authorized encrypted Google Drive appDataFolder sync"
+        },
+        category = AuditCategory.CLOUD_SYNC,
+      )
+      cloudBackupManager.listGoogleDriveBackups(accessToken)
+        .onSuccess { items ->
+          val accountLabel = if (email.isNotBlank()) " ($email)" else ""
+          _uiState.update {
+            it.copy(
+              isDriveSyncBusy = false,
+              driveBackups = items,
+              statusMessage = "Connected to Google Drive$accountLabel",
+            )
+          }
+        }
+        .onFailure { err ->
+          _uiState.update {
+            it.copy(
+              isDriveSyncBusy = false,
+              statusMessage = "Google Drive connected; snapshot refresh pending (${err.message ?: "offline"})",
+            )
+          }
+        }
+    }
+  }
+
+  fun reportGoogleDriveAuthError(message: String) {
+    _uiState.update {
+      it.copy(
+        isDriveSyncBusy = false,
+        errorMessage = message,
+      )
+    }
+  }
+
+  fun refreshGoogleDriveBackups() {
+    viewModelScope.launch {
+      _uiState.update { it.copy(isDriveSyncBusy = true) }
+      val token = resolveDriveToken()
+      if (token.isNullOrBlank()) {
+        _uiState.update {
+          it.copy(
+            isDriveSyncBusy = false,
+            errorMessage = "Authorize Google Drive access to list cloud snapshots.",
+          )
+        }
+        _driveReauthRequired.tryEmit(Unit)
+        return@launch
+      }
+      cloudBackupManager.listGoogleDriveBackups(token)
+        .onSuccess { items ->
+          _uiState.update {
+            it.copy(
+              isDriveSyncBusy = false,
+              driveBackups = items,
+            )
+          }
+        }
+        .onFailure { err ->
+          if (err is DriveAuthExpiredException) {
+            driveAccessToken = null
+            _driveReauthRequired.tryEmit(Unit)
+          }
+          _uiState.update {
+            it.copy(
+              isDriveSyncBusy = false,
+              errorMessage = err.message ?: "Failed to list Google Drive backups",
+            )
+          }
+        }
+    }
+  }
+
+  fun syncVaultToGoogleDrive(
+    selectedFolderIds: Set<String>? = null,
+    onlyAutoSync: Boolean = false,
+    createTimestampedSnapshot: Boolean = false,
+  ) {
+    val dek = sessionDek ?: return
+    viewModelScope.launch {
+      _uiState.update { it.copy(isDriveSyncBusy = true) }
+      val token = resolveDriveToken()
+      if (token.isNullOrBlank()) {
+        _uiState.update {
+          it.copy(
+            isDriveSyncBusy = false,
+            errorMessage = "Tap Connect Google Drive to authorize encrypted cloud sync.",
+          )
+        }
+        _driveReauthRequired.tryEmit(Unit)
+        return@launch
+      }
+      val archiveName = if (createTimestampedSnapshot) {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
+        "BeastLock_Drive_$stamp.vlkbak"
+      } else {
+        CloudBackupManager.AUTO_SYNC_ARCHIVE_NAME
+      }
+      cloudBackupManager.syncVaultToGoogleDrive(
+        accessToken = token,
+        dek = dek,
+        folderIds = selectedFolderIds,
+        onlyAutoSyncEnabled = onlyAutoSync,
+        archiveFileName = archiveName,
+        updateExistingAutoSync = !createTimestampedSnapshot,
+      ) { progress ->
+        _uiState.update { it.copy(cloudBackupProgress = progress) }
+      }.onSuccess { result ->
+        val updatedList = cloudBackupManager.listGoogleDriveBackups(token).getOrNull()
+        _uiState.update { state ->
+          state.copy(
+            isDriveSyncBusy = false,
+            cloudBackupProgress = null,
+            driveBackups = updatedList ?: state.driveBackups,
+            statusMessage = if (result != null) {
+              "Synced ${result.record.folderCount} encrypted folder(s) (${result.record.fileCount} files) to Google Drive"
+            } else {
+              "No eligible folders to sync to Google Drive"
+            },
+          )
+        }
+      }.onFailure { err ->
+        if (err is DriveAuthExpiredException) {
+          driveAccessToken = null
+          _driveReauthRequired.tryEmit(Unit)
+        }
+        _uiState.update {
+          it.copy(
+            isDriveSyncBusy = false,
+            cloudBackupProgress = null,
+            errorMessage = err.message ?: "Google Drive sync failed",
+          )
+        }
+      }
+    }
+  }
+
+  fun restoreFromGoogleDrive(
+    item: DriveVaultBackupItem,
+    backupPin: String? = null,
+  ) {
+    val dek = sessionDek ?: return
+    viewModelScope.launch {
+      _uiState.update { it.copy(isDriveSyncBusy = true) }
+      val token = resolveDriveToken()
+      if (token.isNullOrBlank()) {
+        _uiState.update {
+          it.copy(
+            isDriveSyncBusy = false,
+            errorMessage = "Authorize Google Drive to download encrypted backup.",
+          )
+        }
+        _driveReauthRequired.tryEmit(Unit)
+        return@launch
+      }
+      cloudBackupManager.restoreFromGoogleDrive(
+        accessToken = token,
+        driveFileId = item.id,
+        fileName = item.name,
+        currentDek = dek,
+        backupPinIfDifferentKey = backupPin,
+      ) { progress ->
+        _uiState.update { it.copy(cloudBackupProgress = progress) }
+      }.onSuccess { result ->
+        if (result.requiresBackupPin) {
+          _uiState.update {
+            it.copy(
+              isDriveSyncBusy = false,
+              cloudBackupProgress = null,
+              pendingDriveRestoreItem = item,
+            )
+          }
+        } else {
+          _uiState.update {
+            it.copy(
+              isDriveSyncBusy = false,
+              cloudBackupProgress = null,
+              pendingDriveRestoreItem = null,
+              statusMessage = "Restored ${result.restoredFolders} encrypted folder(s) (${result.restoredFiles} files) from Google Drive",
+            )
+          }
+        }
+      }.onFailure { err ->
+        if (err is DriveAuthExpiredException) {
+          driveAccessToken = null
+          _driveReauthRequired.tryEmit(Unit)
+        }
+        _uiState.update {
+          it.copy(
+            isDriveSyncBusy = false,
+            cloudBackupProgress = null,
+            errorMessage = err.message ?: "Failed to restore Google Drive backup",
+          )
+        }
+      }
+    }
+  }
+
+  fun dismissPendingDriveRestorePin() {
+    _uiState.update { it.copy(pendingDriveRestoreItem = null) }
+  }
+
+  fun deleteGoogleDriveBackup(item: DriveVaultBackupItem) {
+    viewModelScope.launch {
+      _uiState.update { it.copy(isDriveSyncBusy = true) }
+      val token = resolveDriveToken()
+      if (token.isNullOrBlank()) {
+        _uiState.update {
+          it.copy(
+            isDriveSyncBusy = false,
+            errorMessage = "Authorize Google Drive to remove cloud snapshots.",
+          )
+        }
+        _driveReauthRequired.tryEmit(Unit)
+        return@launch
+      }
+      cloudBackupManager.deleteGoogleDriveBackup(token, item.id)
+        .onSuccess {
+          _uiState.update { state ->
+            state.copy(
+              isDriveSyncBusy = false,
+              driveBackups = state.driveBackups.filterNot { it.id == item.id },
+              statusMessage = "Deleted \"${item.name}\" from Google Drive",
+            )
+          }
+        }
+        .onFailure { err ->
+          if (err is DriveAuthExpiredException) {
+            driveAccessToken = null
+            _driveReauthRequired.tryEmit(Unit)
+          }
+          _uiState.update {
+            it.copy(
+              isDriveSyncBusy = false,
+              errorMessage = err.message ?: "Failed to delete Google Drive backup",
+            )
+          }
+        }
+    }
+  }
+
+  fun setGoogleDriveAutoSyncEnabled(enabled: Boolean) {
+    viewModelScope.launch {
+      prefsRepo.setGoogleDriveAutoSyncEnabled(enabled)
+      auditLogRepo.recordEvent(
+        action = "POLICY_UPDATED",
+        folderName = "Google Drive",
+        details = if (enabled) {
+          "Enabled automatic encrypted Google Drive API sync"
+        } else {
+          "Disabled automatic encrypted Google Drive API sync"
+        },
+        category = AuditCategory.CLOUD_SYNC,
+      )
+      if (enabled) {
+        val dek = sessionDek
+        if (dek != null) {
+          maybeRunAutoCloudSync(dek)
+        }
+      }
+    }
+  }
+
+  fun disconnectGoogleDrive() {
+    driveAccessToken = null
+    viewModelScope.launch {
+      prefsRepo.setGoogleDriveConnection(connected = false, email = "")
+      auditLogRepo.recordEvent(
+        action = "GOOGLE_DRIVE_DISCONNECTED",
+        folderName = "Google Drive",
+        details = "Disconnected Google Drive API sync session from BeastLock",
+        category = AuditCategory.CLOUD_SYNC,
+      )
+      _uiState.update {
+        it.copy(
+          driveBackups = emptyList(),
+          pendingDriveRestoreItem = null,
+          statusMessage = "Google Drive sync disconnected (existing Drive backups retained)",
+        )
+      }
+    }
   }
 
   fun exportAuditReport(
@@ -1467,6 +2199,43 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     viewModelScope.launch { prefsRepo.setRequireBiometricAfterAutoLock(enabled) }
   }
 
+  fun setIdleTimeoutEnabled(enabled: Boolean) {
+    viewModelScope.launch {
+      prefsRepo.setIdleTimeoutEnabled(enabled)
+      _uiState.update {
+        it.copy(securitySettings = it.securitySettings.copy(idleTimeoutEnabled = enabled))
+      }
+      auditLogRepo.recordEvent(
+        action = "POLICY_UPDATED",
+        folderName = "Idle Timeout",
+        details = if (enabled) "Foreground inactivity timeout enabled" else "Foreground inactivity timeout disabled",
+        category = AuditCategory.ACCESS_EVENT,
+      )
+      if (enabled) {
+        resetIdleTimer()
+      } else {
+        cancelIdleTimer()
+      }
+    }
+  }
+
+  fun setIdleTimeoutSeconds(seconds: Int) {
+    val clamped = seconds.coerceAtLeast(1)
+    viewModelScope.launch {
+      prefsRepo.setIdleTimeoutSeconds(clamped)
+      _uiState.update {
+        it.copy(securitySettings = it.securitySettings.copy(idleTimeoutSeconds = clamped))
+      }
+      auditLogRepo.recordEvent(
+        action = "POLICY_UPDATED",
+        folderName = "Idle Timeout",
+        details = "Foreground inactivity timeout set to ${formatDurationLabel(clamped)}",
+        category = AuditCategory.ACCESS_EVENT,
+      )
+      resetIdleTimer()
+    }
+  }
+
   fun setPanicModeEnabled(enabled: Boolean) {
     viewModelScope.launch {
       prefsRepo.setPanicModeEnabled(enabled)
@@ -1600,6 +2369,67 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
   fun dismissOrphanCleanupResult() {
     _uiState.update { it.copy(lastOrphanCleanupResult = null) }
+  }
+
+  fun runIntegrityDiagnosticScan() {
+    val dek = sessionDek ?: return
+    if (_uiState.value.isScanningIntegrity) return
+
+    integrityScanJob?.cancel()
+    integrityScanJob = viewModelScope.launch {
+      _uiState.update {
+        it.copy(
+          isScanningIntegrity = true,
+          integrityScanProgress = null,
+        )
+      }
+      runCatching {
+        maintenanceManager.scanVaultIntegrity(masterDek = dek) { progress ->
+          _uiState.update { it.copy(integrityScanProgress = progress) }
+        }
+      }.onSuccess { report ->
+        _uiState.update {
+          it.copy(
+            isScanningIntegrity = false,
+            integrityScanProgress = null,
+            integrityDiagnosticReport = report,
+            statusMessage = if (report.corruptedFiles.isEmpty()) {
+              "Integrity scan passed: ${report.healthyFiles}/${report.totalEncryptedFiles} encrypted file(s) verified"
+            } else {
+              "Integrity alert: ${report.corruptedFiles.size} corrupted file(s) identified"
+            },
+          )
+        }
+      }.onFailure { err ->
+        if (err !is CancellationException) {
+          _uiState.update {
+            it.copy(
+              isScanningIntegrity = false,
+              integrityScanProgress = null,
+              errorMessage = err.message ?: "Failed to run integrity diagnostic scan",
+            )
+          }
+        }
+      }
+    }
+  }
+
+  fun cancelIntegrityDiagnosticScan() {
+    integrityScanJob?.cancel()
+    integrityScanJob = null
+    _uiState.update {
+      it.copy(
+        isScanningIntegrity = false,
+        integrityScanProgress = null,
+      )
+    }
+  }
+
+  fun dismissIntegrityReport() {
+    if (_uiState.value.isScanningIntegrity) {
+      cancelIntegrityDiagnosticScan()
+    }
+    _uiState.update { it.copy(integrityDiagnosticReport = null) }
   }
 
   fun verifyMasterPinForMigration(pin: String, onResult: (Boolean) -> Unit) {
@@ -1740,4 +2570,15 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     val fourth: D,
     val fifth: E,
   )
+
+  companion object {
+    internal fun createForTest(
+      application: Application,
+      overrideTestKey: SecretKey,
+    ): VaultViewModel = VaultViewModel(
+      application = application,
+      keystoreManager = KeystoreManager(application, overrideTestMasterKey = overrideTestKey),
+      overrideAuditKey = overrideTestKey,
+    )
+  }
 }

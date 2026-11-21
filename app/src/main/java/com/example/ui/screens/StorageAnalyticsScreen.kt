@@ -33,6 +33,7 @@ import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.PieChart
 import androidx.compose.material.icons.rounded.SdStorage
 import androidx.compose.material.icons.rounded.Shield
+import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -65,6 +66,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.local.VaultFolderEntity
+import com.example.data.storage.IntegrityDiagnosticReport
 import com.example.ui.VaultUiState
 import com.example.ui.components.VaultStatusBadge
 import com.example.ui.components.formatByteSize
@@ -85,6 +87,7 @@ fun StorageAnalyticsScreen(
   onScanOrphans: () -> Unit,
   onOpenOrphanCleanup: () -> Unit,
   onOpenMigrateOut: () -> Unit,
+  onOpenIntegrityDiagnostic: () -> Unit,
   modifier: Modifier = Modifier,
 ) {
   var selectedSegment by remember { mutableStateOf(HighlightSegment.ALL) }
@@ -137,10 +140,13 @@ fun StorageAnalyticsScreen(
           orphanCount = state.orphanCandidates.size,
           orphanBytes = state.totalOrphanBytes,
           isScanning = state.isScanningOrphans,
+          isScanningIntegrity = state.isScanningIntegrity,
+          integrityReport = state.integrityDiagnosticReport,
           hasFolders = state.folders.isNotEmpty(),
           onScanOrphans = onScanOrphans,
           onOpenOrphanCleanup = onOpenOrphanCleanup,
           onOpenMigrateOut = onOpenMigrateOut,
+          onOpenIntegrityDiagnostic = onOpenIntegrityDiagnostic,
         )
       }
 
@@ -679,13 +685,13 @@ private fun FolderStorageBarCard(
           FilledTonalIconButton(
             onClick = onQuickLock,
             modifier = Modifier
-              .size(34.dp)
+              .size(48.dp)
               .testTag("analytics_quick_lock_${folder.id}"),
           ) {
             Icon(
               imageVector = Icons.Rounded.Lock,
               contentDescription = "Lock folder",
-              modifier = Modifier.size(16.dp),
+              modifier = Modifier.size(18.dp),
             )
           }
         }
@@ -849,18 +855,22 @@ private fun StorageHygieneAndExitCard(
   orphanCount: Int,
   orphanBytes: Long,
   isScanning: Boolean,
+  isScanningIntegrity: Boolean,
+  integrityReport: IntegrityDiagnosticReport?,
   hasFolders: Boolean,
   onScanOrphans: () -> Unit,
   onOpenOrphanCleanup: () -> Unit,
   onOpenMigrateOut: () -> Unit,
+  onOpenIntegrityDiagnostic: () -> Unit,
 ) {
   val hasOrphans = orphanCount > 0
+  val corruptedCount = integrityReport?.corruptedFiles?.size ?: 0
   Card(
     colors = CardDefaults.cardColors(
-      containerColor = if (hasOrphans) {
-        MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f)
-      } else {
-        MaterialTheme.colorScheme.surfaceContainer
+      containerColor = when {
+        corruptedCount > 0 -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f)
+        hasOrphans -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f)
+        else -> MaterialTheme.colorScheme.surfaceContainer
       },
     ),
     modifier = Modifier
@@ -948,6 +958,32 @@ private fun StorageHygieneAndExitCard(
             Spacer(modifier = Modifier.width(6.dp))
             Text("Exit & Export")
           }
+        }
+      }
+
+      if (hasFolders) {
+        OutlinedButton(
+          onClick = onOpenIntegrityDiagnostic,
+          enabled = !isScanningIntegrity,
+          modifier = Modifier
+            .fillMaxWidth()
+            .testTag("analytics_run_integrity_scan_button"),
+        ) {
+          Icon(
+            imageVector = Icons.Rounded.VerifiedUser,
+            contentDescription = null,
+            tint = if (corruptedCount > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(18.dp),
+          )
+          Spacer(modifier = Modifier.width(8.dp))
+          Text(
+            text = when {
+              isScanningIntegrity -> "Verifying Encrypted Files..."
+              corruptedCount > 0 -> "Integrity Alert: $corruptedCount Corrupted File(s) — View Report"
+              integrityReport != null -> "Integrity Verified (${integrityReport.healthyFiles}/${integrityReport.totalEncryptedFiles}) — Re-Scan"
+              else -> "Run Encrypted File Integrity Diagnostic"
+            },
+          )
         }
       }
     }

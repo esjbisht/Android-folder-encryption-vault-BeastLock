@@ -4,10 +4,13 @@ import android.net.Uri
 import com.example.crypto.BiometricAvailability
 import com.example.data.audit.AuditLogSnapshot
 import com.example.data.backup.CloudBackupProgress
+import com.example.data.backup.DriveVaultBackupItem
 import com.example.data.local.BackupRecordEntity
 import com.example.data.local.VaultFolderEntity
 import com.example.data.preferences.SecuritySettings
 import com.example.data.storage.EncryptionProgress
+import com.example.data.storage.IntegrityDiagnosticReport
+import com.example.data.storage.IntegrityScanProgress
 import com.example.data.storage.MigrationProgress
 import com.example.data.storage.MigrationResult
 import com.example.data.storage.OrphanCleanupResult
@@ -53,6 +56,40 @@ data class DeviceStorageInfo(
   val availableDeviceBytes: Long = 0L,
 )
 
+data class SelectiveLockPromptState(
+  val folder: VaultFolderEntity,
+  val plaintextFiles: List<VaultFileItem> = emptyList(),
+  val alreadyEncryptedCount: Int = 0,
+  val isLoading: Boolean = true,
+  val reloadDetailAfterLock: Boolean = false,
+)
+
+fun matchesFolderSearchQuery(folder: VaultFolderEntity, rawQuery: String): Boolean {
+  val trimmed = rawQuery.trim().lowercase()
+  if (trimmed.isEmpty()) return true
+  val folderNameLower = folder.name.lowercase()
+  if (folderNameLower.contains(trimmed)) return true
+
+  val tokens = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
+  if (tokens.isEmpty()) return true
+
+  return tokens.all { token ->
+    when {
+      token == "status:locked" || token == "is:locked" ||
+        token == "locked" || token == "sealed" || token == "encrypted" -> folder.isLocked
+      token == "status:unlocked" || token == "is:unlocked" ||
+        token == "unlocked" || token == "open" || token == "decrypted" || token == "unencrypted" -> !folder.isLocked
+      token.length >= 3 && (
+        "locked".startsWith(token) || "sealed".startsWith(token) || "encrypted".startsWith(token)
+        ) -> folder.isLocked || folderNameLower.contains(token)
+      token.length >= 3 && (
+        "unlocked".startsWith(token) || "decrypted".startsWith(token) || "unencrypted".startsWith(token)
+        ) -> !folder.isLocked || folderNameLower.contains(token)
+      else -> folderNameLower.contains(token)
+    }
+  }
+}
+
 data class VaultUiState(
   val sessionState: VaultSessionState = VaultSessionState.Loading,
   val securitySettings: SecuritySettings = SecuritySettings(),
@@ -67,6 +104,9 @@ data class VaultUiState(
   val isLoadingFiles: Boolean = false,
   val auditLogSnapshot: AuditLogSnapshot = AuditLogSnapshot(),
   val backupRecords: List<BackupRecordEntity> = emptyList(),
+  val driveBackups: List<DriveVaultBackupItem> = emptyList(),
+  val isDriveSyncBusy: Boolean = false,
+  val pendingDriveRestoreItem: DriveVaultBackupItem? = null,
   val deviceStorageInfo: DeviceStorageInfo = DeviceStorageInfo(),
   val encryptionProgress: EncryptionProgress? = null,
   val cloudBackupProgress: CloudBackupProgress? = null,
@@ -77,10 +117,14 @@ data class VaultUiState(
   val selectedOrphanIds: Set<String> = emptySet(),
   val isCleaningOrphans: Boolean = false,
   val lastOrphanCleanupResult: OrphanCleanupResult? = null,
+  val isScanningIntegrity: Boolean = false,
+  val integrityScanProgress: IntegrityScanProgress? = null,
+  val integrityDiagnosticReport: IntegrityDiagnosticReport? = null,
   val migrationProgress: MigrationProgress? = null,
   val migrationResult: MigrationResult? = null,
   val securePreview: SecurePreviewContent? = null,
   val isPreviewLoading: Boolean = false,
+  val selectiveLockPrompt: SelectiveLockPromptState? = null,
   val pendingRestoreUriRequiringPin: Uri? = null,
   val authError: String? = null,
   val recoveryError: String? = null,
@@ -94,9 +138,7 @@ data class VaultUiState(
         FolderFilter.LOCKED -> folder.isLocked
         FolderFilter.UNLOCKED -> !folder.isLocked
       }
-      val matchesQuery = searchQuery.isBlank() ||
-        folder.name.contains(searchQuery, ignoreCase = true)
-      matchesFilter && matchesQuery
+      matchesFilter && matchesFolderSearchQuery(folder, searchQuery)
     }
 
   val lockedFoldersCount: Int get() = folders.count { it.isLocked }

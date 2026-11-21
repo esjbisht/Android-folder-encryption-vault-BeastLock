@@ -1,5 +1,6 @@
 package com.example
 
+import android.app.Activity
 import android.app.StatusBarManager
 import android.content.ComponentName
 import android.content.Context
@@ -10,6 +11,7 @@ import android.os.Bundle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -83,6 +85,8 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.example.crypto.BiometricAuthHelper
 import com.example.crypto.BiometricAuthResult
+import com.example.data.backup.DriveAuthOutcome
+import com.example.data.backup.GoogleDriveAuthHelper
 import com.example.data.storage.MigrationExportFormat
 import com.example.quicksettings.LockVaultTileService
 import com.example.quicksettings.PanicModeTileService
@@ -97,10 +101,12 @@ import com.example.ui.VaultSessionState
 import com.example.ui.VaultViewModel
 import com.example.ui.components.CloudBackupProgressDialog
 import com.example.ui.components.EncryptionProgressDialog
+import com.example.ui.components.IntegrityDiagnosticDialog
 import com.example.ui.components.MigrationProgressDialog
 import com.example.ui.components.MigrationResultDialog
 import com.example.ui.components.MigrationWizardDialog
 import com.example.ui.components.OrphanCleanupDialog
+import com.example.ui.components.SelectiveLockFilesDialog
 import com.example.ui.screens.AuditLogScreen
 import com.example.ui.screens.CloudBackupScreen
 import com.example.ui.screens.FolderDetailScreen
@@ -116,11 +122,24 @@ import java.util.Locale
 import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {
+  private var activeViewModel: VaultViewModel? = null
+
+  override fun onUserInteraction() {
+    super.onUserInteraction()
+    activeViewModel?.onUserInteraction()
+  }
+
+  override fun onDestroy() {
+    activeViewModel = null
+    super.onDestroy()
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     enableEdgeToEdge()
     setContent {
       val viewModel: VaultViewModel = viewModel()
+      activeViewModel = viewModel
       val state by viewModel.uiState.collectAsStateWithLifecycle()
 
       val context = LocalContext.current
@@ -260,6 +279,7 @@ class MainActivity : FragmentActivity() {
           }
           VaultSessionState.Unlocked -> {
             VaultUnlockedAppShell(
+              activity = this@MainActivity,
               viewModel = viewModel,
               hasAccelerometer = panicMonitor.hasAccelerometer,
               authorizeActionBiometric = authorizeActionBiometric,
@@ -298,6 +318,7 @@ private data class PendingMigrationRequest(
 
 @Composable
 private fun VaultUnlockedAppShell(
+  activity: FragmentActivity,
   viewModel: VaultViewModel,
   hasAccelerometer: Boolean,
   authorizeActionBiometric: (fallbackToPin: () -> Unit, onAuthorized: () -> Unit) -> Unit,
@@ -311,9 +332,45 @@ private fun VaultUnlockedAppShell(
   val coroutineScope = rememberCoroutineScope()
   var pendingReencryptIncludeUnlocked by remember { mutableStateOf<Boolean?>(null) }
   var showOrphanCleanupDialog by remember { mutableStateOf(false) }
+  var showIntegrityDiagnosticDialog by remember { mutableStateOf(false) }
   var showMigrationWizard by remember { mutableStateOf(false) }
   var activeMigrationRequest by remember { mutableStateOf<PendingMigrationRequest?>(null) }
   var pendingMigrationPinRequest by remember { mutableStateOf<PendingMigrationRequest?>(null) }
+
+  val driveAuthLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.StartIntentSenderForResult(),
+  ) { result ->
+    if (result.resultCode == Activity.RESULT_OK) {
+      val token = GoogleDriveAuthHelper.parseAuthorizationResult(context, result.data)
+      if (!token.isNullOrBlank()) {
+        viewModel.onGoogleDriveAuthorized(token)
+      } else {
+        viewModel.reportGoogleDriveAuthError("Google Drive authorization did not return an access token.")
+      }
+    } else {
+      viewModel.reportGoogleDriveAuthError("Google Drive authorization cancelled.")
+    }
+  }
+
+  val startGoogleDriveAuth: () -> Unit = {
+    coroutineScope.launch {
+      when (val outcome = GoogleDriveAuthHelper.authorize(activity)) {
+        is DriveAuthOutcome.Authorized -> viewModel.onGoogleDriveAuthorized(outcome.accessToken)
+        is DriveAuthOutcome.NeedsResolution -> {
+          driveAuthLauncher.launch(
+            IntentSenderRequest.Builder(outcome.pendingIntent.intentSender).build(),
+          )
+        }
+        is DriveAuthOutcome.Error -> viewModel.reportGoogleDriveAuthError(outcome.message)
+      }
+    }
+  }
+
+  LaunchedEffect(viewModel) {
+    viewModel.driveReauthRequired.collect {
+      startGoogleDriveAuth()
+    }
+  }
 
   val migrateTreeLauncher = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.OpenDocumentTree(),
@@ -509,6 +566,7 @@ private fun VaultUnlockedAppShell(
               onSelectFilter = viewModel::setFilter,
               onSearchQueryChange = viewModel::setSearchQuery,
               onPickDeviceFolder = viewModel::addDeviceFolder,
+              onDecryptAnyDeviceFolder = viewModel::decryptAnyDeviceFolder,
               onCreatePrivateFolder = viewModel::createPrivateFolder,
               onOpenFolder = { folderId ->
                 navController.navigate(FolderDetailRoute(folderId))
@@ -524,8 +582,11 @@ private fun VaultUnlockedAppShell(
                     viewModel.unlockFolder(folder.id)
                   }
                 } else {
-                  viewModel.lockFolder(folder.id)
+                  viewModel.lockFolder(folder.id, reloadDetail = false)
                 }
+              },
+              onRemoveFolder = { folderId, decryptLockedSafFirst ->
+                viewModel.removeFolder(folderId, decryptLockedSafFirst = decryptLockedSafFirst)
               },
               onEnterSelectionMode = viewModel::enterFolderSelectionMode,
               onToggleFolderSelection = viewModel::toggleFolderSelection,
@@ -533,7 +594,9 @@ private fun VaultUnlockedAppShell(
               onClearSelection = viewModel::clearFolderSelection,
               onEncryptSelectedFolders = viewModel::encryptSelectedFolders,
               onDecryptSelectedFolders = {
-                val selectedLocked = state.folders.filter { it.id in state.selectedFolderIds && it.isLocked }
+                val selectedLocked = state.folders.filter {
+                  it.id in state.selectedFolderIds && (it.isLocked || it.encryptedFileCount > 0)
+                }
                 if (selectedLocked.any { it.requireBiometricPerUnlock }) {
                   authorizeActionBiometric(
                     { viewModel.decryptSelectedFolders() },
@@ -548,6 +611,9 @@ private fun VaultUnlockedAppShell(
                   { pendingReencryptIncludeUnlocked = includeUnlocked },
                   { viewModel.reencryptSelectedFolders(includeUnlocked) },
                 )
+              },
+              onRemoveSelectedFolders = { decryptLockedSafFirst ->
+                viewModel.removeSelectedFolders(decryptLockedSafFirst = decryptLockedSafFirst)
               },
               onToggleFolderAutoCloudSync = viewModel::setFolderAutoCloudBackupSync,
               onSetSelectedAutoCloudSync = viewModel::setSelectedFoldersAutoCloudBackupSync,
@@ -575,6 +641,12 @@ private fun VaultUnlockedAppShell(
                 showOrphanCleanupDialog = true
               },
               onOpenMigrateOut = { showMigrationWizard = true },
+              onOpenIntegrityDiagnostic = {
+                showIntegrityDiagnosticDialog = true
+                if (!state.isScanningIntegrity && state.integrityDiagnosticReport == null) {
+                  viewModel.runIntegrityDiagnosticScan()
+                }
+              },
               modifier = Modifier.statusBarsPadding(),
             )
           }
@@ -591,10 +663,15 @@ private fun VaultUnlockedAppShell(
               isLoadingFiles = state.isLoadingFiles,
               securePreview = state.securePreview,
               isPreviewLoading = state.isPreviewLoading,
-              onBack = { navController.popBackStack() },
+              onBack = {
+                if (navController.currentBackStackEntry?.destination?.hasRoute<FolderDetailRoute>() == true) {
+                  navController.popBackStack()
+                }
+              },
               onRefresh = { viewModel.loadFolderFiles(route.folderId) },
               onImportDocuments = { uris -> viewModel.importFiles(route.folderId, uris) },
               onLockFolder = { viewModel.lockFolder(route.folderId, reloadDetail = true) },
+              onSelectiveLockFolder = { viewModel.requestLockFolderWithSelection(route.folderId, reloadDetail = true) },
               onUnlockFolder = {
                 if (folder?.requireBiometricPerUnlock == true) {
                   authorizeActionBiometric(
@@ -604,6 +681,22 @@ private fun VaultUnlockedAppShell(
                 } else {
                   viewModel.unlockFolder(route.folderId, reloadDetail = true)
                 }
+              },
+              onEncryptFiles = { fileIds ->
+                viewModel.lockFolder(route.folderId, reloadDetail = true, selectedFileIds = fileIds)
+              },
+              onDecryptFiles = { fileIds ->
+                if (folder?.requireBiometricPerUnlock == true) {
+                  authorizeActionBiometric(
+                    { viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true) },
+                    { viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true) },
+                  )
+                } else {
+                  viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true)
+                }
+              },
+              onRemoveFiles = { fileIds ->
+                viewModel.removeFilesInFolder(route.folderId, fileIds, reloadDetail = true)
               },
               onUpdateOptions = { reqBio, obf ->
                 viewModel.updateFolderOptions(route.folderId, reqBio, obf)
@@ -616,7 +709,9 @@ private fun VaultUnlockedAppShell(
               },
               onPeekFile = viewModel::peekFile,
               onDismissPreview = viewModel::dismissPreview,
-              onRemoveFolder = { viewModel.removeFolder(route.folderId) },
+              onRemoveFolder = { decryptLockedSafFirst ->
+                viewModel.removeFolder(route.folderId, decryptLockedSafFirst = decryptLockedSafFirst)
+              },
             )
           }
 
@@ -624,10 +719,27 @@ private fun VaultUnlockedAppShell(
             CloudBackupScreen(
               folders = state.folders,
               backupRecords = state.backupRecords,
+              driveBackups = state.driveBackups,
+              isDriveSyncBusy = state.isDriveSyncBusy,
+              pendingDriveRestoreItem = state.pendingDriveRestoreItem,
               securitySettings = state.securitySettings,
               devicePowerState = state.devicePowerState,
               isBatterySaverBlockingTasks = state.isBatterySaverBlockingTasks,
               pendingRestoreUriRequiringPin = state.pendingRestoreUriRequiringPin,
+              onConnectGoogleDrive = startGoogleDriveAuth,
+              onDisconnectGoogleDrive = viewModel::disconnectGoogleDrive,
+              onRefreshGoogleDriveBackups = viewModel::refreshGoogleDriveBackups,
+              onSyncGoogleDriveNow = { selectedIds ->
+                viewModel.syncVaultToGoogleDrive(
+                  selectedFolderIds = selectedIds,
+                  onlyAutoSync = false,
+                  createTimestampedSnapshot = false,
+                )
+              },
+              onToggleGoogleDriveAutoSync = viewModel::setGoogleDriveAutoSyncEnabled,
+              onRestoreGoogleDriveBackup = viewModel::restoreFromGoogleDrive,
+              onDeleteGoogleDriveBackup = viewModel::deleteGoogleDriveBackup,
+              onDismissPendingDriveRestorePin = viewModel::dismissPendingDriveRestorePin,
               onExportBackup = { uri, provider, selectedIds ->
                 viewModel.exportCloudBackup(uri, provider, selectedIds)
               },
@@ -663,11 +775,15 @@ private fun VaultUnlockedAppShell(
               orphanCount = state.orphanCandidates.size,
               orphanBytes = state.totalOrphanBytes,
               isScanningOrphans = state.isScanningOrphans,
+              isScanningIntegrity = state.isScanningIntegrity,
+              lastIntegrityCorruptedCount = state.integrityDiagnosticReport?.corruptedFiles?.size,
               onToggleBiometric = viewModel::setBiometricEnabled,
               onToggleAutoLockEnabled = viewModel::setAutoLockEnabled,
               onSelectAutoLockSeconds = viewModel::setAutoLockTimeout,
               onToggleAutoLockReencrypt = viewModel::setAutoLockReencryptFolders,
               onToggleRequireBioAfterAutoLock = viewModel::setRequireBiometricAfterAutoLock,
+              onToggleIdleTimeoutEnabled = viewModel::setIdleTimeoutEnabled,
+              onSelectIdleTimeoutSeconds = viewModel::setIdleTimeoutSeconds,
               onTogglePanicMode = viewModel::setPanicModeEnabled,
               onSelectPanicSensitivity = viewModel::setPanicSensitivity,
               onTogglePanicExitToHome = viewModel::setPanicExitToDeviceHome,
@@ -709,6 +825,12 @@ private fun VaultUnlockedAppShell(
               onOpenOrphanCleanup = {
                 viewModel.scanOrphanedFiles()
                 showOrphanCleanupDialog = true
+              },
+              onOpenIntegrityDiagnostic = {
+                showIntegrityDiagnosticDialog = true
+                if (!state.isScanningIntegrity && state.integrityDiagnosticReport == null) {
+                  viewModel.runIntegrityDiagnosticScan()
+                }
               },
               onOpenMigrateOut = { showMigrationWizard = true },
               modifier = Modifier.statusBarsPadding(),
@@ -761,6 +883,35 @@ private fun VaultUnlockedAppShell(
         onSelectAll = viewModel::selectAllOrphans,
         onConfirmDelete = viewModel::deleteSelectedOrphans,
         onDismiss = { showOrphanCleanupDialog = false },
+      )
+    }
+
+    if (showIntegrityDiagnosticDialog) {
+      IntegrityDiagnosticDialog(
+        isScanning = state.isScanningIntegrity,
+        progress = state.integrityScanProgress,
+        report = state.integrityDiagnosticReport,
+        onRescan = { viewModel.runIntegrityDiagnosticScan() },
+        onDismiss = {
+          showIntegrityDiagnosticDialog = false
+          if (state.isScanningIntegrity) {
+            viewModel.cancelIntegrityDiagnosticScan()
+          }
+        },
+      )
+    }
+
+    state.selectiveLockPrompt?.let { prompt ->
+      SelectiveLockFilesDialog(
+        prompt = prompt,
+        onConfirm = { selectedIds ->
+          viewModel.lockFolder(
+            folderId = prompt.folder.id,
+            reloadDetail = prompt.reloadDetailAfterLock,
+            selectedFileIds = selectedIds,
+          )
+        },
+        onDismiss = viewModel::dismissSelectiveLockPrompt,
       )
     }
 
