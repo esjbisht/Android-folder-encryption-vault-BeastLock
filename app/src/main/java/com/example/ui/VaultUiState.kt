@@ -56,6 +56,15 @@ enum class FolderFilter(val label: String) {
   ALL("All"),
   LOCKED("Locked"),
   UNLOCKED("Unlocked"),
+  PARTIAL("Partial"),
+  REVOKED("Revoked"),
+}
+
+enum class FolderSortOrder(val label: String) {
+  RECENT("Recent"),
+  NAME_AZ("Name A–Z"),
+  SIZE_DESC("Largest"),
+  STATUS("Status"),
 }
 
 data class DeviceStorageInfo(
@@ -84,7 +93,14 @@ data class PendingFolderPickerPreview(
   val isScanning: Boolean = false,
 )
 
-fun matchesFolderSearchQuery(folder: VaultFolderEntity, rawQuery: String): Boolean {
+fun VaultFolderEntity.isPartiallyEncrypted(): Boolean =
+  fileCount > 0 && encryptedFileCount > 0 && encryptedFileCount < fileCount
+
+fun matchesFolderSearchQuery(
+  folder: VaultFolderEntity,
+  rawQuery: String,
+  permissionStatus: UriPermissionStatus? = null,
+): Boolean {
   val trimmed = rawQuery.trim().lowercase()
   if (trimmed.isEmpty()) return true
   val folderNameLower = folder.name.lowercase()
@@ -93,18 +109,31 @@ fun matchesFolderSearchQuery(folder: VaultFolderEntity, rawQuery: String): Boole
   val tokens = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
   if (tokens.isEmpty()) return true
 
+  val isPartial = folder.isPartiallyEncrypted()
+  val isRevoked = !folder.isInternalVault && permissionStatus?.needsRegrant == true
+
   return tokens.all { token ->
     when {
       token == "status:locked" || token == "is:locked" ||
         token == "locked" || token == "sealed" || token == "encrypted" -> folder.isLocked
       token == "status:unlocked" || token == "is:unlocked" ||
         token == "unlocked" || token == "open" || token == "decrypted" || token == "unencrypted" -> !folder.isLocked
+      token == "status:partial" || token == "is:partial" ||
+        token == "partial" || token == "mixed" -> isPartial
+      token == "status:revoked" || token == "is:revoked" ||
+        token == "revoked" || token == "permission" || token == "regrant" -> isRevoked
+      token == "saf" || token == "device" || token == "external" -> !folder.isInternalVault
+      token == "private" || token == "internal" || token == "sandbox" -> folder.isInternalVault
       token.length >= 3 && (
         "locked".startsWith(token) || "sealed".startsWith(token) || "encrypted".startsWith(token)
         ) -> folder.isLocked || folderNameLower.contains(token)
       token.length >= 3 && (
         "unlocked".startsWith(token) || "decrypted".startsWith(token) || "unencrypted".startsWith(token)
         ) -> !folder.isLocked || folderNameLower.contains(token)
+      token.length >= 3 && "partial".startsWith(token) ->
+        isPartial || folderNameLower.contains(token)
+      token.length >= 3 && "revoked".startsWith(token) ->
+        isRevoked || folderNameLower.contains(token)
       else -> folderNameLower.contains(token)
     }
   }
@@ -117,6 +146,7 @@ data class VaultUiState(
   val devicePowerState: DevicePowerState = DevicePowerState(),
   val folders: List<VaultFolderEntity> = emptyList(),
   val folderFilter: FolderFilter = FolderFilter.ALL,
+  val folderSortOrder: FolderSortOrder = FolderSortOrder.RECENT,
   val searchQuery: String = "",
   val isSelectionMode: Boolean = false,
   val selectedFolderIds: Set<String> = emptySet(),
@@ -129,8 +159,10 @@ data class VaultUiState(
   val pendingDriveRestoreItem: DriveVaultBackupItem? = null,
   val deviceStorageInfo: DeviceStorageInfo = DeviceStorageInfo(),
   val encryptionProgress: EncryptionProgress? = null,
+  val busyFolderIds: Set<String> = emptySet(),
   val cloudBackupProgress: CloudBackupProgress? = null,
   val isAutoLockReencrypting: Boolean = false,
+  val deferredAutoLockPending: Boolean = false,
   val isScanningOrphans: Boolean = false,
   val hasScannedOrphans: Boolean = false,
   val orphanCandidates: List<OrphanedFileCandidate> = emptyList(),
@@ -165,6 +197,17 @@ data class VaultUiState(
 ) {
   val pendingIssuesCount: Int get() = systemIssues.count { it.syncStatus == "PENDING" }
 
+  fun isFolderBusy(folderId: String): Boolean =
+    folderId in busyFolderIds ||
+      (encryptionProgress?.folderId?.isNotEmpty() == true && encryptionProgress.folderId == folderId)
+
+  fun isFileBusy(folderId: String, fileId: String, displayName: String? = null): Boolean {
+    val progress = encryptionProgress ?: return false
+    if (progress.folderId != folderId) return false
+    if (progress.currentFileId.isNotEmpty() && progress.currentFileId == fileId) return true
+    return !displayName.isNullOrBlank() && progress.currentFileName == displayName
+  }
+
   val publicFolders: List<VaultFolderEntity>
     get() = folders.filter { !it.isStealthHidden }
 
@@ -174,18 +217,50 @@ data class VaultUiState(
   val analyticsVisibleFolders: List<VaultFolderEntity>
     get() = if (isStealthRevealed) folders else publicFolders
 
+  fun isFolderPermissionRevoked(folder: VaultFolderEntity): Boolean =
+    !folder.isInternalVault && folderPermissionStatuses[folder.id]?.needsRegrant == true
+
+  fun matchesFilter(folder: VaultFolderEntity, filter: FolderFilter): Boolean = when (filter) {
+    FolderFilter.ALL -> true
+    FolderFilter.LOCKED -> folder.isLocked
+    FolderFilter.UNLOCKED -> !folder.isLocked
+    FolderFilter.PARTIAL -> folder.isPartiallyEncrypted()
+    FolderFilter.REVOKED -> isFolderPermissionRevoked(folder)
+  }
+
+  fun countForFilter(filter: FolderFilter): Int =
+    publicFolders.count { matchesFilter(it, filter) }
+
+  val folderFilterCounts: Map<FolderFilter, Int>
+    get() = FolderFilter.entries.associateWith { countForFilter(it) }
+
   val filteredFolders: List<VaultFolderEntity>
-    get() = publicFolders.filter { folder ->
-      val matchesFilter = when (folderFilter) {
-        FolderFilter.ALL -> true
-        FolderFilter.LOCKED -> folder.isLocked
-        FolderFilter.UNLOCKED -> !folder.isLocked
+    get() {
+      val matching = publicFolders.filter { folder ->
+        matchesFilter(folder, folderFilter) &&
+          matchesFolderSearchQuery(folder, searchQuery, folderPermissionStatuses[folder.id])
       }
-      matchesFilter && matchesFolderSearchQuery(folder, searchQuery)
+      return when (folderSortOrder) {
+        FolderSortOrder.RECENT -> matching.sortedByDescending { it.lastActionTimestamp }
+        FolderSortOrder.NAME_AZ -> matching.sortedBy { it.name.lowercase() }
+        FolderSortOrder.SIZE_DESC -> matching.sortedByDescending { it.totalBytes }
+        FolderSortOrder.STATUS -> matching.sortedWith(
+          compareBy<VaultFolderEntity> { folder ->
+            when {
+              isFolderPermissionRevoked(folder) -> 0
+              folder.isPartiallyEncrypted() -> 1
+              !folder.isLocked -> 2
+              else -> 3
+            }
+          }.thenBy { it.name.lowercase() },
+        )
+      }
     }
 
   val lockedFoldersCount: Int get() = publicFolders.count { it.isLocked }
   val unlockedFoldersCount: Int get() = publicFolders.count { !it.isLocked }
+  val partialFoldersCount: Int get() = publicFolders.count { it.isPartiallyEncrypted() }
+  val revokedFoldersCount: Int get() = publicFolders.count { isFolderPermissionRevoked(it) }
   val totalEncryptedFiles: Int get() = publicFolders.sumOf { it.encryptedFileCount }
   val totalUnencryptedFiles: Int get() = publicFolders.sumOf { (it.fileCount - it.encryptedFileCount).coerceAtLeast(0) }
   val totalProtectedBytes: Long get() = publicFolders.sumOf { it.totalBytes }

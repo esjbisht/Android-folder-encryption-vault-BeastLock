@@ -168,6 +168,11 @@ fun AuditLogScreen(
             } else {
               MaterialTheme.colorScheme.errorContainer
             },
+            contentColor = if (snapshot.isIntegrityVerified) {
+              MaterialTheme.colorScheme.onPrimaryContainer
+            } else {
+              MaterialTheme.colorScheme.onErrorContainer
+            },
           ),
           modifier = Modifier
             .fillMaxWidth()
@@ -321,6 +326,11 @@ fun AuditLogScreen(
                 MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f)
               } else {
                 MaterialTheme.colorScheme.surfaceContainer
+              },
+              contentColor = if (log.isWarning || log.category == AuditCategory.FAILED_ATTEMPT) {
+                MaterialTheme.colorScheme.onErrorContainer
+              } else {
+                MaterialTheme.colorScheme.onSurface
               },
             ),
             modifier = Modifier

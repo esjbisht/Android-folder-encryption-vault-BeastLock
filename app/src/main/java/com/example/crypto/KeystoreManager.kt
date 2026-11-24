@@ -34,7 +34,7 @@ class KeystoreManager(
 
   companion object {
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
-    private const val KEY_ALIAS = "vaultlock_keystore_master_v1"
+    const val KEY_ALIAS = "vaultlock_keystore_master_v1"
     private const val AUDIT_KEY_ALIAS = "vaultlock_audit_log_v1"
     private const val GCM_TAG_BITS = 128
     private const val IV_BYTES = 12
@@ -43,7 +43,31 @@ class KeystoreManager(
   fun checkBiometricAvailability(): BiometricAvailability =
     BiometricHelper.checkAvailability(context)
 
-  private fun getOrCreateKeystoreKey(alias: String = KEY_ALIAS): SecretKey {
+  fun hasKeystoreKey(alias: String = KEY_ALIAS): Boolean {
+    if (overrideTestMasterKey != null && alias == KEY_ALIAS) return true
+    return runCatching {
+      val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+      keyStore.containsAlias(alias)
+    }.getOrDefault(false)
+  }
+
+  fun deleteKeystoreKey(alias: String = KEY_ALIAS): Boolean {
+    if (overrideTestMasterKey != null && alias == KEY_ALIAS) return false
+    return runCatching {
+      val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+      if (keyStore.containsAlias(alias)) {
+        keyStore.deleteEntry(alias)
+        true
+      } else {
+        false
+      }
+    }.getOrDefault(false)
+  }
+
+  fun getOrCreateKeystoreKey(alias: String = KEY_ALIAS): SecretKey {
+    if (overrideTestMasterKey != null && alias == KEY_ALIAS) {
+      return overrideTestMasterKey
+    }
     val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
     val existing = keyStore.getKey(alias, null) as? SecretKey
     if (existing != null) return existing

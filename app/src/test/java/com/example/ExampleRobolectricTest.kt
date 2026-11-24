@@ -2767,6 +2767,20 @@ class ExampleRobolectricTest {
       assertEquals("contract.txt", decMeta.originalName)
       assertEquals("BeastLock AES-256-GCM Payload", restoredOut.readText())
 
+      // 2b. Keystore-managed AES-256-GCM ByteArray & VLK1 file ByteArray roundtrips
+      assertEquals(true, encManager.hasKeystoreSecretKey())
+      assertArrayEquals(testMasterKey.encoded, encManager.getOrCreateKeystoreSecretKey().encoded)
+      val rawFileBytes = "Confidential Binary ByteArray Payload".toByteArray()
+      val aad = "vault-byte-aad".toByteArray()
+      val ksEncryptedBytes = encManager.encryptBytesWithKeystore(rawFileBytes, associatedData = aad)
+      assertEquals(false, ksEncryptedBytes.contentEquals(rawFileBytes))
+      assertArrayEquals(rawFileBytes, encManager.decryptBytesWithKeystore(ksEncryptedBytes, associatedData = aad))
+
+      val vlkFileBytes = encManager.encryptFileBytes(rawFileBytes, folderKey, fileName = "secret.bin", mimeType = "application/octet-stream")
+      val (recoveredMeta, recoveredBytes) = encManager.decryptFileBytes(vlkFileBytes, folderKey)
+      assertEquals("secret.bin", recoveredMeta.originalName)
+      assertArrayEquals(rawFileBytes, recoveredBytes)
+
       // 3. URI permission auditing across sandbox, accessible dir, and ungranted content:// URI
       java.io.File(pickedDir, "sheet.csv").writeText("a,b,c")
       val inspection = repo.inspectPickedSafFolder(android.net.Uri.fromFile(pickedDir)).getOrThrow()

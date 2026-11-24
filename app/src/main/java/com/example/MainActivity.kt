@@ -1,10 +1,12 @@
 package com.example
 
+import android.Manifest
 import android.app.Activity
 import android.app.StatusBarManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.drawable.Icon as AndroidIcon
 import android.os.Build
 import android.os.Bundle
@@ -14,14 +16,22 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.core.content.ContextCompat
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CloudUpload
 import androidx.compose.material.icons.outlined.Folder
@@ -34,7 +44,6 @@ import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.PieChart
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -93,7 +102,7 @@ import com.example.ui.StorageAnalyticsRoute
 import com.example.ui.VaultSessionState
 import com.example.ui.VaultViewModel
 import com.example.ui.components.CloudBackupProgressDialog
-import com.example.ui.components.EncryptionProgressDialog
+import com.example.ui.components.EncryptionProgressStrip
 import com.example.ui.components.IntegrityDiagnosticDialog
 import com.example.ui.components.MigrationProgressDialog
 import com.example.ui.components.MigrationResultDialog
@@ -102,6 +111,7 @@ import com.example.ui.components.OrphanCleanupDialog
 import com.example.ui.components.SecondaryAuthChallengeDialog
 import com.example.ui.components.SelectiveLockFilesDialog
 import com.example.ui.components.StealthVaultDrawerSheet
+import com.example.ui.components.VaultCircularProgressIndicator
 import com.example.ui.screens.AuditLogScreen
 import com.example.ui.screens.CloudBackupScreen
 import com.example.ui.screens.DiagnosticsSupportScreen
@@ -309,7 +319,7 @@ class MainActivity : FragmentActivity() {
         when (state.sessionState) {
           VaultSessionState.Loading -> {
             Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-              CircularProgressIndicator()
+              VaultCircularProgressIndicator()
             }
           }
           VaultSessionState.NeedsOnboarding -> {
@@ -371,7 +381,6 @@ class MainActivity : FragmentActivity() {
           }
         }
 
-        state.encryptionProgress?.let { EncryptionProgressDialog(it) }
         state.cloudBackupProgress?.let { CloudBackupProgressDialog(it) }
         if (state.isAutoLockReencrypting) {
           androidx.compose.material3.AlertDialog(
@@ -445,6 +454,27 @@ private fun VaultUnlockedAppShell(
   var showIntegrityDiagnosticDialog by remember { mutableStateOf(false) }
   var showMigrationWizard by remember { mutableStateOf(false) }
   var activeMigrationRequest by remember { mutableStateOf<PendingMigrationRequest?>(null) }
+  var hasRequestedNotificationPermission by remember { mutableStateOf(false) }
+
+  val notificationPermissionLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.RequestPermission(),
+  ) { _ -> }
+
+  LaunchedEffect(state.encryptionProgress != null) {
+    if (state.encryptionProgress != null &&
+      !hasRequestedNotificationPermission &&
+      Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+    ) {
+      hasRequestedNotificationPermission = true
+      val granted = ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.POST_NOTIFICATIONS,
+      ) == PackageManager.PERMISSION_GRANTED
+      if (!granted) {
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+      }
+    }
+  }
 
   val activeDetailFolderId = remember(navBackStackEntry) {
     if (navBackStackEntry?.destination?.hasRoute<FolderDetailRoute>() == true) {
@@ -761,44 +791,203 @@ private fun VaultUnlockedAppShell(
           }
         }
 
-        NavHost(
-          navController = navController,
-          startDestination = DashboardRoute,
-          modifier = Modifier.weight(1f),
-        ) {
-          composable<DashboardRoute> {
-            VaultDashboardScreen(
-              state = state,
-              onSelectFilter = viewModel::setFilter,
-              onSearchQueryChange = viewModel::setSearchQuery,
-              onPickDeviceFolder = viewModel::addDeviceFolder,
-              onPreviewPickedFolder = viewModel::previewPickedDeviceFolder,
-              onUpdateFolderPickerOptions = viewModel::updateFolderPickerPreviewOptions,
-              onConfirmFolderPickerPreview = viewModel::confirmFolderPickerPreview,
-              onDismissFolderPickerPreview = viewModel::dismissFolderPickerPreview,
-              onRegrantFolderPermission = viewModel::regrantDeviceFolderPermission,
-              onDecryptAnyDeviceFolder = { uri ->
-                authorizeActionBiometric(
-                  null,
-                  true,
-                  "Authorize Folder Decryption",
-                  "Verify with fingerprint or facial recognition to decrypt files in the selected device folder",
-                  {
-                    pendingSecondaryAuthAction = PendingSecondaryAuthAction(
-                      title = "Authorize Folder Decryption",
-                      description = "Draw your 3×3 Pattern or enter Master PIN to decrypt files in the selected device folder.",
-                      actionLabel = "Decrypt Any Device Folder",
-                      onAuthorized = { viewModel.decryptAnyDeviceFolder(uri) },
+        val hasTopProgressStrip = state.encryptionProgress != null
+        val topScreenModifier = if (hasTopProgressStrip) Modifier else Modifier.statusBarsPadding()
+
+        Column(modifier = Modifier.weight(1f)) {
+          AnimatedVisibility(
+            visible = hasTopProgressStrip,
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut(),
+          ) {
+            state.encryptionProgress?.let { activeProgress ->
+              EncryptionProgressStrip(
+                progress = activeProgress,
+                deferredAutoLockPending = state.deferredAutoLockPending,
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .statusBarsPadding(),
+              )
+            }
+          }
+
+          NavHost(
+            navController = navController,
+            startDestination = DashboardRoute,
+            modifier = Modifier.weight(1f),
+          ) {
+            composable<DashboardRoute> {
+              VaultDashboardScreen(
+                state = state,
+                onSelectFilter = viewModel::setFilter,
+                onSelectSortOrder = viewModel::setFolderSortOrder,
+                onSearchQueryChange = viewModel::setSearchQuery,
+                onClearSearchAndFilters = viewModel::clearDashboardSearchAndFilters,
+                onPickerLaunching = viewModel::markStealthPickerInFlight,
+                onPickDeviceFolder = viewModel::addDeviceFolder,
+                onPreviewPickedFolder = viewModel::previewPickedDeviceFolder,
+                onUpdateFolderPickerOptions = viewModel::updateFolderPickerPreviewOptions,
+                onConfirmFolderPickerPreview = viewModel::confirmFolderPickerPreview,
+                onDismissFolderPickerPreview = viewModel::dismissFolderPickerPreview,
+                onRegrantFolderPermission = viewModel::regrantDeviceFolderPermission,
+                onDecryptAnyDeviceFolder = { uri ->
+                  authorizeActionBiometric(
+                    null,
+                    true,
+                    "Authorize Folder Decryption",
+                    "Verify with fingerprint or facial recognition to decrypt files in the selected device folder",
+                    {
+                      pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                        title = "Authorize Folder Decryption",
+                        description = "Draw your 3×3 Pattern or enter Master PIN to decrypt files in the selected device folder.",
+                        actionLabel = "Decrypt Any Device Folder",
+                        onAuthorized = { viewModel.decryptAnyDeviceFolder(uri) },
+                      )
+                    },
+                    { viewModel.decryptAnyDeviceFolder(uri) },
+                  )
+                },
+                onCreatePrivateFolder = viewModel::createPrivateFolder,
+                onOpenFolder = openFolderWithAuthGate,
+                onToggleLockFolder = { folder ->
+                  if (folder.isLocked) {
+                    if (folder.requireBiometricPerUnlock) {
+                      authorizeActionBiometric(
+                        folder.name,
+                        true,
+                        null,
+                        null,
+                        {
+                          pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                            title = "Authorize Folder Unlock",
+                            description = "Draw your 3×3 Pattern or enter Master PIN to decrypt \"${folder.name}\".",
+                            actionLabel = folder.name,
+                            onAuthorized = { viewModel.unlockFolder(folder.id) },
+                          )
+                        },
+                        { viewModel.unlockFolder(folder.id) },
+                      )
+                    } else {
+                      viewModel.unlockFolder(folder.id)
+                    }
+                  } else {
+                    viewModel.lockFolder(folder.id, reloadDetail = false)
+                  }
+                },
+                onRemoveFolder = { folderId, decryptLockedSafFirst ->
+                  viewModel.removeFolder(folderId, decryptLockedSafFirst = decryptLockedSafFirst)
+                },
+                onEnterSelectionMode = viewModel::enterFolderSelectionMode,
+                onToggleFolderSelection = viewModel::toggleFolderSelection,
+                onSelectAllFilteredFolders = viewModel::selectAllFilteredFolders,
+                onClearSelection = viewModel::clearFolderSelection,
+                onEncryptSelectedFolders = viewModel::encryptSelectedFolders,
+                onDecryptSelectedFolders = {
+                  val selectedLocked = state.folders.filter {
+                    it.id in state.selectedFolderIds && (it.isLocked || it.encryptedFileCount > 0)
+                  }
+                  if (selectedLocked.any { it.requireBiometricPerUnlock }) {
+                    authorizeActionBiometric(
+                      null,
+                      true,
+                      "Unlock ${selectedLocked.size} Encrypted Folder(s)",
+                      "Verify with fingerprint or facial recognition to decrypt selected folders",
+                      {
+                        pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                          title = "Authorize Batch Unlock",
+                          description = "Draw your 3×3 Pattern or enter Master PIN to decrypt ${selectedLocked.size} selected folder(s).",
+                          actionLabel = "Batch Folder Unlock",
+                          onAuthorized = { viewModel.decryptSelectedFolders() },
+                        )
+                      },
+                      { viewModel.decryptSelectedFolders() },
                     )
-                  },
-                  { viewModel.decryptAnyDeviceFolder(uri) },
-                )
-              },
-              onCreatePrivateFolder = viewModel::createPrivateFolder,
-              onOpenFolder = openFolderWithAuthGate,
-              onToggleLockFolder = { folder ->
-                if (folder.isLocked) {
-                  if (folder.requireBiometricPerUnlock) {
+                  } else {
+                    viewModel.decryptSelectedFolders()
+                  }
+                },
+                onReencryptSelectedFolders = { includeUnlocked ->
+                  authorizeActionBiometric(
+                    null,
+                    false,
+                    "Authorize Key Rotation",
+                    "Verify with fingerprint or facial recognition to rotate folder encryption keys",
+                    {
+                      pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                        title = "Authorize Key Rotation",
+                        description = "Draw your 3×3 Pattern or enter your Master Vault PIN to authorize key rotation and re-encryption.",
+                        actionLabel = "Batch Key Rotation",
+                        onAuthorized = { viewModel.reencryptSelectedFolders(includeUnlocked) },
+                      )
+                    },
+                    { viewModel.reencryptSelectedFolders(includeUnlocked) },
+                  )
+                },
+                onRemoveSelectedFolders = { decryptLockedSafFirst ->
+                  viewModel.removeSelectedFolders(decryptLockedSafFirst = decryptLockedSafFirst)
+                },
+                onToggleFolderAutoCloudSync = viewModel::setFolderAutoCloudBackupSync,
+                onSetSelectedAutoCloudSync = viewModel::setSelectedFoldersAutoCloudBackupSync,
+                onBatchRenameFolders = viewModel::batchRenameFolders,
+                onOpenStorageCharts = { navigateTop(StorageAnalyticsRoute) },
+                onOpenDiagnostics = { navController.navigate(DiagnosticsSupportRoute) },
+                onTriggerStealthGesture = { viewModel.requestRevealStealthVault("SHIELD_GESTURE") },
+                onLockVaultNow = { viewModel.lockVaultNow() },
+                onSelectThemeMode = viewModel::setThemeMode,
+                modifier = topScreenModifier,
+              )
+            }
+
+            composable<StorageAnalyticsRoute> {
+              StorageAnalyticsScreen(
+                state = state,
+                onOpenFolder = openFolderWithAuthGate,
+                onLockFolder = { folderId ->
+                  viewModel.lockFolder(folderId)
+                },
+                onNavigateToVault = { navigateTop(DashboardRoute) },
+                onScanOrphans = { viewModel.scanOrphanedFiles(showCleanMessage = true) },
+                onOpenOrphanCleanup = {
+                  viewModel.scanOrphanedFiles()
+                  showOrphanCleanupDialog = true
+                },
+                onOpenMigrateOut = { showMigrationWizard = true },
+                onOpenIntegrityDiagnostic = {
+                  showIntegrityDiagnosticDialog = true
+                  if (!state.isScanningIntegrity && state.integrityDiagnosticReport == null) {
+                    viewModel.runIntegrityDiagnosticScan()
+                  }
+                },
+                modifier = topScreenModifier,
+              )
+            }
+
+            composable<FolderDetailRoute> { backStackEntry ->
+              val route = backStackEntry.toRoute<FolderDetailRoute>()
+              val folder = state.folders.find { it.id == route.folderId }
+              LaunchedEffect(route.folderId) {
+                viewModel.recordFolderAccessed(route.folderId)
+              }
+              FolderDetailScreen(
+                folder = folder,
+                files = state.activeFolderFiles,
+                isLoadingFiles = state.isLoadingFiles,
+                securePreview = state.securePreview,
+                isPreviewLoading = state.isPreviewLoading,
+                encryptionProgress = state.encryptionProgress,
+                isFolderBusy = state.isFolderBusy(route.folderId),
+                hasTopProgressStrip = hasTopProgressStrip,
+                onBack = {
+                  if (navController.currentBackStackEntry?.destination?.hasRoute<FolderDetailRoute>() == true) {
+                    navController.popBackStack()
+                  }
+                },
+                onRefresh = { viewModel.loadFolderFiles(route.folderId) },
+                onImportDocuments = { uris -> viewModel.importFiles(route.folderId, uris) },
+                onLockFolder = { viewModel.lockFolder(route.folderId, reloadDetail = true) },
+                onSelectiveLockFolder = { viewModel.requestLockFolderWithSelection(route.folderId, reloadDetail = true) },
+                onUnlockFolder = {
+                  if (folder?.requireBiometricPerUnlock == true) {
                     authorizeActionBiometric(
                       folder.name,
                       true,
@@ -809,362 +998,230 @@ private fun VaultUnlockedAppShell(
                           title = "Authorize Folder Unlock",
                           description = "Draw your 3×3 Pattern or enter Master PIN to decrypt \"${folder.name}\".",
                           actionLabel = folder.name,
-                          onAuthorized = { viewModel.unlockFolder(folder.id) },
+                          onAuthorized = { viewModel.unlockFolder(route.folderId, reloadDetail = true) },
                         )
                       },
-                      { viewModel.unlockFolder(folder.id) },
+                      { viewModel.unlockFolder(route.folderId, reloadDetail = true) },
                     )
                   } else {
-                    viewModel.unlockFolder(folder.id)
+                    viewModel.unlockFolder(route.folderId, reloadDetail = true)
                   }
-                } else {
-                  viewModel.lockFolder(folder.id, reloadDetail = false)
-                }
-              },
-              onRemoveFolder = { folderId, decryptLockedSafFirst ->
-                viewModel.removeFolder(folderId, decryptLockedSafFirst = decryptLockedSafFirst)
-              },
-              onEnterSelectionMode = viewModel::enterFolderSelectionMode,
-              onToggleFolderSelection = viewModel::toggleFolderSelection,
-              onSelectAllFilteredFolders = viewModel::selectAllFilteredFolders,
-              onClearSelection = viewModel::clearFolderSelection,
-              onEncryptSelectedFolders = viewModel::encryptSelectedFolders,
-              onDecryptSelectedFolders = {
-                val selectedLocked = state.folders.filter {
-                  it.id in state.selectedFolderIds && (it.isLocked || it.encryptedFileCount > 0)
-                }
-                if (selectedLocked.any { it.requireBiometricPerUnlock }) {
-                  authorizeActionBiometric(
-                    null,
-                    true,
-                    "Unlock ${selectedLocked.size} Encrypted Folder(s)",
-                    "Verify with fingerprint or facial recognition to decrypt selected folders",
-                    {
-                      pendingSecondaryAuthAction = PendingSecondaryAuthAction(
-                        title = "Authorize Batch Unlock",
-                        description = "Draw your 3×3 Pattern or enter Master PIN to decrypt ${selectedLocked.size} selected folder(s).",
-                        actionLabel = "Batch Folder Unlock",
-                        onAuthorized = { viewModel.decryptSelectedFolders() },
-                      )
-                    },
-                    { viewModel.decryptSelectedFolders() },
-                  )
-                } else {
-                  viewModel.decryptSelectedFolders()
-                }
-              },
-              onReencryptSelectedFolders = { includeUnlocked ->
-                authorizeActionBiometric(
-                  null,
-                  false,
-                  "Authorize Key Rotation",
-                  "Verify with fingerprint or facial recognition to rotate folder encryption keys",
-                  {
-                    pendingSecondaryAuthAction = PendingSecondaryAuthAction(
-                      title = "Authorize Key Rotation",
-                      description = "Draw your 3×3 Pattern or enter your Master Vault PIN to authorize key rotation and re-encryption.",
-                      actionLabel = "Batch Key Rotation",
-                      onAuthorized = { viewModel.reencryptSelectedFolders(includeUnlocked) },
+                },
+                onEncryptFiles = { fileIds ->
+                  viewModel.lockFolder(route.folderId, reloadDetail = true, selectedFileIds = fileIds)
+                },
+                onDecryptFiles = { fileIds ->
+                  if (folder?.requireBiometricPerUnlock == true) {
+                    authorizeActionBiometric(
+                      folder.name,
+                      true,
+                      "Decrypt File(s) in \"${folder.name}\"",
+                      "Verify with fingerprint or facial recognition to decrypt ${fileIds.size} selected file(s)",
+                      {
+                        pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                          title = "Authorize File Decryption",
+                          description = "Draw your 3×3 Pattern or enter Master PIN to decrypt ${fileIds.size} selected file(s) in \"${folder.name}\".",
+                          actionLabel = folder.name,
+                          onAuthorized = {
+                            viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true)
+                          },
+                        )
+                      },
+                      { viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true) },
                     )
-                  },
-                  { viewModel.reencryptSelectedFolders(includeUnlocked) },
-                )
-              },
-              onRemoveSelectedFolders = { decryptLockedSafFirst ->
-                viewModel.removeSelectedFolders(decryptLockedSafFirst = decryptLockedSafFirst)
-              },
-              onToggleFolderAutoCloudSync = viewModel::setFolderAutoCloudBackupSync,
-              onSetSelectedAutoCloudSync = viewModel::setSelectedFoldersAutoCloudBackupSync,
-              onBatchRenameFolders = viewModel::batchRenameFolders,
-              onOpenStorageCharts = { navigateTop(StorageAnalyticsRoute) },
-              onOpenDiagnostics = { navController.navigate(DiagnosticsSupportRoute) },
-              onTriggerStealthGesture = { viewModel.requestRevealStealthVault("SHIELD_GESTURE") },
-              onLockVaultNow = { viewModel.lockVaultNow() },
-              onSelectThemeMode = viewModel::setThemeMode,
-              modifier = Modifier.statusBarsPadding(),
-            )
-          }
-
-          composable<StorageAnalyticsRoute> {
-            StorageAnalyticsScreen(
-              state = state,
-              onOpenFolder = openFolderWithAuthGate,
-              onLockFolder = { folderId ->
-                viewModel.lockFolder(folderId)
-              },
-              onNavigateToVault = { navigateTop(DashboardRoute) },
-              onScanOrphans = { viewModel.scanOrphanedFiles(showCleanMessage = true) },
-              onOpenOrphanCleanup = {
-                viewModel.scanOrphanedFiles()
-                showOrphanCleanupDialog = true
-              },
-              onOpenMigrateOut = { showMigrationWizard = true },
-              onOpenIntegrityDiagnostic = {
-                showIntegrityDiagnosticDialog = true
-                if (!state.isScanningIntegrity && state.integrityDiagnosticReport == null) {
-                  viewModel.runIntegrityDiagnosticScan()
-                }
-              },
-              modifier = Modifier.statusBarsPadding(),
-            )
-          }
-
-          composable<FolderDetailRoute> { backStackEntry ->
-            val route = backStackEntry.toRoute<FolderDetailRoute>()
-            val folder = state.folders.find { it.id == route.folderId }
-            LaunchedEffect(route.folderId) {
-              viewModel.recordFolderAccessed(route.folderId)
+                  } else {
+                    viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true)
+                  }
+                },
+                onRemoveFiles = { fileIds ->
+                  viewModel.removeFilesInFolder(route.folderId, fileIds, reloadDetail = true)
+                },
+                onUpdateOptions = { reqBio, obf ->
+                  viewModel.updateFolderOptions(route.folderId, reqBio, obf)
+                },
+                onToggleAutoCloudSync = { enabled ->
+                  viewModel.setFolderAutoCloudBackupSync(route.folderId, enabled)
+                },
+                onBatchRenameFiles = { renameMap ->
+                  viewModel.batchRenameFiles(route.folderId, renameMap)
+                },
+                onPeekFile = { item ->
+                  if (item.isEncrypted && folder?.requireBiometricPerUnlock == true && !folder.requireAuthOnOpen) {
+                    authorizeActionBiometric(
+                      folder.name,
+                      false,
+                      "Preview \"${item.displayName}\"",
+                      "Verify with fingerprint or facial recognition to inspect encrypted file contents",
+                      {
+                        pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                          title = "Authorize Encrypted Preview",
+                          description = "Draw your 3×3 Pattern or enter Master PIN to preview \"${item.displayName}\".",
+                          actionLabel = item.displayName,
+                          onAuthorized = { viewModel.peekFile(item) },
+                        )
+                      },
+                      { viewModel.peekFile(item) },
+                    )
+                  } else {
+                    viewModel.peekFile(item)
+                  }
+                },
+                onDismissPreview = viewModel::dismissPreview,
+                onRemoveFolder = { decryptLockedSafFirst ->
+                  viewModel.removeFolder(folderId = route.folderId, decryptLockedSafFirst = decryptLockedSafFirst)
+                },
+                onPickerLaunching = viewModel::markStealthPickerInFlight,
+              )
             }
-            FolderDetailScreen(
-              folder = folder,
-              files = state.activeFolderFiles,
-              isLoadingFiles = state.isLoadingFiles,
-              securePreview = state.securePreview,
-              isPreviewLoading = state.isPreviewLoading,
-              onBack = {
-                if (navController.currentBackStackEntry?.destination?.hasRoute<FolderDetailRoute>() == true) {
-                  navController.popBackStack()
-                }
-              },
-              onRefresh = { viewModel.loadFolderFiles(route.folderId) },
-              onImportDocuments = { uris -> viewModel.importFiles(route.folderId, uris) },
-              onLockFolder = { viewModel.lockFolder(route.folderId, reloadDetail = true) },
-              onSelectiveLockFolder = { viewModel.requestLockFolderWithSelection(route.folderId, reloadDetail = true) },
-              onUnlockFolder = {
-                if (folder?.requireBiometricPerUnlock == true) {
-                  authorizeActionBiometric(
-                    folder.name,
-                    true,
-                    null,
-                    null,
-                    {
-                      pendingSecondaryAuthAction = PendingSecondaryAuthAction(
-                        title = "Authorize Folder Unlock",
-                        description = "Draw your 3×3 Pattern or enter Master PIN to decrypt \"${folder.name}\".",
-                        actionLabel = folder.name,
-                        onAuthorized = { viewModel.unlockFolder(route.folderId, reloadDetail = true) },
-                      )
-                    },
-                    { viewModel.unlockFolder(route.folderId, reloadDetail = true) },
+
+            composable<CloudBackupRoute> {
+              CloudBackupScreen(
+                folders = state.analyticsVisibleFolders,
+                backupRecords = state.backupRecords,
+                driveBackups = state.driveBackups,
+                isDriveSyncBusy = state.isDriveSyncBusy,
+                pendingDriveRestoreItem = state.pendingDriveRestoreItem,
+                securitySettings = state.securitySettings,
+                devicePowerState = state.devicePowerState,
+                isBatterySaverBlockingTasks = state.isBatterySaverBlockingTasks,
+                pendingRestoreUriRequiringPin = state.pendingRestoreUriRequiringPin,
+                onConnectGoogleDrive = startGoogleDriveAuth,
+                onDisconnectGoogleDrive = viewModel::disconnectGoogleDrive,
+                onRefreshGoogleDriveBackups = viewModel::refreshGoogleDriveBackups,
+                onSyncGoogleDriveNow = { selectedIds ->
+                  viewModel.syncVaultToGoogleDrive(
+                    selectedFolderIds = selectedIds,
+                    onlyAutoSync = false,
+                    createTimestampedSnapshot = false,
                   )
-                } else {
-                  viewModel.unlockFolder(route.folderId, reloadDetail = true)
-                }
-              },
-              onEncryptFiles = { fileIds ->
-                viewModel.lockFolder(route.folderId, reloadDetail = true, selectedFileIds = fileIds)
-              },
-              onDecryptFiles = { fileIds ->
-                if (folder?.requireBiometricPerUnlock == true) {
-                  authorizeActionBiometric(
-                    folder.name,
-                    true,
-                    "Decrypt File(s) in \"${folder.name}\"",
-                    "Verify with fingerprint or facial recognition to decrypt ${fileIds.size} selected file(s)",
-                    {
-                      pendingSecondaryAuthAction = PendingSecondaryAuthAction(
-                        title = "Authorize File Decryption",
-                        description = "Draw your 3×3 Pattern or enter Master PIN to decrypt ${fileIds.size} selected file(s) in \"${folder.name}\".",
-                        actionLabel = folder.name,
-                        onAuthorized = {
-                          viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true)
-                        },
-                      )
-                    },
-                    { viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true) },
-                  )
-                } else {
-                  viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true)
-                }
-              },
-              onRemoveFiles = { fileIds ->
-                viewModel.removeFilesInFolder(route.folderId, fileIds, reloadDetail = true)
-              },
-              onUpdateOptions = { reqBio, obf ->
-                viewModel.updateFolderOptions(route.folderId, reqBio, obf)
-              },
-              onToggleAutoCloudSync = { enabled ->
-                viewModel.setFolderAutoCloudBackupSync(route.folderId, enabled)
-              },
-              onBatchRenameFiles = { renameMap ->
-                viewModel.batchRenameFiles(route.folderId, renameMap)
-              },
-              onPeekFile = { item ->
-                if (item.isEncrypted && folder?.requireBiometricPerUnlock == true && !folder.requireAuthOnOpen) {
-                  authorizeActionBiometric(
-                    folder.name,
-                    false,
-                    "Preview \"${item.displayName}\"",
-                    "Verify with fingerprint or facial recognition to inspect encrypted file contents",
-                    {
-                      pendingSecondaryAuthAction = PendingSecondaryAuthAction(
-                        title = "Authorize Encrypted Preview",
-                        description = "Draw your 3×3 Pattern or enter Master PIN to preview \"${item.displayName}\".",
-                        actionLabel = item.displayName,
-                        onAuthorized = { viewModel.peekFile(item) },
-                      )
-                    },
-                    { viewModel.peekFile(item) },
-                  )
-                } else {
-                  viewModel.peekFile(item)
-                }
-              },
-              onDismissPreview = viewModel::dismissPreview,
-              onRemoveFolder = { decryptLockedSafFirst ->
-                viewModel.removeFolder(folderId = route.folderId, decryptLockedSafFirst = decryptLockedSafFirst)
-              },
-              onPickerLaunching = viewModel::markStealthPickerInFlight,
-            )
-          }
+                },
+                onToggleGoogleDriveAutoSync = viewModel::setGoogleDriveAutoSyncEnabled,
+                onRestoreGoogleDriveBackup = viewModel::restoreFromGoogleDrive,
+                onDeleteGoogleDriveBackup = viewModel::deleteGoogleDriveBackup,
+                onDismissPendingDriveRestorePin = viewModel::dismissPendingDriveRestorePin,
+                onExportBackup = { uri, provider, selectedIds ->
+                  viewModel.exportCloudBackup(uri, provider, selectedIds)
+                },
+                onRestoreBackup = { uri, pin ->
+                  viewModel.restoreCloudBackup(uri, pin)
+                },
+                onConfigureAutoBackupTree = viewModel::configureAutoBackupDestination,
+                onClearAutoBackupTree = viewModel::clearAutoBackupDestination,
+                onSyncAutoBackupNow = viewModel::syncAutoBackupNow,
+                onDismissPendingRestorePin = viewModel::dismissPendingRestorePinPrompt,
+                modifier = topScreenModifier,
+              )
+            }
 
-          composable<CloudBackupRoute> {
-            CloudBackupScreen(
-              folders = state.analyticsVisibleFolders,
-              backupRecords = state.backupRecords,
-              driveBackups = state.driveBackups,
-              isDriveSyncBusy = state.isDriveSyncBusy,
-              pendingDriveRestoreItem = state.pendingDriveRestoreItem,
-              securitySettings = state.securitySettings,
-              devicePowerState = state.devicePowerState,
-              isBatterySaverBlockingTasks = state.isBatterySaverBlockingTasks,
-              pendingRestoreUriRequiringPin = state.pendingRestoreUriRequiringPin,
-              onConnectGoogleDrive = startGoogleDriveAuth,
-              onDisconnectGoogleDrive = viewModel::disconnectGoogleDrive,
-              onRefreshGoogleDriveBackups = viewModel::refreshGoogleDriveBackups,
-              onSyncGoogleDriveNow = { selectedIds ->
-                viewModel.syncVaultToGoogleDrive(
-                  selectedFolderIds = selectedIds,
-                  onlyAutoSync = false,
-                  createTimestampedSnapshot = false,
-                )
-              },
-              onToggleGoogleDriveAutoSync = viewModel::setGoogleDriveAutoSyncEnabled,
-              onRestoreGoogleDriveBackup = viewModel::restoreFromGoogleDrive,
-              onDeleteGoogleDriveBackup = viewModel::deleteGoogleDriveBackup,
-              onDismissPendingDriveRestorePin = viewModel::dismissPendingDriveRestorePin,
-              onExportBackup = { uri, provider, selectedIds ->
-                viewModel.exportCloudBackup(uri, provider, selectedIds)
-              },
-              onRestoreBackup = { uri, pin ->
-                viewModel.restoreCloudBackup(uri, pin)
-              },
-              onConfigureAutoBackupTree = viewModel::configureAutoBackupDestination,
-              onClearAutoBackupTree = viewModel::clearAutoBackupDestination,
-              onSyncAutoBackupNow = viewModel::syncAutoBackupNow,
-              onDismissPendingRestorePin = viewModel::dismissPendingRestorePinPrompt,
-              modifier = Modifier.statusBarsPadding(),
-            )
-          }
+            composable<AuditLogRoute> {
+              AuditLogScreen(
+                snapshot = state.auditLogSnapshot,
+                onExportReport = { uri, format, scope ->
+                  viewModel.exportAuditReport(uri, format, scope)
+                },
+                onClearLogs = viewModel::clearAuditLogs,
+                modifier = topScreenModifier,
+              )
+            }
 
-          composable<AuditLogRoute> {
-            AuditLogScreen(
-              snapshot = state.auditLogSnapshot,
-              onExportReport = { uri, format, scope ->
-                viewModel.exportAuditReport(uri, format, scope)
-              },
-              onClearLogs = viewModel::clearAuditLogs,
-              modifier = Modifier.statusBarsPadding(),
-            )
-          }
+            composable<SecuritySettingsRoute> {
+              SecuritySettingsScreen(
+                settings = state.securitySettings,
+                biometricAvailability = state.biometricAvailability,
+                hasAccelerometer = hasAccelerometer,
+                devicePowerState = state.devicePowerState,
+                isBatterySaverBlockingTasks = state.isBatterySaverBlockingTasks,
+                orphanCount = state.orphanCandidates.size,
+                orphanBytes = state.totalOrphanBytes,
+                isScanningOrphans = state.isScanningOrphans,
+                isScanningIntegrity = state.isScanningIntegrity,
+                lastIntegrityCorruptedCount = state.integrityDiagnosticReport?.corruptedFiles?.size,
+                dualKeyStatus = state.dualKeyStatus,
+                pendingIssuesCount = state.pendingIssuesCount,
+                onToggleBiometric = viewModel::setBiometricEnabled,
+                onSelectPrimaryLockType = viewModel::setPrimaryLockType,
+                onToggleAutoLockEnabled = viewModel::setAutoLockEnabled,
+                onSelectAutoLockSeconds = viewModel::setAutoLockTimeout,
+                onToggleAutoLockReencrypt = viewModel::setAutoLockReencryptFolders,
+                onToggleRequireBioAfterAutoLock = viewModel::setRequireBiometricAfterAutoLock,
+                onToggleIdleTimeoutEnabled = viewModel::setIdleTimeoutEnabled,
+                onSelectIdleTimeoutSeconds = viewModel::setIdleTimeoutSeconds,
+                onTogglePanicMode = viewModel::setPanicModeEnabled,
+                onSelectPanicSensitivity = viewModel::setPanicSensitivity,
+                onTogglePanicExitToHome = viewModel::setPanicExitToDeviceHome,
+                onTogglePanicReencrypt = viewModel::setPanicReencryptFolders,
+                onTestPanicLock = { viewModel.triggerPanicLock(source = "SETTINGS_TEST") },
+                onToggleBatterySaverMode = viewModel::setBatterySaverModeEnabled,
+                onAddQuickTileLock = {
+                  requestAddQuickTile(
+                    context = context,
+                    serviceClass = LockVaultTileService::class.java,
+                    labelRes = R.string.qs_tile_lock_vault,
+                    iconRes = R.drawable.ic_qs_lock_vault,
+                  ) { feedback ->
+                    coroutineScope.launch { snackbarHostState.showSnackbar(feedback) }
+                  }
+                },
+                onAddQuickTilePanic = {
+                  requestAddQuickTile(
+                    context = context,
+                    serviceClass = PanicModeTileService::class.java,
+                    labelRes = R.string.qs_tile_panic_mode,
+                    iconRes = R.drawable.ic_qs_panic_mode,
+                  ) { feedback ->
+                    coroutineScope.launch { snackbarHostState.showSnackbar(feedback) }
+                  }
+                },
+                onToggleObfuscateDefault = viewModel::setObfuscateFilenamesDefault,
+                onSelectThemeMode = viewModel::setThemeMode,
+                onToggleDynamicColor = viewModel::setDynamicColor,
+                onChangePin = viewModel::changePin,
+                onSavePattern = { nodes, done ->
+                  viewModel.setOrUpdateUnlockPattern(nodes, makeDefaultFallback = true, onDone = done)
+                },
+                onRemovePattern = viewModel::removeUnlockPattern,
+                onTogglePreferPatternFallback = viewModel::setPreferPatternFallback,
+                onTogglePatternStealthMode = viewModel::setPatternStealthMode,
+                onUpdateRecoveryQuestions = { q1, a1, q2, a2, customPrompts, shareSuggestions, done ->
+                  viewModel.updateSecurityQuestions(q1, a1, q2, a2, customPrompts, shareSuggestions, done)
+                },
+                onLinkExternalDualKeyFolder = viewModel::linkExternalDualKeyFolder,
+                onVerifyDualKeyVault = viewModel::verifyDualKeyVaultNow,
+                onOpenDiagnostics = { navController.navigate(DiagnosticsSupportRoute) },
+                onOpenOrphanCleanup = {
+                  viewModel.scanOrphanedFiles()
+                  showOrphanCleanupDialog = true
+                },
+                onOpenIntegrityDiagnostic = {
+                  showIntegrityDiagnosticDialog = true
+                  if (!state.isScanningIntegrity && state.integrityDiagnosticReport == null) {
+                    viewModel.runIntegrityDiagnosticScan()
+                  }
+                },
+                onOpenMigrateOut = { showMigrationWizard = true },
+                onSelectStealthGestureMode = viewModel::setStealthGestureMode,
+                onToggleAlwaysBlockScreenshots = viewModel::setAlwaysBlockScreenshots,
+                onChangeStealthCode = viewModel::setStealthAccessCode,
+                onOpenStealthVault = { viewModel.requestRevealStealthVault("SETTINGS") },
+                modifier = topScreenModifier,
+              )
+            }
 
-          composable<SecuritySettingsRoute> {
-            SecuritySettingsScreen(
-              settings = state.securitySettings,
-              biometricAvailability = state.biometricAvailability,
-              hasAccelerometer = hasAccelerometer,
-              devicePowerState = state.devicePowerState,
-              isBatterySaverBlockingTasks = state.isBatterySaverBlockingTasks,
-              orphanCount = state.orphanCandidates.size,
-              orphanBytes = state.totalOrphanBytes,
-              isScanningOrphans = state.isScanningOrphans,
-              isScanningIntegrity = state.isScanningIntegrity,
-              lastIntegrityCorruptedCount = state.integrityDiagnosticReport?.corruptedFiles?.size,
-              dualKeyStatus = state.dualKeyStatus,
-              pendingIssuesCount = state.pendingIssuesCount,
-              onToggleBiometric = viewModel::setBiometricEnabled,
-              onSelectPrimaryLockType = viewModel::setPrimaryLockType,
-              onToggleAutoLockEnabled = viewModel::setAutoLockEnabled,
-              onSelectAutoLockSeconds = viewModel::setAutoLockTimeout,
-              onToggleAutoLockReencrypt = viewModel::setAutoLockReencryptFolders,
-              onToggleRequireBioAfterAutoLock = viewModel::setRequireBiometricAfterAutoLock,
-              onToggleIdleTimeoutEnabled = viewModel::setIdleTimeoutEnabled,
-              onSelectIdleTimeoutSeconds = viewModel::setIdleTimeoutSeconds,
-              onTogglePanicMode = viewModel::setPanicModeEnabled,
-              onSelectPanicSensitivity = viewModel::setPanicSensitivity,
-              onTogglePanicExitToHome = viewModel::setPanicExitToDeviceHome,
-              onTogglePanicReencrypt = viewModel::setPanicReencryptFolders,
-              onTestPanicLock = { viewModel.triggerPanicLock(source = "SETTINGS_TEST") },
-              onToggleBatterySaverMode = viewModel::setBatterySaverModeEnabled,
-              onAddQuickTileLock = {
-                requestAddQuickTile(
-                  context = context,
-                  serviceClass = LockVaultTileService::class.java,
-                  labelRes = R.string.qs_tile_lock_vault,
-                  iconRes = R.drawable.ic_qs_lock_vault,
-                ) { feedback ->
-                  coroutineScope.launch { snackbarHostState.showSnackbar(feedback) }
-                }
-              },
-              onAddQuickTilePanic = {
-                requestAddQuickTile(
-                  context = context,
-                  serviceClass = PanicModeTileService::class.java,
-                  labelRes = R.string.qs_tile_panic_mode,
-                  iconRes = R.drawable.ic_qs_panic_mode,
-                ) { feedback ->
-                  coroutineScope.launch { snackbarHostState.showSnackbar(feedback) }
-                }
-              },
-              onToggleObfuscateDefault = viewModel::setObfuscateFilenamesDefault,
-              onSelectThemeMode = viewModel::setThemeMode,
-              onToggleDynamicColor = viewModel::setDynamicColor,
-              onChangePin = viewModel::changePin,
-              onSavePattern = { nodes, done ->
-                viewModel.setOrUpdateUnlockPattern(nodes, makeDefaultFallback = true, onDone = done)
-              },
-              onRemovePattern = viewModel::removeUnlockPattern,
-              onTogglePreferPatternFallback = viewModel::setPreferPatternFallback,
-              onTogglePatternStealthMode = viewModel::setPatternStealthMode,
-              onUpdateRecoveryQuestions = { q1, a1, q2, a2, customPrompts, shareSuggestions, done ->
-                viewModel.updateSecurityQuestions(q1, a1, q2, a2, customPrompts, shareSuggestions, done)
-              },
-              onLinkExternalDualKeyFolder = viewModel::linkExternalDualKeyFolder,
-              onVerifyDualKeyVault = viewModel::verifyDualKeyVaultNow,
-              onOpenDiagnostics = { navController.navigate(DiagnosticsSupportRoute) },
-              onOpenOrphanCleanup = {
-                viewModel.scanOrphanedFiles()
-                showOrphanCleanupDialog = true
-              },
-              onOpenIntegrityDiagnostic = {
-                showIntegrityDiagnosticDialog = true
-                if (!state.isScanningIntegrity && state.integrityDiagnosticReport == null) {
-                  viewModel.runIntegrityDiagnosticScan()
-                }
-              },
-              onOpenMigrateOut = { showMigrationWizard = true },
-              onSelectStealthGestureMode = viewModel::setStealthGestureMode,
-              onToggleAlwaysBlockScreenshots = viewModel::setAlwaysBlockScreenshots,
-              onChangeStealthCode = viewModel::setStealthAccessCode,
-              onOpenStealthVault = { viewModel.requestRevealStealthVault("SETTINGS") },
-              modifier = Modifier.statusBarsPadding(),
-            )
-          }
-
-          composable<DiagnosticsSupportRoute> {
-            DiagnosticsSupportScreen(
-              state = state,
-              onBack = {
-                if (navController.currentBackStackEntry?.destination?.hasRoute<DiagnosticsSupportRoute>() == true) {
-                  navController.popBackStack()
-                }
-              },
-              onSignInWithGoogle = { viewModel.signInFirebaseWithGoogle(activity) },
-              onSignOut = viewModel::signOutFirebase,
-              onSendReport = viewModel::sendDiagnosticReport,
-              onClearSentHistory = viewModel::clearSentDiagnosticHistory,
-              modifier = Modifier.statusBarsPadding(),
-            )
+            composable<DiagnosticsSupportRoute> {
+              DiagnosticsSupportScreen(
+                state = state,
+                onBack = {
+                  if (navController.currentBackStackEntry?.destination?.hasRoute<DiagnosticsSupportRoute>() == true) {
+                    navController.popBackStack()
+                  }
+                },
+                onSignInWithGoogle = { viewModel.signInFirebaseWithGoogle(activity) },
+                onSignOut = viewModel::signOutFirebase,
+                onSendReport = viewModel::sendDiagnosticReport,
+                onClearSentHistory = viewModel::clearSentDiagnosticHistory,
+                modifier = topScreenModifier,
+              )
+            }
           }
         }
       }

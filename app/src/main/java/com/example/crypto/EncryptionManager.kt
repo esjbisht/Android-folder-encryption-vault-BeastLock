@@ -6,11 +6,15 @@ import android.net.Uri
 import androidx.biometric.BiometricPrompt
 import androidx.documentfile.provider.DocumentFile
 import com.example.data.local.VaultFolderEntity
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
+import javax.crypto.Cipher
 import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 enum class UriPermissionStatus(val label: String) {
   PERSISTED_READ_WRITE("Persistable R/W"),
@@ -42,6 +46,24 @@ class EncryptionManager(
   private val dualKeyVaultManager: DualKeyVaultManager? = null,
   private val externalTreeUriProvider: () -> String = { "" },
 ) {
+
+  companion object {
+    private const val AES_GCM_TRANSFORMATION = "AES/GCM/NoPadding"
+    private const val GCM_IV_BYTES = 12
+    private const val GCM_TAG_BITS = 128
+  }
+
+  /**
+   * Generates or retrieves an AES-256-GCM [SecretKey] inside the Android Keystore system.
+   */
+  fun getOrCreateKeystoreSecretKey(alias: String = KeystoreManager.KEY_ALIAS): SecretKey =
+    keystoreManager.getOrCreateKeystoreKey(alias)
+
+  fun hasKeystoreSecretKey(alias: String = KeystoreManager.KEY_ALIAS): Boolean =
+    keystoreManager.hasKeystoreKey(alias)
+
+  fun deleteKeystoreSecretKey(alias: String = KeystoreManager.KEY_ALIAS): Boolean =
+    keystoreManager.deleteKeystoreKey(alias)
 
   fun wrapMasterKey(dek: SecretKey): String = keystoreManager.wrapDekWithKeystore(dek)
 
@@ -157,26 +179,111 @@ class EncryptionManager(
     }
   }
 
+  fun encryptBytes(
+    plainBytes: ByteArray,
+    key: SecretKey,
+    associatedData: ByteArray? = null,
+  ): ByteArray {
+    val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+    cipher.init(Cipher.ENCRYPT_MODE, key)
+    if (associatedData != null && associatedData.isNotEmpty()) {
+      cipher.updateAAD(associatedData)
+    }
+    val iv = cipher.iv
+    require(iv.size == GCM_IV_BYTES) { "Unexpected GCM IV length: ${iv.size}" }
+    val ciphertextWithTag = cipher.doFinal(plainBytes)
+    return iv + ciphertextWithTag
+  }
+
+  fun decryptBytes(
+    encryptedPayload: ByteArray,
+    key: SecretKey,
+    associatedData: ByteArray? = null,
+  ): ByteArray {
+    val minSize = GCM_IV_BYTES + (GCM_TAG_BITS / 8)
+    require(encryptedPayload.size >= minSize) {
+      "Encrypted payload too short (${encryptedPayload.size} bytes)"
+    }
+    val iv = encryptedPayload.copyOfRange(0, GCM_IV_BYTES)
+    val ciphertextWithTag = encryptedPayload.copyOfRange(GCM_IV_BYTES, encryptedPayload.size)
+    val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+    cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
+    if (associatedData != null && associatedData.isNotEmpty()) {
+      cipher.updateAAD(associatedData)
+    }
+    return cipher.doFinal(ciphertextWithTag)
+  }
+
+  fun encryptBytesWithKeystore(
+    plainBytes: ByteArray,
+    keyAlias: String = KeystoreManager.KEY_ALIAS,
+    associatedData: ByteArray? = null,
+  ): ByteArray {
+    val key = getOrCreateKeystoreSecretKey(keyAlias)
+    return encryptBytes(plainBytes = plainBytes, key = key, associatedData = associatedData)
+  }
+
+  fun decryptBytesWithKeystore(
+    encryptedPayload: ByteArray,
+    keyAlias: String = KeystoreManager.KEY_ALIAS,
+    associatedData: ByteArray? = null,
+  ): ByteArray {
+    val key = getOrCreateKeystoreSecretKey(keyAlias)
+    return decryptBytes(encryptedPayload = encryptedPayload, key = key, associatedData = associatedData)
+  }
+
+  fun encryptFileBytes(
+    plainBytes: ByteArray,
+    key: SecretKey,
+    fileName: String,
+    mimeType: String = "application/octet-stream",
+  ): ByteArray {
+    val meta = EncryptedFileMetadata(
+      originalName = fileName,
+      mimeType = mimeType,
+      originalSize = plainBytes.size.toLong(),
+      encryptedAt = System.currentTimeMillis(),
+    )
+    val output = ByteArrayOutputStream()
+    ByteArrayInputStream(plainBytes).use { input ->
+      encryptStream(input, output, key, meta)
+    }
+    return output.toByteArray()
+  }
+
+  fun decryptFileBytes(
+    encryptedFileBytes: ByteArray,
+    key: SecretKey,
+    maxBytes: Int = 24 * 1024 * 1024,
+  ): Pair<EncryptedFileMetadata, ByteArray> =
+    ByteArrayInputStream(encryptedFileBytes).use { input ->
+      decryptToByteArray(input = input, key = key, maxBytes = maxBytes)
+    }
+
   fun encryptStream(
     input: InputStream,
     output: OutputStream,
     key: SecretKey,
     metadata: EncryptedFileMetadata,
+    onProgressBytes: ((Long) -> Unit)? = null,
   ): Long = AesFolderCipher.encryptStream(
     input = input,
     output = output,
     key = key,
     metadata = metadata,
+    onProgressBytes = onProgressBytes,
   )
 
   fun decryptStream(
     input: InputStream,
     output: OutputStream,
     key: SecretKey,
+    onProgressBytes: ((Long) -> Unit)? = null,
   ): EncryptedFileMetadata = AesFolderCipher.decryptStream(
     input = input,
     output = output,
     key = key,
+    onProgressBytes = onProgressBytes,
   )
 
   fun decryptToByteArray(

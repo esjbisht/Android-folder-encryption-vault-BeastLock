@@ -68,8 +68,10 @@ import androidx.compose.ui.unit.dp
 import com.example.data.local.VaultFolderEntity
 import com.example.data.storage.IntegrityDiagnosticReport
 import com.example.ui.VaultUiState
+import com.example.ui.isPartiallyEncrypted
 import com.example.ui.components.VaultStatusBadge
 import com.example.ui.components.formatByteSize
+import com.example.ui.theme.BeastLockTheme
 import kotlin.math.min
 
 private enum class HighlightSegment {
@@ -240,6 +242,7 @@ fun StorageAnalyticsScreen(
                 },
               )
 
+              val vaultColors = BeastLockTheme.colors
               // Interactive Segment Cards
               Row(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -249,7 +252,7 @@ fun StorageAnalyticsScreen(
                   label = "Encrypted (.vlock)",
                   bytesText = formatByteSize(encryptedBytes),
                   detailText = "${state.totalEncryptedFiles} files • ${(encryptedRatio * 100).toInt()}%",
-                  dotColor = MaterialTheme.colorScheme.primary,
+                  dotColor = vaultColors.lockedAccent,
                   selected = selectedSegment == HighlightSegment.ENCRYPTED,
                   onClick = {
                     selectedSegment = if (selectedSegment == HighlightSegment.ENCRYPTED) {
@@ -265,7 +268,7 @@ fun StorageAnalyticsScreen(
                   label = "Unencrypted",
                   bytesText = formatByteSize(unencryptedBytes),
                   detailText = "${state.totalUnencryptedFiles} files • ${(unencryptedRatio * 100).toInt()}%",
-                  dotColor = MaterialTheme.colorScheme.secondary,
+                  dotColor = vaultColors.unlockedAccent,
                   selected = selectedSegment == HighlightSegment.UNENCRYPTED,
                   onClick = {
                     selectedSegment = if (selectedSegment == HighlightSegment.UNENCRYPTED) {
@@ -353,9 +356,10 @@ private fun VaultStorageDonutChart(
     label = "plain_sweep",
   )
 
-  val primaryColor = MaterialTheme.colorScheme.primary
-  val secondaryColor = MaterialTheme.colorScheme.secondary
-  val trackColor = MaterialTheme.colorScheme.surfaceContainerHigh
+  val vaultColors = BeastLockTheme.colors
+  val primaryColor = vaultColors.lockedAccent
+  val secondaryColor = vaultColors.unlockedAccent
+  val trackColor = vaultColors.progressTrack
 
   Box(
     contentAlignment = Alignment.Center,
@@ -524,10 +528,11 @@ private fun DeviceFootprintCard(
   val plainFrac = (unencryptedBytes.toFloat() / totalDeviceBytes.toFloat()).coerceIn(0f, 1f)
   val otherFrac = (usedOtherBytes.toFloat() / totalDeviceBytes.toFloat()).coerceIn(0f, 1f)
 
-  val primaryColor = MaterialTheme.colorScheme.primary
-  val secondaryColor = MaterialTheme.colorScheme.secondary
+  val vaultColors = BeastLockTheme.colors
+  val primaryColor = vaultColors.lockedAccent
+  val secondaryColor = vaultColors.unlockedAccent
   val otherColor = MaterialTheme.colorScheme.outline
-  val freeColor = MaterialTheme.colorScheme.surfaceContainerHigh
+  val freeColor = vaultColors.progressTrack
 
   Card(
     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
@@ -645,9 +650,10 @@ private fun FolderStorageBarCard(
     label = "folder_bar_${folder.id}",
   )
 
-  val primaryColor = MaterialTheme.colorScheme.primary
-  val secondaryColor = MaterialTheme.colorScheme.secondary
-  val trackColor = MaterialTheme.colorScheme.surfaceContainerHigh
+  val vaultColors = BeastLockTheme.colors
+  val primaryColor = vaultColors.lockedAccent
+  val secondaryColor = vaultColors.unlockedAccent
+  val trackColor = vaultColors.progressTrack
 
   Card(
     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
@@ -680,7 +686,10 @@ private fun FolderStorageBarCard(
           modifier = Modifier.weight(1f),
         )
         Spacer(modifier = Modifier.width(8.dp))
-        VaultStatusBadge(isLocked = folder.isLocked)
+        VaultStatusBadge(
+          isLocked = folder.isLocked,
+          isPartiallyEncrypted = folder.isPartiallyEncrypted(),
+        )
         if (!folder.isLocked && folder.fileCount > 0) {
           Spacer(modifier = Modifier.width(6.dp))
           FilledTonalIconButton(
@@ -756,9 +765,10 @@ private fun PostureBreakdownCard(state: VaultUiState) {
   val internalCount = visibleFolders.count { it.isInternalVault }
   val safCount = visibleFolders.count { !it.isInternalVault }
 
-  val primaryColor = MaterialTheme.colorScheme.primary
-  val secondaryColor = MaterialTheme.colorScheme.secondary
-  val trackColor = MaterialTheme.colorScheme.surfaceContainerHigh
+  val vaultColors = BeastLockTheme.colors
+  val primaryColor = vaultColors.lockedAccent
+  val secondaryColor = vaultColors.unlockedAccent
+  val trackColor = vaultColors.progressTrack
 
   Card(
     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),

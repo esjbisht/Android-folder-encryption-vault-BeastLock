@@ -37,9 +37,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Sort
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.BatteryAlert
 import androidx.compose.material.icons.rounded.BugReport
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Checklist
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CloudOff
@@ -63,9 +65,12 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -100,24 +105,37 @@ import com.example.R
 import com.example.crypto.UriPermissionStatus
 import com.example.data.local.VaultFolderEntity
 import com.example.data.preferences.StealthGestureMode
+import com.example.data.storage.EncryptionProgress
 import com.example.ui.FolderFilter
+import com.example.ui.FolderSortOrder
 import com.example.ui.VaultUiState
+import com.example.ui.isPartiallyEncrypted
 import com.example.ui.components.BatchFolderRenameDialog
 import com.example.ui.components.ConfirmRemoveFoldersDialog
 import com.example.ui.components.FolderPickerPreviewSheet
 import com.example.ui.components.PermissionStatusPill
 import com.example.ui.components.ThemeModeDropdownButton
+import com.example.ui.components.VaultLinearProgressBar
 import com.example.ui.components.VaultStatusBadge
 import com.example.ui.components.formatByteSize
 import com.example.ui.components.formatTimestamp
+import com.example.ui.theme.BeastLockTheme
 import com.example.ui.theme.ThemeMode
+import com.example.ui.theme.VaultProgressTone
 
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun VaultDashboardScreen(
   state: VaultUiState,
   onSelectFilter: (FolderFilter) -> Unit,
+  onSelectSortOrder: (FolderSortOrder) -> Unit = {},
   onSearchQueryChange: (String) -> Unit,
+  onClearSearchAndFilters: () -> Unit = {
+    onSearchQueryChange("")
+    onSelectFilter(FolderFilter.ALL)
+    onSelectSortOrder(FolderSortOrder.RECENT)
+  },
+  onPickerLaunching: (Boolean) -> Unit = {},
   onPickDeviceFolder: (Uri) -> Unit,
   onPreviewPickedFolder: (Uri) -> Unit = onPickDeviceFolder,
   onUpdateFolderPickerOptions: (obfuscateFilenames: Boolean, requireAuthOnOpen: Boolean) -> Unit = { _, _ -> },
@@ -152,8 +170,12 @@ fun VaultDashboardScreen(
   var pendingRemoveFolders by remember { mutableStateOf<List<VaultFolderEntity>>(emptyList()) }
   var isRemovingBatchFolders by remember { mutableStateOf(false) }
   var pendingRegrantFolderId by remember { mutableStateOf<String?>(null) }
+  var showSortMenu by remember { mutableStateOf(false) }
   val haptic = LocalHapticFeedback.current
   val publicFolders = state.publicFolders
+  val filterCounts = remember(publicFolders, state.folderPermissionStatuses) {
+    state.folderFilterCounts
+  }
 
   BackHandler(enabled = state.isSelectionMode) {
     onClearSelection()
@@ -162,6 +184,7 @@ fun VaultDashboardScreen(
   val openFolderLauncher = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.OpenDocumentTree(),
   ) { uri ->
+    onPickerLaunching(false)
     if (uri != null) {
       onPreviewPickedFolder(uri)
     }
@@ -170,6 +193,7 @@ fun VaultDashboardScreen(
   val regrantFolderLauncher = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.OpenDocumentTree(),
   ) { uri ->
+    onPickerLaunching(false)
     val targetFolderId = pendingRegrantFolderId
     pendingRegrantFolderId = null
     if (uri != null && targetFolderId != null) {
@@ -180,6 +204,7 @@ fun VaultDashboardScreen(
   val decryptAnyFolderLauncher = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.OpenDocumentTree(),
   ) { uri ->
+    onPickerLaunching(false)
     if (uri != null) {
       onDecryptAnyDeviceFolder(uri)
     }
@@ -291,7 +316,7 @@ fun VaultDashboardScreen(
                   Icon(
                     imageVector = Icons.Rounded.VerifiedUser,
                     contentDescription = "BeastLock security badge",
-                    tint = MaterialTheme.colorScheme.primary,
+                    tint = BeastLockTheme.colors.heroAccent,
                     modifier = Modifier.size(22.dp),
                   )
                   Spacer(modifier = Modifier.width(8.dp))
@@ -302,7 +327,7 @@ fun VaultDashboardScreen(
                       "AES-256-GCM ACTIVE"
                     },
                     style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.primary,
+                    color = BeastLockTheme.colors.heroAccent,
                   )
                 }
                 Row(
@@ -352,15 +377,13 @@ fun VaultDashboardScreen(
                 )
                 StatPill(
                   label = "AUTO-LOCK",
-                  value = if (!state.securitySettings.autoLockEnabled) {
-                    "Off"
-                  } else if (state.securitySettings.autoLockTimeoutSeconds == 0) {
-                    "Immediate"
-                  } else if (state.securitySettings.autoLockTimeoutSeconds < 60) {
-                    "${state.securitySettings.autoLockTimeoutSeconds}s"
-                  } else {
-                    "${state.securitySettings.autoLockTimeoutSeconds / 60}m"
-                  },
+                  value = formatHeroAutoLockPosture(
+                    autoLockEnabled = state.securitySettings.autoLockEnabled,
+                    autoLockSeconds = state.securitySettings.autoLockTimeoutSeconds,
+                    idleEnabled = state.securitySettings.idleTimeoutEnabled,
+                    idleSeconds = state.securitySettings.idleTimeoutSeconds,
+                    deferredPending = state.deferredAutoLockPending,
+                  ),
                   modifier = Modifier.weight(1f),
                 )
               }
@@ -475,7 +498,10 @@ fun VaultDashboardScreen(
       item(key = "actions_row") {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
           Button(
-            onClick = { openFolderLauncher.launch(null) },
+            onClick = {
+              onPickerLaunching(true)
+              openFolderLauncher.launch(null)
+            },
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
             modifier = Modifier
               .fillMaxWidth()
@@ -487,7 +513,10 @@ fun VaultDashboardScreen(
           }
 
           OutlinedButton(
-            onClick = { decryptAnyFolderLauncher.launch(null) },
+            onClick = {
+              onPickerLaunching(true)
+              decryptAnyFolderLauncher.launch(null)
+            },
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
             modifier = Modifier
               .fillMaxWidth()
@@ -511,13 +540,13 @@ fun VaultDashboardScreen(
         }
       }
 
-      // Search & Filter Controls (Search bar always remains present for quick navigation & stealth access code)
+      // Search, Status Filter Chips & Sort Controls
       item(key = "search_filters") {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
           OutlinedTextField(
             value = state.searchQuery,
             onValueChange = onSearchQueryChange,
-            placeholder = { Text("Search by folder name or status (locked / unlocked)...") },
+            placeholder = { Text("Search name or status (locked, unlocked, partial, revoked)...") },
             leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
             trailingIcon = {
               if (state.searchQuery.isNotEmpty()) {
@@ -533,17 +562,19 @@ fun VaultDashboardScreen(
               }
             },
             supportingText = if (publicFolders.isNotEmpty() &&
-              (state.searchQuery.isNotBlank() || state.folderFilter != FolderFilter.ALL)
+              (state.searchQuery.isNotBlank() ||
+                state.folderFilter != FolderFilter.ALL ||
+                state.folderSortOrder != FolderSortOrder.RECENT)
             ) {
               {
                 Text(
-                  text = "${state.filteredFolders.size} of ${publicFolders.size} folder(s) matching",
+                  text = "${state.filteredFolders.size} of ${publicFolders.size} folder(s) • Sorted by ${state.folderSortOrder.label}",
                   modifier = Modifier.testTag("folder_search_match_count"),
                 )
               }
             } else {
               {
-                Text("Type a folder name or status (e.g. locked, unlocked) to filter live")
+                Text("Type a folder name or status (locked, unlocked, partial, revoked) to filter live")
               }
             },
             singleLine = true,
@@ -559,19 +590,108 @@ fun VaultDashboardScreen(
               verticalArrangement = Arrangement.spacedBy(6.dp),
               modifier = Modifier.fillMaxWidth(),
             ) {
+              val vaultColors = BeastLockTheme.colors
               FolderFilter.entries.forEach { filter ->
+                val count = filterCounts[filter] ?: 0
+                val isRevokedWarning = filter == FolderFilter.REVOKED && count > 0
+                val chipColors = when {
+                  isRevokedWarning -> FilterChipDefaults.filterChipColors(
+                    containerColor = vaultColors.dangerContainer.copy(alpha = 0.65f),
+                    labelColor = vaultColors.onDangerContainer,
+                    iconColor = vaultColors.dangerAccent,
+                    selectedContainerColor = vaultColors.dangerContainer,
+                    selectedLabelColor = vaultColors.onDangerContainer,
+                    selectedLeadingIconColor = vaultColors.dangerAccent,
+                  )
+                  filter == FolderFilter.LOCKED -> FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = vaultColors.lockedContainer,
+                    selectedLabelColor = vaultColors.onLockedContainer,
+                  )
+                  filter == FolderFilter.UNLOCKED -> FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = vaultColors.unlockedContainer,
+                    selectedLabelColor = vaultColors.onUnlockedContainer,
+                  )
+                  filter == FolderFilter.PARTIAL -> FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = vaultColors.partialContainer,
+                    selectedLabelColor = vaultColors.onPartialContainer,
+                  )
+                  else -> FilterChipDefaults.filterChipColors()
+                }
                 FilterChip(
                   selected = state.folderFilter == filter,
                   onClick = { onSelectFilter(filter) },
-                  label = { Text(filter.label) },
+                  leadingIcon = if (isRevokedWarning) {
+                    {
+                      Icon(
+                        imageVector = Icons.Rounded.WarningAmber,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                      )
+                    }
+                  } else null,
+                  colors = chipColors,
+                  label = { Text("${filter.label} ($count)") },
                   modifier = Modifier.testTag("filter_chip_${filter.name.lowercase()}"),
                 )
               }
+            }
+
+            Row(
+              horizontalArrangement = Arrangement.spacedBy(8.dp),
+              verticalAlignment = Alignment.CenterVertically,
+              modifier = Modifier.fillMaxWidth(),
+            ) {
+              Box {
+                OutlinedButton(
+                  onClick = { showSortMenu = true },
+                  contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                  modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .testTag("dashboard_sort_button"),
+                ) {
+                  Icon(
+                    imageVector = Icons.AutoMirrored.Rounded.Sort,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                  )
+                  Spacer(modifier = Modifier.width(6.dp))
+                  Text("Sort: ${state.folderSortOrder.label}")
+                }
+                DropdownMenu(
+                  expanded = showSortMenu,
+                  onDismissRequest = { showSortMenu = false },
+                ) {
+                  FolderSortOrder.entries.forEach { order ->
+                    DropdownMenuItem(
+                      text = { Text(order.label) },
+                      trailingIcon = if (state.folderSortOrder == order) {
+                        {
+                          Icon(
+                            imageVector = Icons.Rounded.Check,
+                            contentDescription = "Selected",
+                            tint = MaterialTheme.colorScheme.primary,
+                          )
+                        }
+                      } else null,
+                      onClick = {
+                        onSelectSortOrder(order)
+                        showSortMenu = false
+                      },
+                      modifier = Modifier.testTag("sort_option_${order.name.lowercase()}"),
+                    )
+                  }
+                }
+              }
+
+              Spacer(modifier = Modifier.weight(1f))
+
               if (!state.isSelectionMode && state.filteredFolders.isNotEmpty()) {
                 OutlinedButton(
                   onClick = { onEnterSelectionMode(null) },
                   contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                  modifier = Modifier.testTag("enter_multiselect_button"),
+                  modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .testTag("enter_multiselect_button"),
                 ) {
                   Icon(Icons.Rounded.Checklist, contentDescription = null, modifier = Modifier.size(18.dp))
                   Spacer(modifier = Modifier.width(6.dp))
@@ -673,17 +793,14 @@ fun VaultDashboardScreen(
                 text = if (publicFolders.isEmpty()) {
                   "Tap \"Lock Device Folder\" to select any folder from internal or external storage via Android's Storage Access Framework."
                 } else {
-                  "No folders matched \"${state.searchQuery.ifBlank { state.folderFilter.label }}\". Try another name or status (locked / unlocked)."
+                  "No folders matched \"${state.searchQuery.ifBlank { state.folderFilter.label }}\". Try another name or status (locked, unlocked, partial, revoked)."
                 },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
               )
               if (publicFolders.isNotEmpty()) {
                 OutlinedButton(
-                  onClick = {
-                    onSearchQueryChange("")
-                    onSelectFilter(FolderFilter.ALL)
-                  },
+                  onClick = onClearSearchAndFilters,
                   modifier = Modifier.testTag("clear_search_filters_button"),
                 ) {
                   Icon(Icons.Rounded.Close, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -700,19 +817,25 @@ fun VaultDashboardScreen(
       items(state.filteredFolders, key = { it.id }) { folder ->
         val isSelected = folder.id in state.selectedFolderIds
         val permStatus = state.folderPermissionStatuses[folder.id]
+        val isBusy = state.isFolderBusy(folder.id)
+        val activeProgress = state.encryptionProgress?.takeIf { it.folderId == folder.id }
         VaultFolderCard(
           folder = folder,
           permissionStatus = permStatus,
           isSelectionMode = state.isSelectionMode,
           isSelected = isSelected,
+          isBusy = isBusy,
+          activeProgress = activeProgress,
           onOpen = {
             if (state.isSelectionMode) {
-              onToggleFolderSelection(folder.id)
+              if (!isBusy) onToggleFolderSelection(folder.id)
             } else {
               onOpenFolder(folder.id)
             }
           },
-          onLongPress = { onEnterSelectionMode(folder.id) },
+          onLongPress = {
+            if (!isBusy) onEnterSelectionMode(folder.id)
+          },
           onToggleLock = { onToggleLockFolder(folder) },
           onRequestRemove = {
             isRemovingBatchFolders = false
@@ -723,6 +846,7 @@ fun VaultDashboardScreen(
             val initialUri = runCatching {
               Uri.parse(folder.treeUri).takeIf { it.scheme == "content" }
             }.getOrNull()
+            onPickerLaunching(true)
             regrantFolderLauncher.launch(initialUri)
           },
           onToggleAutoCloudSync = { enabled ->
@@ -798,6 +922,7 @@ fun VaultDashboardScreen(
             }
           }
 
+          val hasBusySelection = selectedFolders.any { state.isFolderBusy(it.id) }
           Row(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -805,7 +930,7 @@ fun VaultDashboardScreen(
           ) {
             Button(
               onClick = onEncryptSelectedFolders,
-              enabled = unlockedSelectedCount > 0,
+              enabled = unlockedSelectedCount > 0 && !hasBusySelection,
               modifier = Modifier
                 .weight(1f)
                 .testTag("batch_encrypt_button"),
@@ -820,7 +945,7 @@ fun VaultDashboardScreen(
             }
             FilledTonalButton(
               onClick = onDecryptSelectedFolders,
-              enabled = lockedSelectedCount > 0,
+              enabled = lockedSelectedCount > 0 && !hasBusySelection,
               modifier = Modifier
                 .weight(1f)
                 .testTag("batch_decrypt_button"),
@@ -837,7 +962,7 @@ fun VaultDashboardScreen(
 
           FilledTonalButton(
             onClick = { showReencryptConfirmDialog = true },
-            enabled = selectedFolders.isNotEmpty(),
+            enabled = selectedFolders.isNotEmpty() && !hasBusySelection,
             colors = ButtonDefaults.filledTonalButtonColors(
               containerColor = MaterialTheme.colorScheme.secondaryContainer,
               contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
@@ -862,7 +987,7 @@ fun VaultDashboardScreen(
           ) {
             OutlinedButton(
               onClick = { showBatchFolderRenameDialog = true },
-              enabled = selectedFolders.isNotEmpty(),
+              enabled = selectedFolders.isNotEmpty() && !hasBusySelection,
               modifier = Modifier
                 .weight(1f)
                 .testTag("batch_rename_folders_button"),
@@ -880,7 +1005,7 @@ fun VaultDashboardScreen(
                 isRemovingBatchFolders = true
                 pendingRemoveFolders = selectedFolders
               },
-              enabled = selectedFolders.isNotEmpty(),
+              enabled = selectedFolders.isNotEmpty() && !hasBusySelection,
               colors = ButtonDefaults.outlinedButtonColors(
                 contentColor = MaterialTheme.colorScheme.error,
               ),
@@ -982,6 +1107,28 @@ private fun StatPill(
   }
 }
 
+private fun formatShortAutoLockSeconds(seconds: Int): String = when {
+  seconds <= 0 -> "0s"
+  seconds < 60 -> "${seconds}s"
+  seconds % 60 == 0 -> "${seconds / 60}m"
+  else -> "${seconds / 60}m${seconds % 60}s"
+}
+
+private fun formatHeroAutoLockPosture(
+  autoLockEnabled: Boolean,
+  autoLockSeconds: Int,
+  idleEnabled: Boolean,
+  idleSeconds: Int,
+  deferredPending: Boolean,
+): String = when {
+  deferredPending -> "Pending"
+  autoLockEnabled && idleEnabled ->
+    "${formatShortAutoLockSeconds(autoLockSeconds)}/${formatShortAutoLockSeconds(idleSeconds)}"
+  autoLockEnabled -> if (autoLockSeconds <= 0) "Immediate" else formatShortAutoLockSeconds(autoLockSeconds)
+  idleEnabled -> "Idle ${formatShortAutoLockSeconds(idleSeconds)}"
+  else -> "Off"
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun VaultFolderCard(
@@ -989,6 +1136,8 @@ private fun VaultFolderCard(
   permissionStatus: UriPermissionStatus?,
   isSelectionMode: Boolean,
   isSelected: Boolean,
+  isBusy: Boolean = false,
+  activeProgress: EncryptionProgress? = null,
   onOpen: () -> Unit,
   onLongPress: () -> Unit,
   onToggleLock: () -> Unit,
@@ -1005,15 +1154,21 @@ private fun VaultFolderCard(
         MaterialTheme.colorScheme.surfaceContainer
       },
     ),
-    border = if (isSelected) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
+    border = when {
+      isSelected -> BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
+      isBusy -> BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.65f))
+      else -> null
+    },
     modifier = Modifier
       .fillMaxWidth()
       .clip(MaterialTheme.shapes.medium)
       .combinedClickable(
         onClick = onOpen,
         onLongClick = {
-          haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-          onLongPress()
+          if (!isBusy) {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            onLongPress()
+          }
         },
       )
       .testTag("folder_card_${folder.id}"),
@@ -1025,16 +1180,18 @@ private fun VaultFolderCard(
           .fillMaxWidth()
           .padding(16.dp),
       ) {
+        val vaultColors = BeastLockTheme.colors
+        val isPartial = folder.isPartiallyEncrypted()
         Surface(
-          color = if (folder.isLocked) {
-            MaterialTheme.colorScheme.secondaryContainer
-          } else {
-            MaterialTheme.colorScheme.primaryContainer
+          color = when {
+            isPartial -> vaultColors.partialContainer
+            folder.isLocked -> vaultColors.lockedContainer
+            else -> vaultColors.unlockedContainer
           },
-          contentColor = if (folder.isLocked) {
-            MaterialTheme.colorScheme.onSecondaryContainer
-          } else {
-            MaterialTheme.colorScheme.onPrimaryContainer
+          contentColor = when {
+            isPartial -> vaultColors.onPartialContainer
+            folder.isLocked -> vaultColors.onLockedContainer
+            else -> vaultColors.onUnlockedContainer
           },
           shape = MaterialTheme.shapes.small,
           modifier = Modifier.size(48.dp),
@@ -1060,10 +1217,13 @@ private fun VaultFolderCard(
               modifier = Modifier.weight(1f, fill = false),
             )
             Spacer(modifier = Modifier.width(8.dp))
-            VaultStatusBadge(isLocked = folder.isLocked)
+            VaultStatusBadge(
+              isLocked = folder.isLocked,
+              isPartiallyEncrypted = isPartial,
+            )
           }
           Spacer(modifier = Modifier.height(4.dp))
-          val fileSummary = if (folder.isLocked && folder.fileCount > 0 && folder.encryptedFileCount < folder.fileCount) {
+          val fileSummary = if (isPartial) {
             "${folder.encryptedFileCount}/${folder.fileCount} encrypted"
           } else {
             "${folder.fileCount} files"
@@ -1095,7 +1255,10 @@ private fun VaultFolderCard(
         if (isSelectionMode) {
           Checkbox(
             checked = isSelected,
-            onCheckedChange = { onOpen() },
+            enabled = !isBusy,
+            onCheckedChange = {
+              if (!isBusy) onOpen()
+            },
             modifier = Modifier.testTag("folder_checkbox_${folder.id}"),
           )
         } else {
@@ -1105,6 +1268,7 @@ private fun VaultFolderCard(
           ) {
             FilledTonalIconButton(
               onClick = onToggleLock,
+              enabled = !isBusy,
               modifier = Modifier.testTag("folder_toggle_lock_${folder.id}"),
             ) {
               Icon(
@@ -1114,6 +1278,7 @@ private fun VaultFolderCard(
             }
             IconButton(
               onClick = onRequestRemove,
+              enabled = !isBusy,
               modifier = Modifier.testTag("folder_remove_${folder.id}"),
             ) {
               Icon(
@@ -1123,6 +1288,58 @@ private fun VaultFolderCard(
               )
             }
           }
+        }
+      }
+
+      AnimatedVisibility(visible = isBusy) {
+        val vaultColors = BeastLockTheme.colors
+        val fraction = activeProgress?.overallFraction?.coerceIn(0f, 1f) ?: 0f
+        val isIndeterminate = activeProgress == null ||
+          (activeProgress.totalFiles <= 0 && activeProgress.totalBytes <= 0L)
+        val percent = (fraction * 100f).toInt().coerceIn(0, 100)
+        val isLockingOp = activeProgress?.isLocking != false
+        val progressTone = if (isLockingOp) VaultProgressTone.ENCRYPT else VaultProgressTone.DECRYPT
+        val progressTint = if (isLockingOp) vaultColors.progressEncrypt else vaultColors.progressDecrypt
+        val statusLabel = when {
+          activeProgress == null -> "Operation in progress…"
+          activeProgress.isLocking -> "Encrypting ${activeProgress.currentFileName} • $percent%"
+          else -> "Decrypting ${activeProgress.currentFileName} • $percent%"
+        }
+        Column(
+          verticalArrangement = Arrangement.spacedBy(5.dp),
+          modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+        ) {
+          Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier.fillMaxWidth(),
+          ) {
+            Text(
+              text = statusLabel,
+              style = MaterialTheme.typography.labelSmall,
+              fontWeight = FontWeight.Medium,
+              color = progressTint,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis,
+              modifier = Modifier.weight(1f),
+            )
+            if (!isIndeterminate) {
+              Spacer(modifier = Modifier.width(8.dp))
+              Text(
+                text = "${activeProgress?.processedFiles ?: 0}/${activeProgress?.totalFiles ?: 0}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+          }
+          VaultLinearProgressBar(
+            progress = if (isIndeterminate) null else fraction,
+            tone = progressTone,
+            height = 4.dp,
+            modifier = Modifier.testTag("folder_inline_progress_${folder.id}"),
+          )
         }
       }
 
@@ -1168,6 +1385,7 @@ private fun VaultFolderCard(
               }
               FilledTonalButton(
                 onClick = onRegrantPermission,
+                enabled = !isBusy,
                 colors = ButtonDefaults.filledTonalButtonColors(
                   containerColor = MaterialTheme.colorScheme.error,
                   contentColor = MaterialTheme.colorScheme.onError,
@@ -1193,7 +1411,7 @@ private fun VaultFolderCard(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
               .fillMaxWidth()
-              .clickable { onToggleAutoCloudSync(!folder.autoCloudBackupSync) }
+              .clickable(enabled = !isBusy) { onToggleAutoCloudSync(!folder.autoCloudBackupSync) }
               .padding(horizontal = 16.dp, vertical = 6.dp),
           ) {
             Icon(
@@ -1224,6 +1442,7 @@ private fun VaultFolderCard(
             }
             Switch(
               checked = folder.autoCloudBackupSync,
+              enabled = !isBusy,
               onCheckedChange = onToggleAutoCloudSync,
               modifier = Modifier.testTag("folder_cloud_sync_toggle_${folder.id}"),
             )
@@ -1331,9 +1550,10 @@ private fun StorageUsagePreviewCard(
 ) {
   val total = (encryptedBytes + unencryptedBytes).coerceAtLeast(1L)
   val encFrac = (encryptedBytes.toFloat() / total.toFloat()).coerceIn(0f, 1f)
-  val primaryColor = MaterialTheme.colorScheme.primary
-  val secondaryColor = MaterialTheme.colorScheme.secondary
-  val trackColor = MaterialTheme.colorScheme.surfaceContainerHigh
+  val vaultColors = BeastLockTheme.colors
+  val primaryColor = vaultColors.lockedAccent
+  val secondaryColor = vaultColors.unlockedAccent
+  val trackColor = vaultColors.progressTrack
 
   Card(
     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),

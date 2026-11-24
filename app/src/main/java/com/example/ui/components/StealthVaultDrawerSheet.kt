@@ -55,8 +55,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.local.VaultFolderEntity
-import com.example.ui.theme.AmberVault
-import com.example.ui.theme.AmberVaultContainer
+import com.example.ui.isPartiallyEncrypted
+import com.example.ui.theme.BeastLockTheme
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -85,12 +85,13 @@ fun StealthVaultDrawerSheet(
         .padding(horizontal = 18.dp)
         .padding(bottom = 18.dp),
     ) {
+      val stealthColors = BeastLockTheme.colors
       // Stealth Vault Security Header
       Surface(
-        color = AmberVaultContainer.copy(alpha = 0.72f),
-        contentColor = AmberVault,
+        color = stealthColors.warningContainer,
+        contentColor = stealthColors.onWarningContainer,
         shape = RoundedCornerShape(50),
-        border = BorderStroke(1.dp, AmberVault.copy(alpha = 0.45f)),
+        border = BorderStroke(1.dp, stealthColors.warningAccent.copy(alpha = 0.45f)),
       ) {
         Row(
           verticalAlignment = Alignment.CenterVertically,
@@ -172,8 +173,8 @@ fun StealthVaultDrawerSheet(
               .padding(24.dp),
           ) {
             Surface(
-              color = AmberVaultContainer,
-              contentColor = AmberVault,
+              color = stealthColors.warningContainer,
+              contentColor = stealthColors.onWarningContainer,
               shape = RoundedCornerShape(16.dp),
             ) {
               Icon(
@@ -220,8 +221,8 @@ fun StealthVaultDrawerSheet(
                   .padding(14.dp),
               ) {
                 Surface(
-                  color = AmberVaultContainer,
-                  contentColor = AmberVault,
+                  color = stealthColors.warningContainer,
+                  contentColor = stealthColors.onWarningContainer,
                   shape = MaterialTheme.shapes.small,
                   modifier = Modifier.size(44.dp),
                 ) {
@@ -244,7 +245,10 @@ fun StealthVaultDrawerSheet(
                       modifier = Modifier.weight(1f, fill = false),
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    VaultStatusBadge(isLocked = folder.isLocked)
+                    VaultStatusBadge(
+                      isLocked = folder.isLocked,
+                      isPartiallyEncrypted = folder.isPartiallyEncrypted(),
+                    )
                   }
                   Spacer(modifier = Modifier.heightIn(min = 2.dp))
                   Text(
@@ -315,7 +319,7 @@ private fun CreateStealthFolderDialog(
       Icon(
         imageVector = Icons.Rounded.VisibilityOff,
         contentDescription = null,
-        tint = AmberVault,
+        tint = BeastLockTheme.colors.warningAccent,
       )
     },
     title = { Text("New Stealth Hidden Folder") },

@@ -35,7 +35,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -64,6 +63,7 @@ import com.example.data.local.BackupRecordEntity
 import com.example.data.local.VaultFolderEntity
 import com.example.data.preferences.SecuritySettings
 import com.example.security.DevicePowerState
+import com.example.ui.components.VaultCircularProgressIndicator
 import com.example.ui.components.formatByteSize
 import com.example.ui.components.formatTimestamp
 import java.text.SimpleDateFormat
@@ -241,7 +241,7 @@ fun CloudBackupScreen(
                   modifier = Modifier.testTag("refresh_google_drive_button"),
                 ) {
                   if (isDriveSyncBusy) {
-                    CircularProgressIndicator(
+                    VaultCircularProgressIndicator(
                       strokeWidth = 2.dp,
                       modifier = Modifier.size(20.dp),
                     )

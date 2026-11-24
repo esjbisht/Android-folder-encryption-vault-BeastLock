@@ -46,7 +46,6 @@ import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedButton
@@ -84,7 +83,9 @@ import com.example.ui.components.NumericPinKeypad
 import com.example.ui.components.PatternLockGrid
 import com.example.ui.components.PinDotsIndicator
 import com.example.ui.components.ThemeModeDropdownButton
+import com.example.ui.components.VaultLinearProgressBar
 import com.example.ui.theme.ThemeMode
+import com.example.ui.theme.VaultProgressTone
 
 private const val CUSTOM_QUESTION_SENTINEL = "Write custom security question…"
 
@@ -219,12 +220,10 @@ fun OnboardingLockSetupScreen(
             color = MaterialTheme.colorScheme.primary,
           )
           Spacer(modifier = Modifier.height(6.dp))
-          LinearProgressIndicator(
-            progress = { (step + 1) / 3f },
-            modifier = Modifier
-              .fillMaxWidth()
-              .height(6.dp)
-              .clip(RoundedCornerShape(3.dp)),
+          VaultLinearProgressBar(
+            progress = (step + 1) / 3f,
+            tone = VaultProgressTone.ENCRYPT,
+            height = 6.dp,
           )
         }
         Spacer(modifier = Modifier.width(8.dp))

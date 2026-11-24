@@ -47,7 +47,30 @@ data class EncryptionProgress(
   val totalFiles: Int,
   val processedBytes: Long,
   val totalBytes: Long,
-)
+  val folderId: String = "",
+  val currentFileId: String = "",
+  val currentFileProcessedBytes: Long = 0L,
+  val currentFileTotalBytes: Long = 0L,
+  val isStealthMasked: Boolean = false,
+) {
+  val currentFileFraction: Float
+    get() = when {
+      currentFileTotalBytes > 0L ->
+        (currentFileProcessedBytes.toFloat() / currentFileTotalBytes.toFloat()).coerceIn(0f, 1f)
+      totalFiles > 0 && processedFiles >= totalFiles -> 1f
+      else -> 0f
+    }
+
+  val overallFraction: Float
+    get() = when {
+      totalBytes > 0L ->
+        ((processedBytes + currentFileProcessedBytes).coerceAtMost(totalBytes).toFloat() / totalBytes.toFloat())
+          .coerceIn(0f, 1f)
+      totalFiles > 0 ->
+        (processedFiles.toFloat() / totalFiles.toFloat()).coerceIn(0f, 1f)
+      else -> 0f
+    }
+}
 
 data class BatchFolderResult(
   val succeededCount: Int,
@@ -133,6 +156,23 @@ class FolderLockerRepository(
     private const val STEALTH_SANDBOX_DIR = ".beastlock_private"
     private const val LEGACY_SANDBOX_DIR = "vaults"
     private const val STEALTH_AUDIT_ALIAS = "Stealth Private Vault"
+  }
+
+  private class ProgressThrottle(
+    private val onProgress: (EncryptionProgress) -> Unit,
+  ) {
+    private var lastEmitAt = 0L
+    private var lastFileKey = ""
+
+    fun emit(progress: EncryptionProgress, force: Boolean = false) {
+      val now = System.currentTimeMillis()
+      val fileKey = "${progress.folderId}|${progress.currentFileId}|${progress.currentFileName}|${progress.processedFiles}"
+      if (force || fileKey != lastFileKey || now - lastEmitAt >= 75L) {
+        lastEmitAt = now
+        lastFileKey = fileKey
+        onProgress(progress)
+      }
+    }
   }
 
   private fun safeAuditName(folder: VaultFolderEntity): String =
@@ -740,6 +780,7 @@ class FolderLockerRepository(
     runCatching {
       val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
       val folderKey = resolveFolderKeyWithRecovery(folder, dek)
+      val throttle = ProgressThrottle(onProgress)
       var processed = 0
       var processedBytes = 0L
 
@@ -757,18 +798,22 @@ class FolderLockerRepository(
         val totalBytes = plainFiles.sumOf { it.length() }
 
         for (file in plainFiles) {
-          onProgress(
-            EncryptionProgress(
-              folderName = folder.name,
-              isLocking = true,
-              currentFileName = file.name,
-              processedFiles = processed,
-              totalFiles = plainFiles.size,
-              processedBytes = processedBytes,
-              totalBytes = totalBytes,
-            ),
-          )
           val origBytes = file.length()
+          val baseProgress = EncryptionProgress(
+            folderName = folder.name,
+            isLocking = true,
+            currentFileName = file.name,
+            processedFiles = processed,
+            totalFiles = plainFiles.size,
+            processedBytes = processedBytes,
+            totalBytes = totalBytes,
+            folderId = folder.id,
+            currentFileId = file.absolutePath,
+            currentFileProcessedBytes = 0L,
+            currentFileTotalBytes = origBytes,
+            isStealthMasked = folder.isStealthHidden,
+          )
+          throttle.emit(baseProgress, force = true)
           val encryptedName = if (folder.obfuscateFilenames) {
             encryptionManager.generateObfuscatedCipherName()
           } else {
@@ -790,6 +835,13 @@ class FolderLockerRepository(
                     originalSize = origBytes,
                     encryptedAt = System.currentTimeMillis(),
                   ),
+                  onProgressBytes = { fileBytes ->
+                    throttle.emit(
+                      baseProgress.copy(
+                        currentFileProcessedBytes = fileBytes.coerceAtMost(origBytes),
+                      ),
+                    )
+                  },
                 )
               }
             }
@@ -807,6 +859,14 @@ class FolderLockerRepository(
           }
           processedBytes += origBytes
           processed++
+          throttle.emit(
+            baseProgress.copy(
+              processedFiles = processed,
+              processedBytes = processedBytes,
+              currentFileProcessedBytes = origBytes,
+            ),
+            force = true,
+          )
         }
         val hasEncrypted = processed > 0 || root.walkTopDown()
           .any { it.isFile && it.name.endsWith(AesFolderCipher.ENCRYPTED_EXTENSION) }
@@ -829,17 +889,21 @@ class FolderLockerRepository(
         for ((doc, parent) in plainDocs) {
           val origName = doc.name ?: "file"
           val origSize = doc.length()
-          onProgress(
-            EncryptionProgress(
-              folderName = folder.name,
-              isLocking = true,
-              currentFileName = origName,
-              processedFiles = processed,
-              totalFiles = plainDocs.size,
-              processedBytes = processedBytes,
-              totalBytes = totalBytes,
-            ),
+          val baseProgress = EncryptionProgress(
+            folderName = folder.name,
+            isLocking = true,
+            currentFileName = origName,
+            processedFiles = processed,
+            totalFiles = plainDocs.size,
+            processedBytes = processedBytes,
+            totalBytes = totalBytes,
+            folderId = folder.id,
+            currentFileId = doc.uri.toString(),
+            currentFileProcessedBytes = 0L,
+            currentFileTotalBytes = origSize,
+            isStealthMasked = folder.isStealthHidden,
           )
+          throttle.emit(baseProgress, force = true)
           val targetName = if (folder.obfuscateFilenames) {
             encryptionManager.generateObfuscatedCipherName()
           } else {
@@ -866,6 +930,13 @@ class FolderLockerRepository(
                     originalSize = origSize,
                     encryptedAt = System.currentTimeMillis(),
                   ),
+                  onProgressBytes = { fileBytes ->
+                    throttle.emit(
+                      baseProgress.copy(
+                        currentFileProcessedBytes = fileBytes.coerceAtMost(origSize),
+                      ),
+                    )
+                  },
                 )
                 encryptedOk = true
               }
@@ -879,6 +950,14 @@ class FolderLockerRepository(
           }
           processedBytes += origSize
           processed++
+          throttle.emit(
+            baseProgress.copy(
+              processedFiles = processed,
+              processedBytes = processedBytes,
+              currentFileProcessedBytes = origSize,
+            ),
+            force = true,
+          )
         }
         val remainingEnc = mutableListOf<Pair<DocumentFile, DocumentFile>>()
         gatherEncryptedSafDocs(tree, remainingEnc)
@@ -916,6 +995,7 @@ class FolderLockerRepository(
       require(fileIds.isNotEmpty()) { "Select at least one encrypted file to decrypt" }
       val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
       val folderKey = resolveFolderKeyWithRecovery(folder, dek)
+      val throttle = ProgressThrottle(onProgress)
       var processed = 0
       var processedBytes = 0L
 
@@ -933,12 +1013,43 @@ class FolderLockerRepository(
 
         for (encFile in encryptedFiles) {
           val parent = encFile.parentFile ?: root
+          val encLen = encFile.length()
+          val headerMeta = encFile.inputStream().use { input ->
+            encryptionManager.readMetadata(input, folderKey)
+          }
+          val fileTotalForBar = headerMeta.originalSize.takeIf { it > 0L } ?: encLen
+          val baseProgress = EncryptionProgress(
+            folderName = folder.name,
+            isLocking = false,
+            currentFileName = headerMeta.originalName,
+            processedFiles = processed,
+            totalFiles = encryptedFiles.size,
+            processedBytes = processedBytes,
+            totalBytes = totalBytes,
+            folderId = folder.id,
+            currentFileId = encFile.absolutePath,
+            currentFileProcessedBytes = 0L,
+            currentFileTotalBytes = fileTotalForBar,
+            isStealthMasked = folder.isStealthHidden,
+          )
+          throttle.emit(baseProgress, force = true)
           val tempPlain = File(parent, ".dec_${UUID.randomUUID()}")
           var meta: EncryptedFileMetadata? = null
           try {
             encFile.inputStream().use { input ->
               tempPlain.outputStream().use { output ->
-                meta = encryptionManager.decryptStream(input, output, folderKey)
+                meta = encryptionManager.decryptStream(
+                  input = input,
+                  output = output,
+                  key = folderKey,
+                  onProgressBytes = { plainBytes ->
+                    throttle.emit(
+                      baseProgress.copy(
+                        currentFileProcessedBytes = plainBytes.coerceAtMost(fileTotalForBar),
+                      ),
+                    )
+                  },
+                )
               }
             }
           } catch (t: Throwable) {
@@ -946,18 +1057,6 @@ class FolderLockerRepository(
             throw t
           }
           val resolvedMeta = meta ?: error("Missing metadata after decryption")
-          onProgress(
-            EncryptionProgress(
-              folderName = folder.name,
-              isLocking = false,
-              currentFileName = resolvedMeta.originalName,
-              processedFiles = processed,
-              totalFiles = encryptedFiles.size,
-              processedBytes = processedBytes,
-              totalBytes = totalBytes,
-            ),
-          )
-          val encLen = encFile.length()
           val restoredFile = uniqueLocalFile(parent, sanitizeFileName(resolvedMeta.originalName))
           if (!tempPlain.renameTo(restoredFile)) {
             tempPlain.copyTo(restoredFile, overwrite = true)
@@ -969,6 +1068,14 @@ class FolderLockerRepository(
           }
           processedBytes += encLen
           processed++
+          throttle.emit(
+            baseProgress.copy(
+              processedFiles = processed,
+              processedBytes = processedBytes,
+              currentFileProcessedBytes = fileTotalForBar,
+            ),
+            force = true,
+          )
         }
         val anyEncryptedRemaining = root.walkTopDown()
           .any { it.isFile && it.name.endsWith(AesFolderCipher.ENCRYPTED_EXTENSION) }
@@ -988,24 +1095,29 @@ class FolderLockerRepository(
             encryptionManager.readMetadata(input, folderKey)
           } ?: error("Cannot read encrypted header")
 
-          onProgress(
-            EncryptionProgress(
-              folderName = folder.name,
-              isLocking = false,
-              currentFileName = meta.originalName,
-              processedFiles = processed,
-              totalFiles = encryptedDocs.size,
-              processedBytes = processedBytes,
-              totalBytes = totalBytes,
-            ),
+          val encLen = encDoc.length()
+          val fileTotalForBar = meta.originalSize.takeIf { it > 0L } ?: encLen
+          val baseProgress = EncryptionProgress(
+            folderName = folder.name,
+            isLocking = false,
+            currentFileName = meta.originalName,
+            processedFiles = processed,
+            totalFiles = encryptedDocs.size,
+            processedBytes = processedBytes,
+            totalBytes = totalBytes,
+            folderId = folder.id,
+            currentFileId = encDoc.uri.toString(),
+            currentFileProcessedBytes = 0L,
+            currentFileTotalBytes = fileTotalForBar,
+            isStealthMasked = folder.isStealthHidden,
           )
+          throttle.emit(baseProgress, force = true)
 
           val safeName = uniqueSafName(parent, sanitizeFileName(meta.originalName))
           val targetDoc = createSafFile(parent, meta.mimeType.ifBlank { "application/octet-stream" }, safeName)
             ?: error("Could not restore decrypted file")
 
           var decryptedOk = false
-          val encLen = encDoc.length()
           try {
             val inStream = context.contentResolver.openInputStream(encDoc.uri)
               ?: error("Cannot read encrypted file ${encDoc.name ?: safeName}")
@@ -1013,7 +1125,18 @@ class FolderLockerRepository(
               val outStream = context.contentResolver.openOutputStream(targetDoc.uri)
                 ?: error("Cannot write decrypted file $safeName")
               outStream.use { output ->
-                encryptionManager.decryptStream(input, output, folderKey)
+                encryptionManager.decryptStream(
+                  input = input,
+                  output = output,
+                  key = folderKey,
+                  onProgressBytes = { plainBytes ->
+                    throttle.emit(
+                      baseProgress.copy(
+                        currentFileProcessedBytes = plainBytes.coerceAtMost(fileTotalForBar),
+                      ),
+                    )
+                  },
+                )
                 decryptedOk = true
               }
             }
@@ -1026,6 +1149,14 @@ class FolderLockerRepository(
           }
           processedBytes += encLen
           processed++
+          throttle.emit(
+            baseProgress.copy(
+              processedFiles = processed,
+              processedBytes = processedBytes,
+              currentFileProcessedBytes = fileTotalForBar,
+            ),
+            force = true,
+          )
         }
         val remainingEncrypted = mutableListOf<Pair<DocumentFile, DocumentFile>>()
         gatherEncryptedSafDocs(tree, remainingEncrypted)
@@ -1055,6 +1186,7 @@ class FolderLockerRepository(
     runCatching {
       val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
       val folderKey = resolveFolderKeyWithRecovery(folder, dek)
+      val throttle = ProgressThrottle(onProgress)
       var processed = 0
       var processedBytes = 0L
 
@@ -1068,12 +1200,43 @@ class FolderLockerRepository(
 
         for (encFile in encryptedFiles) {
           val parent = encFile.parentFile ?: root
+          val encLen = encFile.length()
+          val headerMeta = encFile.inputStream().use { input ->
+            encryptionManager.readMetadata(input, folderKey)
+          }
+          val fileTotalForBar = headerMeta.originalSize.takeIf { it > 0L } ?: encLen
+          val baseProgress = EncryptionProgress(
+            folderName = folder.name,
+            isLocking = false,
+            currentFileName = headerMeta.originalName,
+            processedFiles = processed,
+            totalFiles = encryptedFiles.size,
+            processedBytes = processedBytes,
+            totalBytes = totalBytes,
+            folderId = folder.id,
+            currentFileId = encFile.absolutePath,
+            currentFileProcessedBytes = 0L,
+            currentFileTotalBytes = fileTotalForBar,
+            isStealthMasked = folder.isStealthHidden,
+          )
+          throttle.emit(baseProgress, force = true)
           val tempPlain = File(parent, ".dec_${UUID.randomUUID()}")
           var meta: EncryptedFileMetadata? = null
           try {
             encFile.inputStream().use { input ->
               tempPlain.outputStream().use { output ->
-                meta = encryptionManager.decryptStream(input, output, folderKey)
+                meta = encryptionManager.decryptStream(
+                  input = input,
+                  output = output,
+                  key = folderKey,
+                  onProgressBytes = { plainBytes ->
+                    throttle.emit(
+                      baseProgress.copy(
+                        currentFileProcessedBytes = plainBytes.coerceAtMost(fileTotalForBar),
+                      ),
+                    )
+                  },
+                )
               }
             }
           } catch (t: Throwable) {
@@ -1081,18 +1244,6 @@ class FolderLockerRepository(
             throw t
           }
           val resolvedMeta = meta ?: error("Missing metadata after decryption")
-          onProgress(
-            EncryptionProgress(
-              folderName = folder.name,
-              isLocking = false,
-              currentFileName = resolvedMeta.originalName,
-              processedFiles = processed,
-              totalFiles = encryptedFiles.size,
-              processedBytes = processedBytes,
-              totalBytes = totalBytes,
-            ),
-          )
-          val encLen = encFile.length()
           val restoredFile = uniqueLocalFile(parent, sanitizeFileName(resolvedMeta.originalName))
           if (!tempPlain.renameTo(restoredFile)) {
             tempPlain.copyTo(restoredFile, overwrite = true)
@@ -1104,6 +1255,14 @@ class FolderLockerRepository(
           }
           processedBytes += encLen
           processed++
+          throttle.emit(
+            baseProgress.copy(
+              processedFiles = processed,
+              processedBytes = processedBytes,
+              currentFileProcessedBytes = fileTotalForBar,
+            ),
+            force = true,
+          )
         }
         File(root, NOMEDIA_FILE).takeIf { it.exists() }?.delete()
       } else {
@@ -1118,24 +1277,29 @@ class FolderLockerRepository(
             encryptionManager.readMetadata(input, folderKey)
           } ?: error("Cannot read encrypted header")
 
-          onProgress(
-            EncryptionProgress(
-              folderName = folder.name,
-              isLocking = false,
-              currentFileName = meta.originalName,
-              processedFiles = processed,
-              totalFiles = encryptedDocs.size,
-              processedBytes = processedBytes,
-              totalBytes = totalBytes,
-            ),
+          val encLen = encDoc.length()
+          val fileTotalForBar = meta.originalSize.takeIf { it > 0L } ?: encLen
+          val baseProgress = EncryptionProgress(
+            folderName = folder.name,
+            isLocking = false,
+            currentFileName = meta.originalName,
+            processedFiles = processed,
+            totalFiles = encryptedDocs.size,
+            processedBytes = processedBytes,
+            totalBytes = totalBytes,
+            folderId = folder.id,
+            currentFileId = encDoc.uri.toString(),
+            currentFileProcessedBytes = 0L,
+            currentFileTotalBytes = fileTotalForBar,
+            isStealthMasked = folder.isStealthHidden,
           )
+          throttle.emit(baseProgress, force = true)
 
           val safeName = uniqueSafName(parent, sanitizeFileName(meta.originalName))
           val targetDoc = createSafFile(parent, meta.mimeType.ifBlank { "application/octet-stream" }, safeName)
             ?: error("Could not restore decrypted file")
 
           var decryptedOk = false
-          val encLen = encDoc.length()
           try {
             val inStream = context.contentResolver.openInputStream(encDoc.uri)
               ?: error("Cannot read encrypted file ${encDoc.name ?: safeName}")
@@ -1143,7 +1307,18 @@ class FolderLockerRepository(
               val outStream = context.contentResolver.openOutputStream(targetDoc.uri)
                 ?: error("Cannot write decrypted file $safeName")
               outStream.use { output ->
-                encryptionManager.decryptStream(input, output, folderKey)
+                encryptionManager.decryptStream(
+                  input = input,
+                  output = output,
+                  key = folderKey,
+                  onProgressBytes = { plainBytes ->
+                    throttle.emit(
+                      baseProgress.copy(
+                        currentFileProcessedBytes = plainBytes.coerceAtMost(fileTotalForBar),
+                      ),
+                    )
+                  },
+                )
                 decryptedOk = true
               }
             }
@@ -1156,6 +1331,14 @@ class FolderLockerRepository(
           }
           processedBytes += encLen
           processed++
+          throttle.emit(
+            baseProgress.copy(
+              processedFiles = processed,
+              processedBytes = processedBytes,
+              currentFileProcessedBytes = fileTotalForBar,
+            ),
+            force = true,
+          )
         }
         tree.findFile(NOMEDIA_FILE)?.let { deleteSafDocStrict(it) }
       }
@@ -1186,6 +1369,7 @@ class FolderLockerRepository(
       val tree = resolveTreeDocumentFile(treeUri)
         ?: error("Unable to open selected device folder")
       val displayName = existing?.name ?: tree.name?.takeIf { it.isNotBlank() } ?: "Device Folder"
+      val throttle = ProgressThrottle(onProgress)
 
       val encryptedDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
       val plainDocs = mutableListOf<Pair<DocumentFile, DocumentFile>>()
@@ -1201,23 +1385,28 @@ class FolderLockerRepository(
           encryptionManager.readMetadata(input, folderKey)
         } ?: error("Cannot read encrypted header in \"${encDoc.name ?: "file"}\" (wrong key or tampered file)")
 
-        onProgress(
-          EncryptionProgress(
-            folderName = displayName,
-            isLocking = false,
-            currentFileName = meta.originalName,
-            processedFiles = processed,
-            totalFiles = encryptedDocs.size,
-            processedBytes = processedBytes,
-            totalBytes = totalBytes,
-          ),
+        val encLen = encDoc.length()
+        val fileTotalForBar = meta.originalSize.takeIf { it > 0L } ?: encLen
+        val baseProgress = EncryptionProgress(
+          folderName = displayName,
+          isLocking = false,
+          currentFileName = meta.originalName,
+          processedFiles = processed,
+          totalFiles = encryptedDocs.size,
+          processedBytes = processedBytes,
+          totalBytes = totalBytes,
+          folderId = existing?.id ?: "",
+          currentFileId = encDoc.uri.toString(),
+          currentFileProcessedBytes = 0L,
+          currentFileTotalBytes = fileTotalForBar,
+          isStealthMasked = existing?.isStealthHidden == true,
         )
+        throttle.emit(baseProgress, force = true)
 
         val safeName = uniqueSafName(parent, sanitizeFileName(meta.originalName))
         val targetDoc = createSafFile(parent, meta.mimeType.ifBlank { "application/octet-stream" }, safeName)
           ?: error("Could not write decrypted file $safeName")
 
-        val encLen = encDoc.length()
         var decryptedOk = false
         try {
           val inStream = context.contentResolver.openInputStream(encDoc.uri)
@@ -1225,8 +1414,19 @@ class FolderLockerRepository(
           inStream.use { input ->
             val outStream = context.contentResolver.openOutputStream(targetDoc.uri)
               ?: error("Cannot write decrypted file $safeName")
-              outStream.use { output ->
-              encryptionManager.decryptStream(input, output, folderKey)
+            outStream.use { output ->
+              encryptionManager.decryptStream(
+                input = input,
+                output = output,
+                key = folderKey,
+                onProgressBytes = { plainBytes ->
+                  throttle.emit(
+                    baseProgress.copy(
+                      currentFileProcessedBytes = plainBytes.coerceAtMost(fileTotalForBar),
+                    ),
+                  )
+                },
+              )
               decryptedOk = true
             }
           }
@@ -1239,6 +1439,14 @@ class FolderLockerRepository(
         }
         processedBytes += encLen
         processed++
+        throttle.emit(
+          baseProgress.copy(
+            processedFiles = processed,
+            processedBytes = processedBytes,
+            currentFileProcessedBytes = fileTotalForBar,
+          ),
+          force = true,
+        )
       }
 
       if (processed > 0) {
@@ -1292,6 +1500,8 @@ class FolderLockerRepository(
           totalFiles = folder.fileCount.coerceAtLeast(1),
           processedBytes = 0L,
           totalBytes = folder.totalBytes,
+          folderId = folder.id,
+          isStealthMasked = folder.isStealthHidden,
         ),
       )
       lockFolder(folder.id, dek) { progress ->
@@ -1349,6 +1559,8 @@ class FolderLockerRepository(
           totalFiles = folder.encryptedFileCount.coerceAtLeast(1),
           processedBytes = 0L,
           totalBytes = folder.totalBytes,
+          folderId = folder.id,
+          isStealthMasked = folder.isStealthHidden,
         ),
       )
       unlockFolder(folder.id, dek) { progress ->
@@ -1429,12 +1641,14 @@ class FolderLockerRepository(
             val parent = encFile.parentFile ?: root
             val tempPlain = File(context.cacheDir, ".reenc_plain_${UUID.randomUUID()}")
             val stagedCipher = File(parent, ".reenc_cipher_${UUID.randomUUID()}")
+            val encLen = encFile.length()
             try {
               val recoveredMeta = encFile.inputStream().use { input ->
                 tempPlain.outputStream().use { plainOut ->
                   encryptionManager.decryptStream(input, plainOut, oldFolderKey)
                 }
               }
+              val fileSize = recoveredMeta.originalSize.takeIf { it > 0L } ?: encLen
               onProgress(
                 EncryptionProgress(
                   folderName = folder.name,
@@ -1444,6 +1658,11 @@ class FolderLockerRepository(
                   totalFiles = totalFiles,
                   processedBytes = processedBytes,
                   totalBytes = totalBytes,
+                  folderId = folder.id,
+                  currentFileId = encFile.absolutePath,
+                  currentFileProcessedBytes = 0L,
+                  currentFileTotalBytes = fileSize,
+                  isStealthMasked = folder.isStealthHidden,
                 ),
               )
               tempPlain.inputStream().use { plainIn ->
@@ -1457,7 +1676,7 @@ class FolderLockerRepository(
                 }
               }
               stagedEncryptedSwaps.add(encFile to stagedCipher)
-              processedBytes += encFile.length()
+              processedBytes += encLen
               processed++
             } finally {
               if (tempPlain.exists()) {
@@ -1469,6 +1688,7 @@ class FolderLockerRepository(
           for (plainFile in targetPlainFiles) {
             val parent = plainFile.parentFile ?: root
             val stagedCipher = File(parent, ".reenc_cipher_${UUID.randomUUID()}")
+            val plainLen = plainFile.length()
             onProgress(
               EncryptionProgress(
                 folderName = folder.name,
@@ -1478,6 +1698,11 @@ class FolderLockerRepository(
                 totalFiles = totalFiles,
                 processedBytes = processedBytes,
                 totalBytes = totalBytes,
+                folderId = folder.id,
+                currentFileId = plainFile.absolutePath,
+                currentFileProcessedBytes = 0L,
+                currentFileTotalBytes = plainLen,
+                isStealthMasked = folder.isStealthHidden,
               ),
             )
             val targetName = if (folder.obfuscateFilenames) {
@@ -1494,14 +1719,14 @@ class FolderLockerRepository(
                   metadata = EncryptedFileMetadata(
                     originalName = plainFile.name,
                     mimeType = guessMimeType(plainFile.name),
-                    originalSize = plainFile.length(),
+                    originalSize = plainLen,
                     encryptedAt = System.currentTimeMillis(),
                   ),
                 )
               }
             }
             stagedPlainAdditions.add(Triple(plainFile, stagedCipher, targetName))
-            processedBytes += plainFile.length()
+            processedBytes += plainLen
             processed++
           }
         } catch (t: Throwable) {
@@ -1563,6 +1788,7 @@ class FolderLockerRepository(
             val stagedName = ".reenc_tmp_${UUID.randomUUID()}"
             val stagedDoc = parent.createFile("application/octet-stream", stagedName)
               ?: error("Could not stage re-encrypted SAF file")
+            val encLen = encDoc.length()
             try {
               val recoveredMeta = context.contentResolver.openInputStream(encDoc.uri)?.use { input ->
                 tempPlain.outputStream().use { plainOut ->
@@ -1570,6 +1796,7 @@ class FolderLockerRepository(
                 }
               } ?: error("Cannot read encrypted SAF file")
 
+              val fileSize = recoveredMeta.originalSize.takeIf { it > 0L } ?: encLen
               onProgress(
                 EncryptionProgress(
                   folderName = folder.name,
@@ -1579,6 +1806,11 @@ class FolderLockerRepository(
                   totalFiles = totalFiles,
                   processedBytes = processedBytes,
                   totalBytes = totalBytes,
+                  folderId = folder.id,
+                  currentFileId = encDoc.uri.toString(),
+                  currentFileProcessedBytes = 0L,
+                  currentFileTotalBytes = fileSize,
+                  isStealthMasked = folder.isStealthHidden,
                 ),
               )
 
@@ -1595,7 +1827,7 @@ class FolderLockerRepository(
 
               val desiredFinalName = encDoc.name ?: encryptionManager.generateObfuscatedCipherName()
               stagedSwaps.add(StagedSafSwap(encDoc, stagedDoc, desiredFinalName))
-              processedBytes += encDoc.length()
+              processedBytes += encLen
               processed++
             } catch (t: Throwable) {
               stagedDoc.delete()
@@ -1621,6 +1853,11 @@ class FolderLockerRepository(
                 totalFiles = totalFiles,
                 processedBytes = processedBytes,
                 totalBytes = totalBytes,
+                folderId = folder.id,
+                currentFileId = plainDoc.uri.toString(),
+                currentFileProcessedBytes = 0L,
+                currentFileTotalBytes = origSize,
+                isStealthMasked = folder.isStealthHidden,
               ),
             )
             try {
@@ -1730,6 +1967,8 @@ class FolderLockerRepository(
           totalFiles = folder.fileCount.coerceAtLeast(1),
           processedBytes = 0L,
           totalBytes = folder.totalBytes,
+          folderId = folder.id,
+          isStealthMasked = folder.isStealthHidden,
         ),
       )
       rotateFolderKey(folder.id, masterDek, encryptUnlockedFolders) { progress ->
@@ -1835,6 +2074,11 @@ class FolderLockerRepository(
               totalFiles = targets.size,
               processedBytes = processedBytes,
               totalBytes = totalBytes,
+              folderId = folder.id,
+              currentFileId = item.id,
+              currentFileProcessedBytes = 0L,
+              currentFileTotalBytes = item.sizeBytes,
+              isStealthMasked = folder.isStealthHidden,
             ),
           )
 
@@ -1952,6 +2196,11 @@ class FolderLockerRepository(
               totalFiles = targets.size,
               processedBytes = processedBytes,
               totalBytes = totalBytes,
+              folderId = folder.id,
+              currentFileId = item.id,
+              currentFileProcessedBytes = 0L,
+              currentFileTotalBytes = item.sizeBytes,
+              isStealthMasked = folder.isStealthHidden,
             ),
           )
 
@@ -2298,12 +2547,13 @@ class FolderLockerRepository(
     folderId: String,
     dek: SecretKey?,
     decryptLockedSafFirst: Boolean = true,
+    onProgress: (EncryptionProgress) -> Unit = {},
   ) {
     val folder = vaultDao.getFolderById(folderId) ?: return
     if (folder.isInternalVault) {
       internalFolderDir(folder.id).deleteRecursively()
     } else if (decryptLockedSafFirst && (folder.isLocked || folder.encryptedFileCount > 0) && dek != null) {
-      unlockFolder(folderId, dek).getOrThrow()
+      unlockFolder(folderId, dek, onProgress = onProgress).getOrThrow()
     }
     vaultDao.deleteFolderById(folderId)
     val note = when {
@@ -2347,6 +2597,8 @@ class FolderLockerRepository(
           totalFiles = targets.size,
           processedBytes = totalBytes,
           totalBytes = targets.sumOf { it.totalBytes },
+          folderId = folder.id,
+          isStealthMasked = folder.isStealthHidden,
         ),
       )
       runCatching {
@@ -2354,6 +2606,7 @@ class FolderLockerRepository(
           folderId = folder.id,
           dek = dek,
           decryptLockedSafFirst = decryptLockedSafFirst,
+          onProgress = onProgress,
         )
       }.onSuccess {
         succeeded++

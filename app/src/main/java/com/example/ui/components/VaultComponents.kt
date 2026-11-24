@@ -3,6 +3,7 @@ package com.example.ui.components
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -24,14 +25,17 @@ import androidx.compose.material.icons.rounded.BrightnessAuto
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CloudUpload
 import androidx.compose.material.icons.rounded.DarkMode
+import androidx.compose.material.icons.rounded.EnhancedEncryption
 import androidx.compose.material.icons.rounded.Fingerprint
 import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LinearProgressIndicator
@@ -47,13 +51,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.example.data.backup.CloudBackupProgress
 import com.example.data.storage.EncryptionProgress
+import com.example.ui.theme.BeastLockTheme
 import com.example.ui.theme.ThemeMode
+import com.example.ui.theme.VaultProgressTone
+import com.example.ui.theme.VaultThemeEngine
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -61,22 +70,38 @@ import java.util.Locale
 @Composable
 fun VaultStatusBadge(
   isLocked: Boolean,
+  isPartiallyEncrypted: Boolean = false,
   modifier: Modifier = Modifier,
 ) {
-  val containerColor = if (isLocked) {
-    MaterialTheme.colorScheme.secondaryContainer
-  } else {
-    MaterialTheme.colorScheme.primaryContainer
-  }
-  val contentColor = if (isLocked) {
-    MaterialTheme.colorScheme.onSecondaryContainer
-  } else {
-    MaterialTheme.colorScheme.onPrimaryContainer
+  val colors = BeastLockTheme.colors
+  val (containerColor, contentColor, accentColor, icon, label) = when {
+    isPartiallyEncrypted -> Quintuple(
+      colors.partialContainer,
+      colors.onPartialContainer,
+      colors.partialAccent,
+      Icons.Rounded.EnhancedEncryption,
+      "PARTIAL",
+    )
+    isLocked -> Quintuple(
+      colors.lockedContainer,
+      colors.onLockedContainer,
+      colors.lockedAccent,
+      Icons.Rounded.Lock,
+      "LOCKED",
+    )
+    else -> Quintuple(
+      colors.unlockedContainer,
+      colors.onUnlockedContainer,
+      colors.unlockedAccent,
+      Icons.Rounded.LockOpen,
+      "UNLOCKED",
+    )
   }
   Surface(
     color = containerColor,
     contentColor = contentColor,
     shape = RoundedCornerShape(50),
+    border = BorderStroke(1.dp, accentColor.copy(alpha = 0.35f)),
     modifier = modifier,
   ) {
     Row(
@@ -84,18 +109,76 @@ fun VaultStatusBadge(
       modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
     ) {
       Icon(
-        imageVector = if (isLocked) Icons.Rounded.Lock else Icons.Rounded.LockOpen,
+        imageVector = icon,
         contentDescription = null,
         modifier = Modifier.size(13.dp),
       )
       Spacer(modifier = Modifier.width(5.dp))
       Text(
-        text = if (isLocked) "LOCKED" else "UNLOCKED",
+        text = label,
         style = MaterialTheme.typography.labelSmall,
         fontWeight = FontWeight.Bold,
+        maxLines = 1,
       )
     }
   }
+}
+
+private data class Quintuple<A, B, C, D, E>(
+  val first: A,
+  val second: B,
+  val third: C,
+  val fourth: D,
+  val fifth: E,
+)
+
+@Composable
+fun VaultLinearProgressBar(
+  progress: Float?,
+  tone: VaultProgressTone = VaultProgressTone.NEUTRAL,
+  height: Dp = 5.dp,
+  modifier: Modifier = Modifier,
+) {
+  val palette = VaultThemeEngine.progressPaletteFor(BeastLockTheme.colors, tone)
+  val barModifier = modifier
+    .fillMaxWidth()
+    .height(height)
+    .clip(RoundedCornerShape(50))
+
+  if (progress == null) {
+    LinearProgressIndicator(
+      color = palette.indicatorColor,
+      trackColor = palette.trackColor,
+      strokeCap = StrokeCap.Round,
+      modifier = barModifier,
+    )
+  } else {
+    val clamped = progress.coerceIn(0f, 1f)
+    LinearProgressIndicator(
+      progress = { clamped },
+      color = palette.indicatorColor,
+      trackColor = palette.trackColor,
+      strokeCap = StrokeCap.Round,
+      drawStopIndicator = {},
+      modifier = barModifier,
+    )
+  }
+}
+
+@Composable
+fun VaultCircularProgressIndicator(
+  modifier: Modifier = Modifier,
+  tone: VaultProgressTone = VaultProgressTone.NEUTRAL,
+  strokeWidth: Dp = 3.dp,
+) {
+  val palette = VaultThemeEngine.progressPaletteFor(BeastLockTheme.colors, tone)
+  CircularProgressIndicator(
+    color = palette.indicatorColor,
+    trackColor = palette.trackColor,
+    strokeWidth = strokeWidth,
+    strokeCap = StrokeCap.Round,
+    modifier = modifier,
+  )
 }
 
 @Composable
@@ -256,13 +339,19 @@ private fun KeypadDigitButton(
 
 @Composable
 fun EncryptionProgressDialog(progress: EncryptionProgress) {
+  val tone = if (progress.isLocking) VaultProgressTone.ENCRYPT else VaultProgressTone.DECRYPT
+  val accentColor = if (progress.isLocking) {
+    BeastLockTheme.colors.lockedAccent
+  } else {
+    BeastLockTheme.colors.partialAccent
+  }
   AlertDialog(
     onDismissRequest = {},
     icon = {
       Icon(
         imageVector = if (progress.isLocking) Icons.Rounded.Lock else Icons.Rounded.LockOpen,
         contentDescription = null,
-        tint = MaterialTheme.colorScheme.primary,
+        tint = accentColor,
       )
     },
     title = {
@@ -290,12 +379,10 @@ fun EncryptionProgressDialog(progress: EncryptionProgress) {
         val fraction = if (progress.totalFiles > 0) {
           (progress.processedFiles.toFloat() / progress.totalFiles.toFloat()).coerceIn(0f, 1f)
         } else 0f
-        LinearProgressIndicator(
-          progress = { fraction },
-          modifier = Modifier
-            .fillMaxWidth()
-            .height(8.dp)
-            .clip(RoundedCornerShape(4.dp)),
+        VaultLinearProgressBar(
+          progress = fraction,
+          tone = tone,
+          height = 8.dp,
         )
         Text(
           text = "${progress.processedFiles} / ${progress.totalFiles} files • ${formatByteSize(progress.processedBytes)}",
@@ -309,6 +396,129 @@ fun EncryptionProgressDialog(progress: EncryptionProgress) {
 }
 
 @Composable
+fun EncryptionProgressStrip(
+  progress: EncryptionProgress,
+  deferredAutoLockPending: Boolean = false,
+  modifier: Modifier = Modifier,
+) {
+  val totalFiles = progress.totalFiles.coerceAtLeast(1)
+  val activeIndex = (progress.processedFiles + 1).coerceIn(1, totalFiles)
+  val overallFraction = progress.overallFraction.coerceIn(0f, 1f)
+  val percent = (overallFraction * 100f).toInt().coerceIn(0, 100)
+  val isIndeterminate = progress.totalFiles <= 0 && progress.totalBytes <= 0L
+  val currentBytes = (progress.processedBytes + progress.currentFileProcessedBytes)
+    .let { processed ->
+      if (progress.totalBytes > 0L) processed.coerceAtMost(progress.totalBytes) else processed
+    }
+    .coerceAtLeast(0L)
+
+  val title = if (progress.isStealthMasked) {
+    if (progress.isLocking) "Encrypting Private Vault" else "Decrypting Private Vault"
+  } else {
+    val actionWord = if (progress.isLocking) "Encrypting" else "Decrypting"
+    "$actionWord • ${progress.folderName}"
+  }
+
+  val subtitle = if (progress.isStealthMasked) {
+    if (isIndeterminate) {
+      "AES-256-GCM • Preparing Private Vault…"
+    } else {
+      "Protected file $activeIndex/$totalFiles • ${formatByteSize(currentBytes)}"
+    }
+  } else {
+    if (isIndeterminate) {
+      "AES-256-GCM • ${progress.currentFileName}"
+    } else {
+      "${progress.currentFileName} • ${progress.processedFiles}/$totalFiles • ${formatByteSize(currentBytes)}"
+    }
+  }
+
+  val colors = BeastLockTheme.colors
+  val tone = if (progress.isLocking) VaultProgressTone.ENCRYPT else VaultProgressTone.DECRYPT
+  val accentColor = if (progress.isLocking) colors.progressEncrypt else colors.progressDecrypt
+
+  Surface(
+    color = colors.progressSurface,
+    contentColor = colors.onProgressSurface,
+    tonalElevation = 4.dp,
+    shadowElevation = 2.dp,
+    modifier = modifier
+      .fillMaxWidth()
+      .testTag("encryption_progress_strip"),
+  ) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+      Column(
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(horizontal = 16.dp, vertical = 10.dp),
+      ) {
+        Row(
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.SpaceBetween,
+          modifier = Modifier.fillMaxWidth(),
+        ) {
+          Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.weight(1f),
+          ) {
+            Icon(
+              imageVector = if (progress.isLocking) Icons.Rounded.Lock else Icons.Rounded.LockOpen,
+              contentDescription = null,
+              tint = accentColor,
+              modifier = Modifier.size(18.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+              text = title,
+              style = MaterialTheme.typography.labelLarge,
+              fontWeight = FontWeight.SemiBold,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis,
+            )
+          }
+          Spacer(modifier = Modifier.width(8.dp))
+          Text(
+            text = if (isIndeterminate) "Working" else "$percent%",
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Bold,
+            color = accentColor,
+          )
+        }
+
+        Text(
+          text = subtitle,
+          style = MaterialTheme.typography.labelSmall,
+          color = colors.onProgressSurface.copy(alpha = 0.78f),
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+        )
+
+        VaultLinearProgressBar(
+          progress = if (isIndeterminate) null else overallFraction,
+          tone = tone,
+          height = 6.dp,
+          modifier = Modifier.testTag("encryption_progress_strip_bar"),
+        )
+
+        if (deferredAutoLockPending) {
+          Text(
+            text = "Auto-lock queued — vault will seal automatically once file encryption finishes",
+            style = MaterialTheme.typography.labelSmall,
+            color = colors.warningAccent,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.testTag("encryption_progress_deferred_autolock"),
+          )
+        }
+      }
+      HorizontalDivider(color = colors.progressSurfaceBorder)
+    }
+  }
+}
+
+@Composable
 fun CloudBackupProgressDialog(progress: CloudBackupProgress) {
   AlertDialog(
     onDismissRequest = {},
@@ -316,7 +526,7 @@ fun CloudBackupProgressDialog(progress: CloudBackupProgress) {
       Icon(
         imageVector = Icons.Rounded.CloudUpload,
         contentDescription = null,
-        tint = MaterialTheme.colorScheme.primary,
+        tint = BeastLockTheme.colors.infoAccent,
       )
     },
     title = {
@@ -337,12 +547,10 @@ fun CloudBackupProgressDialog(progress: CloudBackupProgress) {
         val fraction = if (progress.totalFiles > 0) {
           (progress.processedFiles.toFloat() / progress.totalFiles.toFloat()).coerceIn(0f, 1f)
         } else 0f
-        LinearProgressIndicator(
-          progress = { fraction },
-          modifier = Modifier
-            .fillMaxWidth()
-            .height(8.dp)
-            .clip(RoundedCornerShape(4.dp)),
+        VaultLinearProgressBar(
+          progress = fraction,
+          tone = VaultProgressTone.NEUTRAL,
+          height = 8.dp,
         )
         Text(
           text = "${progress.processedFiles} / ${progress.totalFiles} files processed",

@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -33,6 +34,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -56,7 +58,6 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
@@ -69,6 +70,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -87,16 +89,20 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.local.VaultFolderEntity
+import com.example.data.storage.EncryptionProgress
 import com.example.data.storage.SecurePreviewContent
 import com.example.data.storage.VaultFileItem
 import com.example.ui.components.BatchFileRenameDialog
 import com.example.ui.components.ConfirmRemoveFilesDialog
 import com.example.ui.components.ConfirmRemoveFoldersDialog
+import com.example.ui.components.VaultCircularProgressIndicator
+import com.example.ui.components.VaultLinearProgressBar
 import com.example.ui.components.VaultStatusBadge
 import com.example.ui.components.formatByteSize
 import com.example.ui.components.formatTimestamp
-import com.example.ui.theme.AmberVault
-import com.example.ui.theme.AmberVaultContainer
+import com.example.ui.isPartiallyEncrypted
+import com.example.ui.theme.BeastLockTheme
+import com.example.ui.theme.VaultProgressTone
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -106,6 +112,9 @@ fun FolderDetailScreen(
   isLoadingFiles: Boolean,
   securePreview: SecurePreviewContent?,
   isPreviewLoading: Boolean,
+  encryptionProgress: EncryptionProgress? = null,
+  isFolderBusy: Boolean = false,
+  hasTopProgressStrip: Boolean = false,
   onBack: () -> Unit,
   onRefresh: () -> Unit,
   onImportDocuments: (List<Uri>) -> Unit,
@@ -167,6 +176,7 @@ fun FolderDetailScreen(
   Scaffold(
     topBar = {
       TopAppBar(
+        windowInsets = if (hasTopProgressStrip) WindowInsets(0, 0, 0, 0) else TopAppBarDefaults.windowInsets,
         title = {
           Column {
             Text(
@@ -192,11 +202,16 @@ fun FolderDetailScreen(
           }
         },
         actions = {
-          IconButton(onClick = onRefresh, modifier = Modifier.testTag("folder_detail_refresh")) {
+          IconButton(
+            onClick = onRefresh,
+            enabled = !isFolderBusy,
+            modifier = Modifier.testTag("folder_detail_refresh"),
+          ) {
             Icon(Icons.Rounded.Refresh, contentDescription = "Refresh files")
           }
           IconButton(
             onClick = { showDeleteConfirm = true },
+            enabled = !isFolderBusy,
             modifier = Modifier.testTag("folder_detail_remove"),
           ) {
             Icon(Icons.Rounded.DeleteOutline, contentDescription = "Remove folder")
@@ -244,11 +259,12 @@ fun FolderDetailScreen(
       ) {
         if (folder.isStealthHidden) {
           item(key = "stealth_protection_banner") {
+            val stealthColors = BeastLockTheme.colors
             Surface(
-              color = AmberVaultContainer.copy(alpha = 0.78f),
-              contentColor = AmberVault,
+              color = stealthColors.warningContainer,
+              contentColor = stealthColors.onWarningContainer,
               shape = MaterialTheme.shapes.medium,
-              border = BorderStroke(1.dp, AmberVault.copy(alpha = 0.45f)),
+              border = BorderStroke(1.dp, stealthColors.warningAccent.copy(alpha = 0.45f)),
               modifier = Modifier
                 .fillMaxWidth()
                 .testTag("folder_stealth_protection_banner"),
@@ -294,12 +310,48 @@ fun FolderDetailScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 modifier = Modifier.fillMaxWidth(),
               ) {
-                VaultStatusBadge(isLocked = folder.isLocked)
+                VaultStatusBadge(
+                  isLocked = folder.isLocked,
+                  isPartiallyEncrypted = folder.isPartiallyEncrypted(),
+                )
                 Text(
                   text = "${folder.encryptedFileCount}/${folder.fileCount} encrypted",
                   style = MaterialTheme.typography.labelMedium,
                   color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+              }
+
+              val folderProgress = encryptionProgress?.takeIf { it.folderId == folder.id }
+              if (isFolderBusy) {
+                val vaultColors = BeastLockTheme.colors
+                val fraction = folderProgress?.overallFraction?.coerceIn(0f, 1f) ?: 0f
+                val isIndeterminate = folderProgress == null ||
+                  (folderProgress.totalFiles <= 0 && folderProgress.totalBytes <= 0L)
+                val percent = (fraction * 100f).toInt().coerceIn(0, 100)
+                val isLockingOp = folderProgress?.isLocking != false
+                val tone = if (isLockingOp) VaultProgressTone.ENCRYPT else VaultProgressTone.DECRYPT
+                val tint = if (isLockingOp) vaultColors.progressEncrypt else vaultColors.progressDecrypt
+                Column(
+                  verticalArrangement = Arrangement.spacedBy(4.dp),
+                  modifier = Modifier.fillMaxWidth(),
+                ) {
+                  Text(
+                    text = when {
+                      folderProgress == null -> "Crypto job in progress — controls locked to protect files"
+                      folderProgress.isLocking -> "Encrypting ${folderProgress.processedFiles}/${folderProgress.totalFiles} • $percent%"
+                      else -> "Decrypting ${folderProgress.processedFiles}/${folderProgress.totalFiles} • $percent%"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = tint,
+                  )
+                  VaultLinearProgressBar(
+                    progress = if (isIndeterminate) null else fraction,
+                    tone = tone,
+                    height = 5.dp,
+                    modifier = Modifier.testTag("detail_folder_inline_progress"),
+                  )
+                }
               }
 
               Row(
@@ -310,6 +362,7 @@ fun FolderDetailScreen(
                   files.any { !it.isEncrypted }
                 Button(
                   onClick = if (folder.isLocked) onUnlockFolder else onLockFolder,
+                  enabled = !isFolderBusy,
                   modifier = Modifier
                     .weight(1f)
                     .testTag("detail_lock_unlock_button"),
@@ -337,6 +390,7 @@ fun FolderDetailScreen(
                 if (hasRemainingPlaintext) {
                   FilledTonalButton(
                     onClick = onSelectiveLockFolder,
+                    enabled = !isFolderBusy,
                     modifier = Modifier
                       .weight(1f)
                       .testTag(
@@ -367,6 +421,7 @@ fun FolderDetailScreen(
                     onPickerLaunching(true)
                     docImportLauncher.launch(arrayOf("*/*"))
                   },
+                  enabled = !isFolderBusy,
                   modifier = Modifier
                     .weight(1f)
                     .testTag("import_files_button"),
@@ -382,6 +437,7 @@ fun FolderDetailScreen(
                       PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
                     )
                   },
+                  enabled = !isFolderBusy,
                   modifier = Modifier
                     .weight(1f)
                     .testTag("import_photos_button"),
@@ -416,7 +472,7 @@ fun FolderDetailScreen(
                 }
                 Switch(
                   checked = if (folder.isStealthHidden) true else folder.requireBiometricPerUnlock,
-                  enabled = !folder.isStealthHidden,
+                  enabled = !folder.isStealthHidden && !isFolderBusy,
                   onCheckedChange = { onUpdateOptions(it, folder.obfuscateFilenames) },
                   modifier = Modifier.testTag("folder_require_bio_switch"),
                 )
@@ -440,7 +496,7 @@ fun FolderDetailScreen(
                 }
                 Switch(
                   checked = if (folder.isStealthHidden) true else folder.obfuscateFilenames,
-                  enabled = !folder.isStealthHidden,
+                  enabled = !folder.isStealthHidden && !isFolderBusy,
                   onCheckedChange = { onUpdateOptions(folder.requireBiometricPerUnlock, it) },
                   modifier = Modifier.testTag("folder_obfuscate_switch"),
                 )
@@ -460,6 +516,7 @@ fun FolderDetailScreen(
                 }
                 Switch(
                   checked = folder.autoCloudBackupSync,
+                  enabled = !isFolderBusy,
                   onCheckedChange = onToggleAutoCloudSync,
                   modifier = Modifier.testTag("folder_detail_auto_cloud_sync_switch"),
                 )
@@ -523,6 +580,7 @@ fun FolderDetailScreen(
             if (files.isNotEmpty() && !isFileSelectionMode) {
               OutlinedButton(
                 onClick = { isFileSelectionMode = true },
+                enabled = !isFolderBusy,
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                 modifier = Modifier.testTag("folder_files_select_button"),
               ) {
@@ -596,7 +654,7 @@ fun FolderDetailScreen(
                 .fillMaxWidth()
                 .padding(32.dp),
             ) {
-              CircularProgressIndicator()
+              VaultCircularProgressIndicator()
             }
           }
         } else if (files.isEmpty()) {
@@ -624,6 +682,11 @@ fun FolderDetailScreen(
         } else {
           items(files, key = { it.id }) { file ->
             val isSelected = file.id in selectedFileIds
+            val isFileActive = encryptionProgress != null &&
+              encryptionProgress.folderId == folder.id &&
+              ((encryptionProgress.currentFileId.isNotEmpty() && encryptionProgress.currentFileId == file.id) ||
+                encryptionProgress.currentFileName == file.displayName)
+            val fileControlsLocked = isFolderBusy || isFileActive
             val toggleFileSelect = {
               isFileSelectionMode = true
               selectedFileIds = if (isSelected) {
@@ -634,17 +697,22 @@ fun FolderDetailScreen(
             }
             Card(
               colors = CardDefaults.cardColors(
-                containerColor = if (isSelected) {
-                  MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.42f)
-                } else {
-                  MaterialTheme.colorScheme.surfaceContainer
+                containerColor = when {
+                  isSelected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.42f)
+                  isFileActive -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
+                  else -> MaterialTheme.colorScheme.surfaceContainer
                 },
               ),
-              border = if (isSelected) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
+              border = when {
+                isSelected -> BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
+                isFileActive -> BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary)
+                else -> null
+              },
               modifier = Modifier
                 .fillMaxWidth()
                 .clip(MaterialTheme.shapes.medium)
                 .combinedClickable(
+                  enabled = !fileControlsLocked,
                   onClick = {
                     if (isFileSelectionMode) {
                       toggleFileSelect()
@@ -666,11 +734,17 @@ fun FolderDetailScreen(
                   .fillMaxWidth()
                   .padding(14.dp),
               ) {
+                val fileVaultColors = BeastLockTheme.colors
                 Surface(
                   color = if (file.isEncrypted) {
-                    MaterialTheme.colorScheme.secondaryContainer
+                    fileVaultColors.lockedContainer
                   } else {
                     MaterialTheme.colorScheme.surfaceContainerHigh
+                  },
+                  contentColor = if (file.isEncrypted) {
+                    fileVaultColors.onLockedContainer
+                  } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
                   },
                   shape = MaterialTheme.shapes.small,
                   modifier = Modifier.size(42.dp),
@@ -679,11 +753,6 @@ fun FolderDetailScreen(
                     Icon(
                       imageVector = if (file.isEncrypted) Icons.Rounded.EnhancedEncryption else Icons.Rounded.Description,
                       contentDescription = null,
-                      tint = if (file.isEncrypted) {
-                        MaterialTheme.colorScheme.onSecondaryContainer
-                      } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                      },
                     )
                   }
                 }
@@ -708,15 +777,55 @@ fun FolderDetailScreen(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                   )
+                  if (isFileActive && encryptionProgress != null) {
+                    val activeColors = BeastLockTheme.colors
+                    val fileFraction = encryptionProgress.currentFileFraction.coerceIn(0f, 1f)
+                    val filePercent = (fileFraction * 100f).toInt().coerceIn(0, 100)
+                    val isIndeterminate = encryptionProgress.currentFileTotalBytes <= 0L
+                    val fileTone = if (encryptionProgress.isLocking) VaultProgressTone.ENCRYPT else VaultProgressTone.DECRYPT
+                    val fileTint = if (encryptionProgress.isLocking) activeColors.progressEncrypt else activeColors.progressDecrypt
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                      verticalAlignment = Alignment.CenterVertically,
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      modifier = Modifier.fillMaxWidth(),
+                    ) {
+                      Text(
+                        text = if (encryptionProgress.isLocking) {
+                          "Encrypting"
+                        } else {
+                          "Decrypting"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = fileTint,
+                      )
+                      Text(
+                        text = if (isIndeterminate) "Working…" else "$filePercent%",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = fileTint,
+                      )
+                    }
+                    Spacer(modifier = Modifier.height(3.dp))
+                    VaultLinearProgressBar(
+                      progress = if (isIndeterminate) null else fileFraction,
+                      tone = fileTone,
+                      height = 4.dp,
+                      modifier = Modifier.testTag("file_inline_progress_${file.displayName}"),
+                    )
+                  }
                 }
                 if (isFileSelectionMode) {
                   Checkbox(
                     checked = isSelected,
+                    enabled = !fileControlsLocked,
                     onCheckedChange = { toggleFileSelect() },
                     modifier = Modifier.testTag("file_checkbox_${file.displayName}"),
                   )
                 } else {
                   IconButton(
+                    enabled = !fileControlsLocked,
                     onClick = {
                       if (file.isEncrypted) {
                         onDecryptFiles(setOf(file.id))
@@ -746,13 +855,17 @@ fun FolderDetailScreen(
                       },
                     )
                   }
-                  IconButton(onClick = { onPeekFile(file) }) {
+                  IconButton(
+                    enabled = !fileControlsLocked,
+                    onClick = { onPeekFile(file) },
+                  ) {
                     Icon(
                       imageVector = Icons.Rounded.Visibility,
                       contentDescription = "Secure preview",
                     )
                   }
                   IconButton(
+                    enabled = !fileControlsLocked,
                     onClick = { pendingRemoveFiles = listOf(file) },
                     modifier = Modifier.testTag("file_remove_${file.displayName}"),
                   ) {
@@ -807,6 +920,7 @@ fun FolderDetailScreen(
               ) {
                 if (selectedEncryptedIds.isNotEmpty()) {
                   Button(
+                    enabled = !isFolderBusy,
                     onClick = {
                       val targetIds = selectedEncryptedIds
                       isFileSelectionMode = false
@@ -824,6 +938,7 @@ fun FolderDetailScreen(
                 }
                 if (selectedPlainIds.isNotEmpty()) {
                   FilledTonalButton(
+                    enabled = !isFolderBusy,
                     onClick = {
                       val targetIds = selectedPlainIds
                       isFileSelectionMode = false
@@ -847,6 +962,7 @@ fun FolderDetailScreen(
               modifier = Modifier.fillMaxWidth(),
             ) {
               OutlinedButton(
+                enabled = !isFolderBusy,
                 onClick = { showBatchRenameDialog = true },
                 modifier = Modifier
                   .weight(1f)
@@ -857,6 +973,7 @@ fun FolderDetailScreen(
                 Text("Rename (${selectedFiles.size})", maxLines = 1, overflow = TextOverflow.Ellipsis)
               }
               OutlinedButton(
+                enabled = !isFolderBusy,
                 onClick = { pendingRemoveFiles = selectedFiles },
                 colors = ButtonDefaults.outlinedButtonColors(
                   contentColor = MaterialTheme.colorScheme.error,
@@ -899,7 +1016,7 @@ fun FolderDetailScreen(
       title = { Text("Decrypting Secure Preview...") },
       text = {
         Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxWidth()) {
-          CircularProgressIndicator()
+          VaultCircularProgressIndicator()
         }
       },
       confirmButton = {},

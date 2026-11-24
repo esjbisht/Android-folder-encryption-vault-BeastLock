@@ -38,10 +38,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SegmentedButton
@@ -74,6 +72,8 @@ import com.example.data.storage.OrphanCategory
 import com.example.data.storage.OrphanedFileCandidate
 import com.example.data.storage.VaultFileItem
 import com.example.ui.SelectiveLockPromptState
+import com.example.ui.theme.BeastLockTheme
+import com.example.ui.theme.VaultProgressTone
 
 @Composable
 fun OrphanCleanupDialog(
@@ -125,7 +125,7 @@ fun OrphanCleanupDialog(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(10.dp),
               ) {
-                CircularProgressIndicator()
+                VaultCircularProgressIndicator()
                 Text(
                   text = if (isCleaning) "Removing orphaned temporary files..." else "Scanning vault & cloud staging...",
                   style = MaterialTheme.typography.bodySmall,
@@ -565,12 +565,10 @@ fun MigrationProgressDialog(
         val fraction = if (progress.totalFiles > 0) {
           (progress.processedFiles.toFloat() / progress.totalFiles.toFloat()).coerceIn(0f, 1f)
         } else 0f
-        LinearProgressIndicator(
-          progress = { fraction },
-          modifier = Modifier
-            .fillMaxWidth()
-            .height(8.dp)
-            .clip(RoundedCornerShape(4.dp)),
+        VaultLinearProgressBar(
+          progress = fraction,
+          tone = VaultProgressTone.DECRYPT,
+          height = 8.dp,
         )
         Text(
           text = "${progress.processedFiles} / ${progress.totalFiles} files • ${formatByteSize(progress.exportedBytes)} written",
@@ -711,24 +709,21 @@ fun IntegrityDiagnosticDialog(
               val total = progress?.totalFiles ?: 0
               val scanned = progress?.scannedFiles ?: 0
               if (total > 0) {
-                LinearProgressIndicator(
-                  progress = { (scanned.toFloat() / total.toFloat()).coerceIn(0f, 1f) },
-                  modifier = Modifier
-                    .fillMaxWidth()
-                    .height(8.dp)
-                    .clip(RoundedCornerShape(4.dp)),
+                VaultLinearProgressBar(
+                  progress = (scanned.toFloat() / total.toFloat()).coerceIn(0f, 1f),
+                  tone = VaultProgressTone.NEUTRAL,
+                  height = 8.dp,
                 )
                 Text(
                   text = "$scanned / $total encrypted file(s) checked • ${progress?.corruptedSoFar ?: 0} corrupted",
                   style = MaterialTheme.typography.labelSmall,
-                  color = MaterialTheme.colorScheme.primary,
+                  color = BeastLockTheme.colors.infoAccent,
                 )
               } else {
-                LinearProgressIndicator(
-                  modifier = Modifier
-                    .fillMaxWidth()
-                    .height(8.dp)
-                    .clip(RoundedCornerShape(4.dp)),
+                VaultLinearProgressBar(
+                  progress = null,
+                  tone = VaultProgressTone.NEUTRAL,
+                  height = 8.dp,
                 )
                 Text(
                   text = "Indexing encrypted vault folders...",
@@ -1070,7 +1065,7 @@ fun SelectiveLockFilesDialog(
               horizontalAlignment = Alignment.CenterHorizontally,
               verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-              CircularProgressIndicator()
+              VaultCircularProgressIndicator()
               Text(
                 text = "Reading folder files...",
                 style = MaterialTheme.typography.bodySmall,

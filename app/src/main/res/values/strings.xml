@@ -10,4 +10,6 @@
     <string name="biometric_negative_use_pattern_or_pin">Use Pattern or PIN</string>
     <string name="qs_tile_lock_vault">Lock BeastLock</string>
     <string name="qs_tile_panic_mode">BeastLock Panic</string>
+    <string name="crypto_notification_channel_name">Encryption &amp; Decryption Progress</string>
+    <string name="crypto_notification_channel_desc">Shows live horizontal progress while BeastLock encrypts or decrypts files</string>
 </resources>

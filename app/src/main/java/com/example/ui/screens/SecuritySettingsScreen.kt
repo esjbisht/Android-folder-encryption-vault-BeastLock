@@ -69,6 +69,7 @@ import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
@@ -104,9 +105,13 @@ import com.example.data.preferences.StealthGestureMode
 import com.example.security.DevicePowerState
 import com.example.security.PanicSensitivity
 import com.example.ui.components.PatternLockGrid
+import com.example.ui.components.VaultLinearProgressBar
+import com.example.ui.components.VaultStatusBadge
 import com.example.ui.components.formatByteSize
 import com.example.ui.components.formatTimestamp
+import com.example.ui.theme.BeastLockTheme
 import com.example.ui.theme.ThemeMode
+import com.example.ui.theme.VaultProgressTone
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -428,83 +433,246 @@ fun SecuritySettingsScreen(
                 )
               }
             }
+
+            Surface(
+              color = MaterialTheme.colorScheme.surfaceContainerLow,
+              shape = MaterialTheme.shapes.medium,
+              border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+              modifier = Modifier
+                .fillMaxWidth()
+                .testTag("settings_theme_preview_card"),
+            ) {
+              val previewColors = BeastLockTheme.colors
+              Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.padding(12.dp),
+              ) {
+                Text(
+                  text = "Status & Progress Preview",
+                  style = MaterialTheme.typography.labelLarge,
+                )
+                FlowRow(
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                  verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                  VaultStatusBadge(isLocked = true)
+                  VaultStatusBadge(isLocked = false, isPartiallyEncrypted = true)
+                  VaultStatusBadge(isLocked = false)
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                  Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth(),
+                  ) {
+                    Text(
+                      text = "Encrypting Vault",
+                      style = MaterialTheme.typography.labelSmall,
+                      color = previewColors.progressEncrypt,
+                      fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                      text = "72%",
+                      style = MaterialTheme.typography.labelSmall,
+                      color = previewColors.progressEncrypt,
+                      fontWeight = FontWeight.Bold,
+                    )
+                  }
+                  VaultLinearProgressBar(
+                    progress = 0.72f,
+                    tone = VaultProgressTone.ENCRYPT,
+                    height = 5.dp,
+                  )
+                  Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth(),
+                  ) {
+                    Text(
+                      text = "Decrypting Folder",
+                      style = MaterialTheme.typography.labelSmall,
+                      color = previewColors.progressDecrypt,
+                      fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                      text = "45%",
+                      style = MaterialTheme.typography.labelSmall,
+                      color = previewColors.progressDecrypt,
+                      fontWeight = FontWeight.Bold,
+                    )
+                  }
+                  VaultLinearProgressBar(
+                    progress = 0.45f,
+                    tone = VaultProgressTone.DECRYPT,
+                    height = 5.dp,
+                  )
+                }
+              }
+            }
           }
         }
       }
 
-      // Auto-Lock Timeout & Folder Re-Encryption
+      // Unified Auto-Lock & Folder Sealing (Inactivity + Background Triggers)
       item(key = "autolock_card") {
+        val anyAutoLockActive = settings.autoLockEnabled || settings.idleTimeoutEnabled
+        val combinedPostureSummary = buildList {
+          if (settings.idleTimeoutEnabled) {
+            add("Idle: ${formatAutoLockDuration(settings.idleTimeoutSeconds)}")
+          }
+          if (settings.autoLockEnabled) {
+            add("Background: ${formatAutoLockDuration(settings.autoLockTimeoutSeconds)}")
+          }
+        }.let { parts ->
+          if (parts.isEmpty()) {
+            "Disabled • Vault stays unlocked until manually sealed"
+          } else {
+            parts.joinToString(" • ") + if (settings.autoLockReencryptFolders) " • Seals folders" else ""
+          }
+        }
+
         Card(
           colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-          modifier = Modifier.fillMaxWidth(),
+          modifier = Modifier
+            .fillMaxWidth()
+            .testTag("settings_unified_autolock_card"),
         ) {
-          Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+          Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+          ) {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-              Icon(Icons.Rounded.LockClock, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+              Icon(
+                imageVector = Icons.Rounded.LockClock,
+                contentDescription = "Auto-Lock & Folder Sealing",
+                tint = if (anyAutoLockActive) {
+                  MaterialTheme.colorScheme.primary
+                } else {
+                  MaterialTheme.colorScheme.onSurfaceVariant
+                },
+              )
               Spacer(modifier = Modifier.width(12.dp))
               Column(modifier = Modifier.weight(1f)) {
-                Text("Background Auto-Lock", style = MaterialTheme.typography.titleSmall)
+                Text("Auto-Lock & Folder Sealing", style = MaterialTheme.typography.titleMedium)
                 Text(
-                  text = if (settings.autoLockEnabled) {
-                    "Active • Triggers after ${formatAutoLockDuration(settings.autoLockTimeoutSeconds)}"
-                  } else {
-                    "Disabled • Vault stays unlocked when backgrounded"
-                  },
+                  text = combinedPostureSummary,
                   style = MaterialTheme.typography.bodySmall,
-                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  color = if (anyAutoLockActive) {
+                    MaterialTheme.colorScheme.primary
+                  } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                  },
                 )
               }
-              Switch(
-                checked = settings.autoLockEnabled,
-                onCheckedChange = onToggleAutoLockEnabled,
-                modifier = Modifier.testTag("settings_autolock_enabled_switch"),
-              )
             }
 
-            if (settings.autoLockEnabled) {
+            if (settings.lastAutoLockSummary.isNotBlank()) {
+              Surface(
+                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .testTag("settings_last_autolock_summary"),
+              ) {
+                Text(
+                  text = "Last auto-lock: ${settings.lastAutoLockSummary}",
+                  style = MaterialTheme.typography.labelSmall,
+                  modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                )
+              }
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+
+            // Trigger 1: Inactivity Auto-Lock
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
               Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Icon(Icons.Rounded.EnhancedEncryption, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                Icon(Icons.Rounded.Timer, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                 Spacer(modifier = Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                  Text("Re-Encrypt Unlocked Folders", style = MaterialTheme.typography.titleSmall)
+                  Text("Inactivity Auto-Lock", style = MaterialTheme.typography.titleSmall)
                   Text(
-                    text = "Automatically seal unlocked folders with AES-256-GCM when timer expires",
+                    text = if (settings.idleTimeoutEnabled) {
+                      "Active • Locks after ${formatAutoLockDuration(settings.idleTimeoutSeconds)} without input (defers during active encryption)"
+                    } else {
+                      "Disabled • Foreground inactivity will not lock vault"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                   )
                 }
                 Switch(
-                  checked = settings.autoLockReencryptFolders,
-                  onCheckedChange = onToggleAutoLockReencrypt,
-                  modifier = Modifier.testTag("settings_autolock_reencrypt_switch"),
+                  checked = settings.idleTimeoutEnabled,
+                  onCheckedChange = onToggleIdleTimeoutEnabled,
+                  modifier = Modifier.testTag("settings_idle_timeout_switch"),
                 )
               }
 
+              if (settings.idleTimeoutEnabled) {
+                val idlePresets = listOf(15 to "15s", 30 to "30s", 60 to "1 min", 120 to "2 min", 300 to "5 min", 900 to "15 min")
+                val isIdlePreset = idlePresets.any { it.first == settings.idleTimeoutSeconds }
+                FlowRow(
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                  verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                  idlePresets.forEach { (sec, label) ->
+                    FilterChip(
+                      selected = settings.idleTimeoutSeconds == sec,
+                      onClick = { onSelectIdleTimeoutSeconds(sec) },
+                      label = { Text(label) },
+                      modifier = Modifier.testTag("idle_timeout_chip_$sec"),
+                    )
+                  }
+                  FilterChip(
+                    selected = !isIdlePreset,
+                    onClick = { showCustomIdleDurationDialog = true },
+                    label = {
+                      Text(
+                        if (!isIdlePreset) {
+                          "Custom (${formatAutoLockDuration(settings.idleTimeoutSeconds)})"
+                        } else {
+                          "Custom..."
+                        },
+                      )
+                    },
+                    modifier = Modifier.testTag("idle_timeout_chip_custom"),
+                  )
+                }
+              }
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+
+            // Trigger 2: Background Auto-Lock
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
               Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Icon(Icons.Rounded.Fingerprint, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                Icon(Icons.Rounded.Lock, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                 Spacer(modifier = Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                  Text("Require Biometric After Auto-Lock", style = MaterialTheme.typography.titleSmall)
+                  Text("Lock When App Goes to Background", style = MaterialTheme.typography.titleSmall)
                   Text(
-                    text = "Prompt fingerprint/face recognition upon returning",
+                    text = if (settings.autoLockEnabled) {
+                      "Active • Locks ${
+                        if (settings.autoLockTimeoutSeconds == 0) {
+                          "immediately on background"
+                        } else {
+                          "after ${formatAutoLockDuration(settings.autoLockTimeoutSeconds)} in background"
+                        }
+                      }"
+                    } else {
+                      "Disabled • Vault stays unlocked when backgrounded"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                   )
                 }
                 Switch(
-                  checked = settings.requireBiometricAfterAutoLock,
-                  onCheckedChange = onToggleRequireBioAfterAutoLock,
-                  enabled = bioSupported,
-                  modifier = Modifier.testTag("settings_autolock_bio_switch"),
+                  checked = settings.autoLockEnabled,
+                  onCheckedChange = onToggleAutoLockEnabled,
+                  modifier = Modifier.testTag("settings_autolock_enabled_switch"),
                 )
               }
 
-              Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                  Icon(Icons.Rounded.Timer, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                  Spacer(modifier = Modifier.width(8.dp))
-                  Text("Background Grace Duration", style = MaterialTheme.typography.labelLarge)
-                }
+              if (settings.autoLockEnabled) {
                 val presets = listOf(0 to "Immediate", 15 to "15s", 30 to "30s", 60 to "1 min", 300 to "5 min", 900 to "15 min")
                 val isPreset = presets.any { it.first == settings.autoLockTimeoutSeconds }
                 FlowRow(
@@ -536,81 +704,51 @@ fun SecuritySettingsScreen(
                 }
               }
             }
-          }
-        }
-      }
 
-      // Foreground Inactivity Idle Timeout
-      item(key = "idle_timeout_card") {
-        Card(
-          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-          modifier = Modifier.fillMaxWidth(),
-        ) {
-          Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-              Icon(Icons.Rounded.Timer, contentDescription = "Inactivity Idle Timeout", tint = MaterialTheme.colorScheme.primary)
-              Spacer(modifier = Modifier.width(12.dp))
-              Column(modifier = Modifier.weight(1f)) {
-                Text("Inactivity Idle Timeout", style = MaterialTheme.typography.titleSmall)
-                Text(
-                  text = if (settings.idleTimeoutEnabled) {
-                    "Active • Locks vault after ${formatAutoLockDuration(settings.idleTimeoutSeconds)} without activity"
-                  } else {
-                    "Disabled • Foreground inactivity will not lock vault"
-                  },
-                  style = MaterialTheme.typography.bodySmall,
-                  color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-              }
-              Switch(
-                checked = settings.idleTimeoutEnabled,
-                onCheckedChange = onToggleIdleTimeoutEnabled,
-                modifier = Modifier.testTag("settings_idle_timeout_switch"),
-              )
-            }
+            if (anyAutoLockActive) {
+              HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
 
-            if (settings.idleTimeoutEnabled) {
               Text(
-                text = "Resets automatically on touch or input. Active encryption or cloud backup pauses the countdown until finished.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                text = "Sealing & Re-Authentication",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
               )
 
-              Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                  Icon(Icons.Rounded.LockClock, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                  Spacer(modifier = Modifier.width(8.dp))
-                  Text("Inactivity Lock Duration", style = MaterialTheme.typography.labelLarge)
-                }
-                val idlePresets = listOf(15 to "15s", 30 to "30s", 60 to "1 min", 120 to "2 min", 300 to "5 min", 900 to "15 min")
-                val isIdlePreset = idlePresets.any { it.first == settings.idleTimeoutSeconds }
-                FlowRow(
-                  horizontalArrangement = Arrangement.spacedBy(8.dp),
-                  verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                  idlePresets.forEach { (sec, label) ->
-                    FilterChip(
-                      selected = settings.idleTimeoutSeconds == sec,
-                      onClick = { onSelectIdleTimeoutSeconds(sec) },
-                      label = { Text(label) },
-                      modifier = Modifier.testTag("idle_timeout_chip_$sec"),
-                    )
-                  }
-                  FilterChip(
-                    selected = !isIdlePreset,
-                    onClick = { showCustomIdleDurationDialog = true },
-                    label = {
-                      Text(
-                        if (!isIdlePreset) {
-                          "Custom (${formatAutoLockDuration(settings.idleTimeoutSeconds)})"
-                        } else {
-                          "Custom..."
-                        },
-                      )
-                    },
-                    modifier = Modifier.testTag("idle_timeout_chip_custom"),
+              Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Rounded.EnhancedEncryption, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                  Text("Re-Encrypt Unlocked Folders", style = MaterialTheme.typography.titleSmall)
+                  Text(
+                    text = "Automatically seal unlocked & partial folders with AES-256-GCM after active file crypto finishes",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                   )
                 }
+                Switch(
+                  checked = settings.autoLockReencryptFolders,
+                  onCheckedChange = onToggleAutoLockReencrypt,
+                  modifier = Modifier.testTag("settings_autolock_reencrypt_switch"),
+                )
+              }
+
+              Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Rounded.Fingerprint, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                  Text("Require Biometric After Auto-Lock", style = MaterialTheme.typography.titleSmall)
+                  Text(
+                    text = "Prompt fingerprint/face recognition upon returning",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                }
+                Switch(
+                  checked = settings.requireBiometricAfterAutoLock,
+                  onCheckedChange = onToggleRequireBioAfterAutoLock,
+                  enabled = bioSupported,
+                  modifier = Modifier.testTag("settings_autolock_bio_switch"),
+                )
               }
             }
           }

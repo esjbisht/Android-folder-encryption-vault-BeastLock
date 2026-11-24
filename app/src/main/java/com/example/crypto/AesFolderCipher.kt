@@ -147,6 +147,7 @@ object AesFolderCipher {
     key: SecretKey,
     metadata: EncryptedFileMetadata,
     chunkSize: Int = DEFAULT_CHUNK_SIZE,
+    onProgressBytes: ((Long) -> Unit)? = null,
   ): Long {
     val baseNonce = ByteArray(NONCE_BYTES).also { secureRandom.nextBytes(it) }
     val metaBytes = json.encodeToString(metadata).toByteArray(StandardCharsets.UTF_8)
@@ -186,6 +187,7 @@ object AesFolderCipher {
       val encryptedChunk = cipher.doFinal(buffer, 0, read)
       dos.writeInt(encryptedChunk.size)
       dos.write(encryptedChunk)
+      onProgressBytes?.invoke(totalPlainBytes)
       chunkIndex++
     }
 
@@ -305,6 +307,7 @@ object AesFolderCipher {
     input: InputStream,
     output: OutputStream,
     key: SecretKey,
+    onProgressBytes: ((Long) -> Unit)? = null,
   ): EncryptedFileMetadata {
     val dis = DataInputStream(input)
     val magic = ByteArray(4)
@@ -335,6 +338,7 @@ object AesFolderCipher {
     )
 
     var chunkIndex = 0L
+    var totalDecryptedBytes = 0L
     while (true) {
       val len = try {
         dis.readInt()
@@ -368,6 +372,8 @@ object AesFolderCipher {
       cipher.updateAAD("VLK1-DATA-$chunkIndex".toByteArray(StandardCharsets.UTF_8))
       val plainChunk = cipher.doFinal(encryptedChunk)
       output.write(plainChunk)
+      totalDecryptedBytes += plainChunk.size.toLong()
+      onProgressBytes?.invoke(totalDecryptedBytes)
       chunkIndex++
     }
     output.flush()

@@ -28,7 +28,6 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -46,6 +45,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.crypto.UriPermissionStatus
 import com.example.ui.PendingFolderPickerPreview
+import com.example.ui.theme.BeastLockTheme
+import com.example.ui.theme.VaultProgressTone
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -131,7 +132,11 @@ fun FolderPickerPreviewSheet(
             .fillMaxWidth()
             .padding(vertical = 12.dp),
         ) {
-          LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+          VaultLinearProgressBar(
+            progress = null,
+            tone = VaultProgressTone.NEUTRAL,
+            height = 6.dp,
+          )
           Text(
             text = "Auditing SAF URI permissions & scanning files...",
             style = MaterialTheme.typography.bodySmall,
@@ -313,27 +318,32 @@ fun PermissionStatusPill(
   status: UriPermissionStatus,
   modifier: Modifier = Modifier,
 ) {
-  val (containerColor, contentColor, icon) = when (status) {
-    UriPermissionStatus.PERSISTED_READ_WRITE -> Triple(
-      MaterialTheme.colorScheme.primaryContainer,
-      MaterialTheme.colorScheme.onPrimaryContainer,
+  val colors = BeastLockTheme.colors
+  val (containerColor, contentColor, accentColor, icon) = when (status) {
+    UriPermissionStatus.PERSISTED_READ_WRITE -> PillColors(
+      colors.lockedContainer,
+      colors.onLockedContainer,
+      colors.lockedAccent,
       Icons.Rounded.VerifiedUser,
     )
-    UriPermissionStatus.TRANSIENT -> Triple(
-      MaterialTheme.colorScheme.tertiaryContainer,
-      MaterialTheme.colorScheme.onTertiaryContainer,
+    UriPermissionStatus.TRANSIENT -> PillColors(
+      colors.warningContainer,
+      colors.onWarningContainer,
+      colors.warningAccent,
       Icons.Rounded.Info,
     )
     UriPermissionStatus.READ_ONLY,
     UriPermissionStatus.REVOKED,
-    -> Triple(
-      MaterialTheme.colorScheme.errorContainer,
-      MaterialTheme.colorScheme.onErrorContainer,
+    -> PillColors(
+      colors.dangerContainer,
+      colors.onDangerContainer,
+      colors.dangerAccent,
       Icons.Rounded.WarningAmber,
     )
-    UriPermissionStatus.INTERNAL_SANDBOX -> Triple(
-      MaterialTheme.colorScheme.secondaryContainer,
-      MaterialTheme.colorScheme.onSecondaryContainer,
+    UriPermissionStatus.INTERNAL_SANDBOX -> PillColors(
+      colors.infoContainer,
+      colors.onInfoContainer,
+      colors.infoAccent,
       Icons.Rounded.VerifiedUser,
     )
   }
@@ -342,9 +352,7 @@ fun PermissionStatusPill(
     color = containerColor,
     contentColor = contentColor,
     shape = RoundedCornerShape(50),
-    border = if (status.needsRegrant) {
-      BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.5f))
-    } else null,
+    border = BorderStroke(1.dp, accentColor.copy(alpha = if (status.needsRegrant) 0.6f else 0.35f)),
     modifier = modifier,
   ) {
     Row(
@@ -366,6 +374,13 @@ fun PermissionStatusPill(
     }
   }
 }
+
+private data class PillColors(
+  val container: androidx.compose.ui.graphics.Color,
+  val content: androidx.compose.ui.graphics.Color,
+  val accent: androidx.compose.ui.graphics.Color,
+  val icon: androidx.compose.ui.graphics.vector.ImageVector,
+)
 
 @Composable
 private fun PreviewStatBox(

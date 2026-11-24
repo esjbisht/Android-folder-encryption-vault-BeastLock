@@ -25,6 +25,7 @@ import com.example.data.preferences.PrimaryLockType
 import com.example.data.preferences.SecurityPreferencesRepository
 import com.example.data.preferences.SecuritySettings
 import com.example.data.preferences.StealthGestureMode
+import com.example.data.storage.EncryptionProgress
 import com.example.data.storage.FolderLockerRepository
 import com.example.data.storage.MigrationExportFormat
 import com.example.data.storage.VaultFileItem
@@ -38,6 +39,7 @@ import com.example.security.DevicePowerState
 import com.example.security.PanicSensitivity
 import com.example.security.QuickTileCommand
 import com.example.security.VaultQuickActionBus
+import com.example.service.CryptoProgressForegroundService
 import com.example.ui.theme.ThemeMode
 import com.google.firebase.Firebase
 import com.google.firebase.auth.FirebaseAuth
@@ -120,6 +122,10 @@ class VaultViewModel private constructor(
   private var idleSequence: Long = 0L
   @Volatile
   private var isAppInForeground: Boolean = true
+  @Volatile
+  private var deferredAutoLockTriggerReason: String? = null
+  private val busyFolderLock = Any()
+  private val activeBusyFolderIds = mutableSetOf<String>()
 
   private val _uiState = MutableStateFlow(
     VaultUiState(
@@ -223,10 +229,17 @@ class VaultViewModel private constructor(
           if (!isAppInForeground || sessionDek == null || !latestSettings.idleTimeoutEnabled || latestSettings.idleTimeoutSeconds <= 0) {
             return@collectLatest
           }
-          if (isBusyWithForegroundWork()) {
-            remainingMs = latestSettings.idleTimeoutSeconds.toLong() * 1000L
-          } else {
-            remainingMs -= stepMs
+          remainingMs -= stepMs
+        }
+        if (isBusyWithForegroundWork()) {
+          markDeferredAutoLock("INACTIVITY")
+          while (isBusyWithForegroundWork()) {
+            delay(1_000L)
+            val latestSettings = _uiState.value.securitySettings
+            if (!isAppInForeground || sessionDek == null || !latestSettings.idleTimeoutEnabled || latestSettings.idleTimeoutSeconds <= 0) {
+              clearDeferredAutoLock()
+              return@collectLatest
+            }
           }
         }
         performIdleTimeoutLock(_uiState.value.securitySettings.idleTimeoutSeconds)
@@ -235,12 +248,49 @@ class VaultViewModel private constructor(
   }
 
   override fun onCleared() {
+    CryptoProgressForegroundService.syncProgress(getApplication(), null)
     batteryMonitor.stop()
     cloudReportsJob?.cancel()
     runCatching {
       firebaseAuthListener?.let { Firebase.auth.removeAuthStateListener(it) }
     }
     super.onCleared()
+  }
+
+  private fun updateEncryptionProgress(progress: EncryptionProgress?) {
+    _uiState.update { it.copy(encryptionProgress = progress) }
+    CryptoProgressForegroundService.syncProgress(getApplication(), progress)
+    if (progress == null) {
+      flushDeferredAutoLockIfReady()
+    }
+  }
+
+  private fun tryAcquireBusyFolders(folderIds: Collection<String>): Boolean {
+    val cleanIds = folderIds.filter { it.isNotBlank() }.toSet()
+    if (cleanIds.isEmpty()) return true
+    synchronized(busyFolderLock) {
+      if (cleanIds.any { it in activeBusyFolderIds }) {
+        return false
+      }
+      activeBusyFolderIds.addAll(cleanIds)
+      val snapshot = activeBusyFolderIds.toSet()
+      _uiState.update { it.copy(busyFolderIds = snapshot) }
+      return true
+    }
+  }
+
+  private fun releaseBusyFolders(folderIds: Collection<String>) {
+    val cleanIds = folderIds.filter { it.isNotBlank() }.toSet()
+    if (cleanIds.isEmpty()) return
+    val allReleased = synchronized(busyFolderLock) {
+      activeBusyFolderIds.removeAll(cleanIds)
+      val snapshot = activeBusyFolderIds.toSet()
+      _uiState.update { it.copy(busyFolderIds = snapshot) }
+      snapshot.isEmpty()
+    }
+    if (allReleased) {
+      flushDeferredAutoLockIfReady()
+    }
   }
 
   fun completeOnboarding(
@@ -505,9 +555,11 @@ class VaultViewModel private constructor(
       wasAutoLockedNotice -> "Vault authenticated after automatic lock"
       else -> null
     }
+    clearDeferredAutoLock()
     _uiState.update {
       it.copy(
         sessionState = VaultSessionState.Unlocked,
+        deferredAutoLockPending = false,
         authError = null,
         statusMessage = statusMsg ?: it.statusMessage,
       )
@@ -595,6 +647,7 @@ class VaultViewModel private constructor(
     val capturedDek = sessionDek
     autoLockJob?.cancel()
     autoLockJob = null
+    clearDeferredAutoLock()
     sessionDek = null
     driveAccessToken = null
     cancelIdleTimer()
@@ -631,6 +684,7 @@ class VaultViewModel private constructor(
         } else {
           VaultSessionState.NeedsOnboarding
         },
+        deferredAutoLockPending = false,
         activeFolderFiles = emptyList(),
         securePreview = null,
         pendingRestoreUriRequiringPin = null,
@@ -655,6 +709,7 @@ class VaultViewModel private constructor(
 
     autoLockJob?.cancel()
     autoLockJob = null
+    clearDeferredAutoLock()
     backgroundedAtMillis = 0L
     sessionDek = null
     driveAccessToken = null
@@ -672,6 +727,7 @@ class VaultViewModel private constructor(
         } else {
           VaultSessionState.NeedsOnboarding
         },
+        deferredAutoLockPending = false,
         activeFolderFiles = emptyList(),
         securePreview = null,
         pendingRestoreUriRequiringPin = null,
@@ -728,6 +784,9 @@ class VaultViewModel private constructor(
 
   fun onUserInteraction() {
     if (isAppInForeground && sessionDek != null) {
+      if (deferredAutoLockTriggerReason == "INACTIVITY") {
+        clearDeferredAutoLock()
+      }
       resetIdleTimer()
     }
   }
@@ -743,11 +802,69 @@ class VaultViewModel private constructor(
   private fun isBusyWithForegroundWork(): Boolean {
     val state = _uiState.value
     return state.encryptionProgress != null ||
+      state.busyFolderIds.isNotEmpty() ||
       state.cloudBackupProgress != null ||
       state.migrationProgress != null ||
       state.isAutoLockReencrypting ||
       state.isCleaningOrphans ||
       state.isScanningIntegrity
+  }
+
+  private fun markDeferredAutoLock(reason: String) {
+    deferredAutoLockTriggerReason = reason
+    _uiState.update { it.copy(deferredAutoLockPending = true) }
+  }
+
+  private fun clearDeferredAutoLock() {
+    deferredAutoLockTriggerReason = null
+    _uiState.update {
+      if (it.deferredAutoLockPending) it.copy(deferredAutoLockPending = false) else it
+    }
+  }
+
+  private fun flushDeferredAutoLockIfReady() {
+    val reason = deferredAutoLockTriggerReason ?: return
+    if (sessionDek == null || _uiState.value.sessionState != VaultSessionState.Unlocked) {
+      clearDeferredAutoLock()
+      return
+    }
+    if (isBusyWithForegroundWork()) return
+
+    val settings = _uiState.value.securitySettings
+    when (reason) {
+      "BACKGROUND" -> {
+        if (!settings.autoLockEnabled) {
+          clearDeferredAutoLock()
+          return
+        }
+        val bgStart = if (backgroundedAtMillis > 0L) {
+          backgroundedAtMillis
+        } else {
+          settings.lastBackgroundedAtMillis
+        }
+        val elapsedSec = if (bgStart > 0L) {
+          ((System.currentTimeMillis() - bgStart) / 1000L).toInt()
+            .coerceAtLeast(settings.autoLockTimeoutSeconds)
+        } else {
+          settings.autoLockTimeoutSeconds
+        }
+        deferredAutoLockTriggerReason = null
+        viewModelScope.launch {
+          performAutoLock(elapsedSeconds = elapsedSec)
+        }
+      }
+      "INACTIVITY" -> {
+        if (!settings.idleTimeoutEnabled || !isAppInForeground) {
+          clearDeferredAutoLock()
+          return
+        }
+        deferredAutoLockTriggerReason = null
+        viewModelScope.launch {
+          performIdleTimeoutLock(timeoutSeconds = settings.idleTimeoutSeconds)
+        }
+      }
+      else -> clearDeferredAutoLock()
+    }
   }
 
   fun onAppBackgrounded() {
@@ -766,6 +883,7 @@ class VaultViewModel private constructor(
 
     val settings = stateNow.securitySettings
     if (!settings.autoLockEnabled || sessionDek == null) return
+    if (stateNow.isStealthPickerInFlight) return
 
     val now = System.currentTimeMillis()
     backgroundedAtMillis = now
@@ -777,7 +895,11 @@ class VaultViewModel private constructor(
       if (timeoutSec > 0) {
         delay(timeoutSec * 1000L)
       }
-      performAutoLock(elapsedSeconds = timeoutSec)
+      if (isBusyWithForegroundWork()) {
+        markDeferredAutoLock("BACKGROUND")
+      } else {
+        performAutoLock(elapsedSeconds = timeoutSec)
+      }
     }
   }
 
@@ -785,26 +907,42 @@ class VaultViewModel private constructor(
     isAppInForeground = true
     autoLockJob?.cancel()
     autoLockJob = null
+    if (_uiState.value.isStealthPickerInFlight) {
+      _uiState.update { it.copy(isStealthPickerInFlight = false) }
+    }
 
     val settings = _uiState.value.securitySettings
     val bgStart = if (backgroundedAtMillis > 0L) backgroundedAtMillis else settings.lastBackgroundedAtMillis
     backgroundedAtMillis = 0L
 
-    if (!settings.autoLockEnabled) {
-      viewModelScope.launch { prefsRepo.recordBackgroundedAt(0L) }
-      if (sessionDek != null) resetIdleTimer()
-      return
-    }
-
     val dek = sessionDek
     if (dek != null) {
       refreshFolderPermissions()
     }
+
+    if (deferredAutoLockTriggerReason != null) {
+      if (!isBusyWithForegroundWork()) {
+        flushDeferredAutoLockIfReady()
+        return
+      }
+      return
+    }
+
+    if (!settings.autoLockEnabled) {
+      viewModelScope.launch { prefsRepo.recordBackgroundedAt(0L) }
+      if (dek != null) resetIdleTimer()
+      return
+    }
+
     if (dek != null && bgStart > 0L && _uiState.value.sessionState == VaultSessionState.Unlocked) {
       val elapsedSec = ((System.currentTimeMillis() - bgStart) / 1000L).toInt()
       if (elapsedSec >= settings.autoLockTimeoutSeconds) {
-        viewModelScope.launch {
-          performAutoLock(elapsedSeconds = elapsedSec)
+        if (isBusyWithForegroundWork()) {
+          markDeferredAutoLock("BACKGROUND")
+        } else {
+          viewModelScope.launch {
+            performAutoLock(elapsedSeconds = elapsedSec)
+          }
         }
       } else {
         viewModelScope.launch { prefsRepo.recordBackgroundedAt(0L) }
@@ -816,12 +954,19 @@ class VaultViewModel private constructor(
   }
 
   private suspend fun performAutoLock(elapsedSeconds: Int) {
+    if (_uiState.value.isAutoLockReencrypting) return
     val dek = sessionDek ?: return
     val settings = _uiState.value.securitySettings
+    deferredAutoLockTriggerReason = null
     cancelIdleTimer()
 
     withContext(NonCancellable) {
-      _uiState.update { it.copy(isAutoLockReencrypting = true) }
+      _uiState.update {
+        it.copy(
+          isAutoLockReencrypting = true,
+          deferredAutoLockPending = false,
+        )
+      }
 
       val pausedByBattery = isBatterySaverBlockingNow()
       val sealedPrivate = folderRepo.concealAndResealPrivateFolders(dek)
@@ -868,6 +1013,7 @@ class VaultViewModel private constructor(
       _uiState.update {
         it.copy(
           isAutoLockReencrypting = false,
+          deferredAutoLockPending = false,
           sessionState = if (settings.isVaultInitialized || it.sessionState == VaultSessionState.Unlocked) {
             VaultSessionState.Locked
           } else {
@@ -890,12 +1036,22 @@ class VaultViewModel private constructor(
   }
 
   private suspend fun performIdleTimeoutLock(timeoutSeconds: Int) {
+    if (_uiState.value.isAutoLockReencrypting) return
     val dek = sessionDek ?: return
     val settings = _uiState.value.securitySettings
-    if (!isAppInForeground || !settings.idleTimeoutEnabled) return
+    if (!isAppInForeground || !settings.idleTimeoutEnabled) {
+      clearDeferredAutoLock()
+      return
+    }
+    deferredAutoLockTriggerReason = null
 
     withContext(NonCancellable) {
-      _uiState.update { it.copy(isAutoLockReencrypting = true) }
+      _uiState.update {
+        it.copy(
+          isAutoLockReencrypting = true,
+          deferredAutoLockPending = false,
+        )
+      }
 
       val pausedByBattery = isBatterySaverBlockingNow()
       val sealedPrivate = folderRepo.concealAndResealPrivateFolders(dek)
@@ -943,6 +1099,7 @@ class VaultViewModel private constructor(
       _uiState.update {
         it.copy(
           isAutoLockReencrypting = false,
+          deferredAutoLockPending = false,
           sessionState = if (settings.isVaultInitialized || it.sessionState == VaultSessionState.Unlocked) {
             VaultSessionState.Locked
           } else {
@@ -965,10 +1122,12 @@ class VaultViewModel private constructor(
   }
 
   private suspend fun reencryptAllUnlockedFolders(dek: SecretKey): Int {
-    val unlockedFolders = vaultDao.getAllFoldersOnce()
-      .filter { !it.isLocked && it.fileCount > 0 }
+    val unsealedFolders = vaultDao.getAllFoldersOnce()
+      .filter { folder ->
+        folder.fileCount > 0 && (!folder.isLocked || folder.encryptedFileCount < folder.fileCount)
+      }
     var sealed = 0
-    for (folder in unlockedFolders) {
+    for (folder in unsealedFolders) {
       folderRepo.lockFolder(folder.id, dek).onSuccess { sealed++ }
     }
     return sealed
@@ -983,6 +1142,20 @@ class VaultViewModel private constructor(
 
   fun setFilter(filter: FolderFilter) {
     _uiState.update { it.copy(folderFilter = filter) }
+  }
+
+  fun setFolderSortOrder(sortOrder: FolderSortOrder) {
+    _uiState.update { it.copy(folderSortOrder = sortOrder) }
+  }
+
+  fun clearDashboardSearchAndFilters() {
+    _uiState.update {
+      it.copy(
+        searchQuery = "",
+        folderFilter = FolderFilter.ALL,
+        folderSortOrder = FolderSortOrder.RECENT,
+      )
+    }
   }
 
   fun setSearchQuery(query: String) {
@@ -1148,140 +1321,164 @@ class VaultViewModel private constructor(
   fun confirmFolderPickerPreview(encryptNow: Boolean) {
     val preview = _uiState.value.pendingFolderPickerPreview ?: return
     if (preview.isScanning) return
+    val existingId = preview.existingFolderId
+    if (existingId != null && !tryAcquireBusyFolders(listOf(existingId))) return
     _uiState.update { it.copy(pendingFolderPickerPreview = null) }
     viewModelScope.launch {
-      folderRepo.registerSafFolder(
-        treeUri = preview.treeUri,
-        obfuscateDefault = preview.obfuscateFilenames,
-        requireBioDefault = preview.requireAuthOnOpen,
-      ).onSuccess { registered ->
-        folderRepo.updateFolderSecurityOptions(
-          folderId = registered.id,
-          requireBiometricPerUnlock = preview.requireAuthOnOpen,
-          obfuscateFilenames = preview.obfuscateFilenames,
-          requireAuthOnOpen = preview.requireAuthOnOpen,
-        )
-        val dek = sessionDek
-        if (encryptNow && dek != null && registered.fileCount > registered.encryptedFileCount) {
-          folderRepo.lockFolder(registered.id, dek) { progress ->
-            _uiState.update { it.copy(encryptionProgress = progress) }
-          }.onSuccess { lockedFolder ->
-            syncDualKeyVaultInternal(dek)
-            refreshFolderPermissions()
-            _uiState.update {
-              it.copy(
-                encryptionProgress = null,
-                statusMessage = "Encrypted & locked \"${lockedFolder.name}\" (${lockedFolder.encryptedFileCount} files secured • ${preview.permissionStatus.label})",
-              )
-            }
-          }.onFailure { err ->
-            issueRecorder.recordIssueAsync(
-              category = IssueCategory.CRYPTO_ERROR,
-              errorCode = "PICKER_LOCK_FAILED",
-              rawSummary = err.message ?: "Encryption after folder selection failed",
-            )
-            _uiState.update {
-              it.copy(
-                encryptionProgress = null,
-                errorMessage = err.message ?: "Registered folder, but encryption failed",
-              )
-            }
+      var acquiredRegisteredId: String? = existingId
+      try {
+        folderRepo.registerSafFolder(
+          treeUri = preview.treeUri,
+          obfuscateDefault = preview.obfuscateFilenames,
+          requireBioDefault = preview.requireAuthOnOpen,
+        ).onSuccess { registered ->
+          if (acquiredRegisteredId == null && tryAcquireBusyFolders(listOf(registered.id))) {
+            acquiredRegisteredId = registered.id
           }
-        } else {
-          syncDualKeyVaultInternal(dek)
-          refreshFolderPermissions()
-          val actionLabel = when {
-            preview.existingFolderId != null ->
-              "Updated \"${registered.name}\" (${preview.permissionStatus.label})"
-            encryptNow && registered.encryptedFileCount > 0 ->
-              "Registered \"${registered.name}\" (${registered.encryptedFileCount} encrypted file(s) detected)"
-            else ->
-              "Registered \"${registered.name}\" (${preview.permissionStatus.label})"
-          }
-          _uiState.update { it.copy(statusMessage = actionLabel) }
-        }
-      }.onFailure { err ->
-        issueRecorder.recordIssueAsync(
-          category = IssueCategory.SAF_STORAGE,
-          errorCode = "CONFIRM_PICKED_FOLDER_FAILED",
-          rawSummary = err.message ?: "Failed to register selected folder",
-        )
-        _uiState.update {
-          it.copy(errorMessage = err.message ?: "Failed to register selected folder")
-        }
-      }
-    }
-  }
-
-  fun regrantDeviceFolderPermission(folderId: String, treeUri: Uri) {
-    viewModelScope.launch {
-      folderRepo.regrantSafFolderPermission(folderId, treeUri)
-        .onSuccess { updated ->
-          refreshFolderPermissions()
-          _uiState.update {
-            it.copy(statusMessage = "Restored persistent access to \"${updated.name}\"")
-          }
-        }
-        .onFailure { err ->
-          issueRecorder.recordIssueAsync(
-            category = IssueCategory.SAF_STORAGE,
-            errorCode = "REGRANT_PERMISSION_FAILED",
-            rawSummary = err.message ?: "Failed to restore folder permission",
+          folderRepo.updateFolderSecurityOptions(
+            folderId = registered.id,
+            requireBiometricPerUnlock = preview.requireAuthOnOpen,
+            obfuscateFilenames = preview.obfuscateFilenames,
+            requireAuthOnOpen = preview.requireAuthOnOpen,
           )
-          _uiState.update {
-            it.copy(errorMessage = err.message ?: "Could not restore folder access")
-          }
-        }
-    }
-  }
-
-  fun addDeviceFolder(treeUri: Uri) {
-    viewModelScope.launch {
-      val obfuscate = _uiState.value.securitySettings.obfuscateFilenamesDefault
-      folderRepo.registerSafFolder(treeUri, obfuscateDefault = obfuscate, requireBioDefault = true)
-        .onSuccess { folder ->
           val dek = sessionDek
-          if (dek != null && folder.fileCount > 0 && !folder.isLocked) {
-            folderRepo.lockFolder(folder.id, dek) { progress ->
-              _uiState.update { it.copy(encryptionProgress = progress) }
+          if (encryptNow && dek != null && registered.fileCount > registered.encryptedFileCount) {
+            folderRepo.lockFolder(registered.id, dek) { progress ->
+              updateEncryptionProgress(progress)
             }.onSuccess { lockedFolder ->
               syncDualKeyVaultInternal(dek)
               refreshFolderPermissions()
+              updateEncryptionProgress(null)
               _uiState.update {
                 it.copy(
-                  encryptionProgress = null,
-                  statusMessage = "Added & auto-locked \"${lockedFolder.name}\" (${lockedFolder.encryptedFileCount} files secured)",
+                  statusMessage = "Encrypted & locked \"${lockedFolder.name}\" (${lockedFolder.encryptedFileCount} files secured • ${preview.permissionStatus.label})",
                 )
               }
             }.onFailure { err ->
               issueRecorder.recordIssueAsync(
                 category = IssueCategory.CRYPTO_ERROR,
-                errorCode = "AUTO_LOCK_ON_ADD_FAILED",
-                rawSummary = err.message ?: "Auto-lock after adding device folder failed",
+                errorCode = "PICKER_LOCK_FAILED",
+                rawSummary = err.message ?: "Encryption after folder selection failed",
               )
+              updateEncryptionProgress(null)
               _uiState.update {
                 it.copy(
-                  encryptionProgress = null,
-                  errorMessage = err.message ?: "Added folder, but auto-lock encryption failed",
+                  errorMessage = err.message ?: "Registered folder, but encryption failed",
                 )
               }
             }
           } else {
             syncDualKeyVaultInternal(dek)
             refreshFolderPermissions()
-            _uiState.update {
-              it.copy(statusMessage = "Protected \"${folder.name}\" (Authentication required on open)")
+            val actionLabel = when {
+              preview.existingFolderId != null ->
+                "Updated \"${registered.name}\" (${preview.permissionStatus.label})"
+              encryptNow && registered.encryptedFileCount > 0 ->
+                "Registered \"${registered.name}\" (${registered.encryptedFileCount} encrypted file(s) detected)"
+              else ->
+                "Registered \"${registered.name}\" (${preview.permissionStatus.label})"
             }
+            _uiState.update { it.copy(statusMessage = actionLabel) }
           }
-        }
-        .onFailure { err ->
+        }.onFailure { err ->
           issueRecorder.recordIssueAsync(
             category = IssueCategory.SAF_STORAGE,
-            errorCode = "ADD_DEVICE_FOLDER_FAILED",
-            rawSummary = err.message ?: "Failed to register SAF device folder",
+            errorCode = "CONFIRM_PICKED_FOLDER_FAILED",
+            rawSummary = err.message ?: "Failed to register selected folder",
           )
-          _uiState.update { it.copy(errorMessage = err.message ?: "Failed to register folder") }
+          _uiState.update {
+            it.copy(errorMessage = err.message ?: "Failed to register selected folder")
+          }
         }
+      } finally {
+        updateEncryptionProgress(null)
+        acquiredRegisteredId?.let { releaseBusyFolders(listOf(it)) }
+      }
+    }
+  }
+
+  fun regrantDeviceFolderPermission(folderId: String, treeUri: Uri) {
+    if (!tryAcquireBusyFolders(listOf(folderId))) return
+    viewModelScope.launch {
+      try {
+        folderRepo.regrantSafFolderPermission(folderId, treeUri)
+          .onSuccess { updated ->
+            refreshFolderPermissions()
+            _uiState.update {
+              it.copy(statusMessage = "Restored persistent access to \"${updated.name}\"")
+            }
+          }
+          .onFailure { err ->
+            issueRecorder.recordIssueAsync(
+              category = IssueCategory.SAF_STORAGE,
+              errorCode = "REGRANT_PERMISSION_FAILED",
+              rawSummary = err.message ?: "Failed to restore folder permission",
+            )
+            _uiState.update {
+              it.copy(errorMessage = err.message ?: "Could not restore folder access")
+            }
+          }
+      } finally {
+        releaseBusyFolders(listOf(folderId))
+      }
+    }
+  }
+
+  fun addDeviceFolder(treeUri: Uri) {
+    viewModelScope.launch {
+      var acquiredFolderId: String? = null
+      try {
+        val obfuscate = _uiState.value.securitySettings.obfuscateFilenamesDefault
+        folderRepo.registerSafFolder(treeUri, obfuscateDefault = obfuscate, requireBioDefault = true)
+          .onSuccess { folder ->
+            val dek = sessionDek
+            if (dek != null && folder.fileCount > 0 && !folder.isLocked) {
+              if (!tryAcquireBusyFolders(listOf(folder.id))) return@onSuccess
+              acquiredFolderId = folder.id
+              folderRepo.lockFolder(folder.id, dek) { progress ->
+                updateEncryptionProgress(progress)
+              }.onSuccess { lockedFolder ->
+                syncDualKeyVaultInternal(dek)
+                refreshFolderPermissions()
+                updateEncryptionProgress(null)
+                _uiState.update {
+                  it.copy(
+                    statusMessage = "Added & auto-locked \"${lockedFolder.name}\" (${lockedFolder.encryptedFileCount} files secured)",
+                  )
+                }
+              }.onFailure { err ->
+                issueRecorder.recordIssueAsync(
+                  category = IssueCategory.CRYPTO_ERROR,
+                  errorCode = "AUTO_LOCK_ON_ADD_FAILED",
+                  rawSummary = err.message ?: "Auto-lock after adding device folder failed",
+                )
+                updateEncryptionProgress(null)
+                _uiState.update {
+                  it.copy(
+                    errorMessage = err.message ?: "Added folder, but auto-lock encryption failed",
+                  )
+                }
+              }
+            } else {
+              syncDualKeyVaultInternal(dek)
+              refreshFolderPermissions()
+              _uiState.update {
+                it.copy(statusMessage = "Protected \"${folder.name}\" (Authentication required on open)")
+              }
+            }
+          }
+          .onFailure { err ->
+            issueRecorder.recordIssueAsync(
+              category = IssueCategory.SAF_STORAGE,
+              errorCode = "ADD_DEVICE_FOLDER_FAILED",
+              rawSummary = err.message ?: "Failed to register SAF device folder",
+            )
+            _uiState.update { it.copy(errorMessage = err.message ?: "Failed to register folder") }
+          }
+      } finally {
+        updateEncryptionProgress(null)
+        acquiredFolderId?.let { releaseBusyFolders(listOf(it)) }
+      }
     }
   }
 
@@ -1321,27 +1518,32 @@ class VaultViewModel private constructor(
     moveOriginals: Boolean = true,
   ) {
     if (uris.isEmpty()) return
+    if (!tryAcquireBusyFolders(listOf(folderId))) return
     viewModelScope.launch {
-      folderRepo.importFilesWithReport(folderId, uris, sessionDek, moveOriginals = moveOriginals)
-        .onSuccess { res ->
-          loadFolderFiles(folderId)
-          val msg = when {
-            res.importedCount == 0 -> "No files were imported"
-            moveOriginals && res.movedWithoutCopyCount == res.importedCount ->
-              "Added ${res.importedCount} file(s) (moved without copies)"
-            moveOriginals && res.movedWithoutCopyCount > 0 ->
-              "Added ${res.importedCount} file(s) (${res.movedWithoutCopyCount} moved, ${res.readOnlySourceCount} from read-only picker)"
-            else -> "Added ${res.importedCount} file(s)"
+      try {
+        folderRepo.importFilesWithReport(folderId, uris, sessionDek, moveOriginals = moveOriginals)
+          .onSuccess { res ->
+            loadFolderFiles(folderId)
+            val msg = when {
+              res.importedCount == 0 -> "No files were imported"
+              moveOriginals && res.movedWithoutCopyCount == res.importedCount ->
+                "Added ${res.importedCount} file(s) (moved without copies)"
+              moveOriginals && res.movedWithoutCopyCount > 0 ->
+                "Added ${res.importedCount} file(s) (${res.movedWithoutCopyCount} moved, ${res.readOnlySourceCount} from read-only picker)"
+              else -> "Added ${res.importedCount} file(s)"
+            }
+            _uiState.update { it.copy(statusMessage = msg) }
+            val dek = sessionDek
+            if (dek != null && res.importedCount > 0) {
+              maybeRunAutoCloudSync(dek, onlyIfFolderSyncEnabledId = folderId)
+            }
           }
-          _uiState.update { it.copy(statusMessage = msg) }
-          val dek = sessionDek
-          if (dek != null && res.importedCount > 0) {
-            maybeRunAutoCloudSync(dek, onlyIfFolderSyncEnabledId = folderId)
+          .onFailure { err ->
+            _uiState.update { it.copy(errorMessage = err.message ?: "File import failed") }
           }
-        }
-        .onFailure { err ->
-          _uiState.update { it.copy(errorMessage = err.message ?: "File import failed") }
-        }
+      } finally {
+        releaseBusyFolders(listOf(folderId))
+      }
     }
   }
 
@@ -1365,6 +1567,7 @@ class VaultViewModel private constructor(
   }
 
   fun requestLockFolderWithSelection(folderId: String, reloadDetail: Boolean = false) {
+    if (_uiState.value.isFolderBusy(folderId)) return
     val folder = _uiState.value.folders.find { it.id == folderId } ?: return
     viewModelScope.launch {
       _uiState.update {
@@ -1424,70 +1627,74 @@ class VaultViewModel private constructor(
     selectedFileIds: Set<String>? = null,
   ) {
     val dek = sessionDek ?: return
+    if (!tryAcquireBusyFolders(listOf(folderId))) return
     viewModelScope.launch {
       _uiState.update { it.copy(selectiveLockPrompt = null) }
-      folderRepo.lockFolder(folderId, dek, selectedFileIds = selectedFileIds) { progress ->
-        _uiState.update { it.copy(encryptionProgress = progress) }
-      }.onSuccess { updated ->
-        val remainingPlain = (updated.fileCount - updated.encryptedFileCount).coerceAtLeast(0)
-        val msg = when {
-          selectedFileIds != null && remainingPlain > 0 ->
-            "Encrypted ${updated.encryptedFileCount}/${updated.fileCount} file(s) in \"${updated.name}\" ($remainingPlain kept unencrypted)"
-          else ->
-            "Locked \"${updated.name}\" with AES-256-GCM"
-        }
-        _uiState.update {
-          it.copy(
-            encryptionProgress = null,
-            statusMessage = msg,
+      try {
+        folderRepo.lockFolder(folderId, dek, selectedFileIds = selectedFileIds) { progress ->
+          updateEncryptionProgress(progress)
+        }.onSuccess { updated ->
+          val remainingPlain = (updated.fileCount - updated.encryptedFileCount).coerceAtLeast(0)
+          val msg = when {
+            selectedFileIds != null && remainingPlain > 0 ->
+              "Encrypted ${updated.encryptedFileCount}/${updated.fileCount} file(s) in \"${updated.name}\" ($remainingPlain kept unencrypted)"
+            else ->
+              "Locked \"${updated.name}\" with AES-256-GCM"
+          }
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(statusMessage = msg)
+          }
+          if (reloadDetail) loadFolderFiles(folderId)
+          syncDualKeyVaultInternal(dek)
+          if (updated.autoCloudBackupSync) {
+            maybeRunAutoCloudSync(dek)
+          }
+        }.onFailure { err ->
+          issueRecorder.recordIssueAsync(
+            category = IssueCategory.CRYPTO_ERROR,
+            errorCode = "LOCK_FOLDER_FAILED",
+            rawSummary = err.message ?: "Encryption failed",
           )
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(errorMessage = err.message ?: "Encryption failed")
+          }
         }
-        if (reloadDetail) loadFolderFiles(folderId)
-        syncDualKeyVaultInternal(dek)
-        if (updated.autoCloudBackupSync) {
-          maybeRunAutoCloudSync(dek)
-        }
-      }.onFailure { err ->
-        issueRecorder.recordIssueAsync(
-          category = IssueCategory.CRYPTO_ERROR,
-          errorCode = "LOCK_FOLDER_FAILED",
-          rawSummary = err.message ?: "Encryption failed",
-        )
-        _uiState.update {
-          it.copy(
-            encryptionProgress = null,
-            errorMessage = err.message ?: "Encryption failed",
-          )
-        }
+      } finally {
+        updateEncryptionProgress(null)
+        releaseBusyFolders(listOf(folderId))
       }
     }
   }
 
   fun unlockFolder(folderId: String, reloadDetail: Boolean = false) {
     val dek = sessionDek ?: return
+    if (!tryAcquireBusyFolders(listOf(folderId))) return
     viewModelScope.launch {
-      folderRepo.unlockFolder(folderId, dek) { progress ->
-        _uiState.update { it.copy(encryptionProgress = progress) }
-      }.onSuccess { updated ->
-        _uiState.update {
-          it.copy(
-            encryptionProgress = null,
-            statusMessage = "Unlocked \"${updated.name}\"",
+      try {
+        folderRepo.unlockFolder(folderId, dek) { progress ->
+          updateEncryptionProgress(progress)
+        }.onSuccess { updated ->
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(statusMessage = "Unlocked \"${updated.name}\"")
+          }
+          if (reloadDetail) loadFolderFiles(folderId)
+        }.onFailure { err ->
+          issueRecorder.recordIssueAsync(
+            category = IssueCategory.CRYPTO_ERROR,
+            errorCode = "UNLOCK_FOLDER_FAILED",
+            rawSummary = err.message ?: "Decryption failed — key or tag mismatch",
           )
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(errorMessage = err.message ?: "Decryption failed — key or tag mismatch")
+          }
         }
-        if (reloadDetail) loadFolderFiles(folderId)
-      }.onFailure { err ->
-        issueRecorder.recordIssueAsync(
-          category = IssueCategory.CRYPTO_ERROR,
-          errorCode = "UNLOCK_FOLDER_FAILED",
-          rawSummary = err.message ?: "Decryption failed — key or tag mismatch",
-        )
-        _uiState.update {
-          it.copy(
-            encryptionProgress = null,
-            errorMessage = err.message ?: "Decryption failed — key or tag mismatch",
-          )
-        }
+      } finally {
+        updateEncryptionProgress(null)
+        releaseBusyFolders(listOf(folderId))
       }
     }
   }
@@ -1499,67 +1706,73 @@ class VaultViewModel private constructor(
   ) {
     if (fileIds.isEmpty()) return
     val dek = sessionDek ?: return
+    if (!tryAcquireBusyFolders(listOf(folderId))) return
     viewModelScope.launch {
-      folderRepo.decryptFilesInFolder(folderId, fileIds, dek) { progress ->
-        _uiState.update { it.copy(encryptionProgress = progress) }
-      }.onSuccess { updated ->
-        val msg = if (updated.isLocked) {
-          "Decrypted ${fileIds.size} file(s) • ${updated.encryptedFileCount} still encrypted"
-        } else {
-          "Decrypted ${fileIds.size} file(s) in \"${updated.name}\""
-        }
-        _uiState.update {
-          it.copy(
-            encryptionProgress = null,
-            statusMessage = msg,
+      try {
+        folderRepo.decryptFilesInFolder(folderId, fileIds, dek) { progress ->
+          updateEncryptionProgress(progress)
+        }.onSuccess { updated ->
+          val msg = if (updated.isLocked) {
+            "Decrypted ${fileIds.size} file(s) • ${updated.encryptedFileCount} still encrypted"
+          } else {
+            "Decrypted ${fileIds.size} file(s) in \"${updated.name}\""
+          }
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(statusMessage = msg)
+          }
+          if (reloadDetail) loadFolderFiles(folderId)
+        }.onFailure { err ->
+          issueRecorder.recordIssueAsync(
+            category = IssueCategory.CRYPTO_ERROR,
+            errorCode = "DECRYPT_FILE_FAILED",
+            rawSummary = err.message ?: "File decryption failed — key or tag mismatch",
           )
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(errorMessage = err.message ?: "File decryption failed — key or tag mismatch")
+          }
         }
-        if (reloadDetail) loadFolderFiles(folderId)
-      }.onFailure { err ->
-        issueRecorder.recordIssueAsync(
-          category = IssueCategory.CRYPTO_ERROR,
-          errorCode = "DECRYPT_FILE_FAILED",
-          rawSummary = err.message ?: "File decryption failed — key or tag mismatch",
-        )
-        _uiState.update {
-          it.copy(
-            encryptionProgress = null,
-            errorMessage = err.message ?: "File decryption failed — key or tag mismatch",
-          )
-        }
+      } finally {
+        updateEncryptionProgress(null)
+        releaseBusyFolders(listOf(folderId))
       }
     }
   }
 
   fun decryptAnyDeviceFolder(treeUri: Uri) {
     val dek = sessionDek ?: return
+    val existingId = _uiState.value.folders.find { it.treeUri == treeUri.toString() }?.id
+    val lockKey = existingId ?: "saf_decrypt_$treeUri"
+    if (!tryAcquireBusyFolders(listOf(lockKey))) return
     viewModelScope.launch {
-      folderRepo.decryptAnySafFolder(treeUri, dek) { progress ->
-        _uiState.update { it.copy(encryptionProgress = progress) }
-      }.onSuccess { res ->
-        val msg = if (res.decryptedFiles > 0) {
-          "Decrypted ${res.decryptedFiles} file(s) in \"${res.folderName}\" in-place (no copies left)"
-        } else {
-          "No encrypted .vlock files found in \"${res.folderName}\""
-        }
-        _uiState.update {
-          it.copy(
-            encryptionProgress = null,
-            statusMessage = msg,
+      try {
+        folderRepo.decryptAnySafFolder(treeUri, dek) { progress ->
+          updateEncryptionProgress(progress)
+        }.onSuccess { res ->
+          val msg = if (res.decryptedFiles > 0) {
+            "Decrypted ${res.decryptedFiles} file(s) in \"${res.folderName}\" in-place (no copies left)"
+          } else {
+            "No encrypted .vlock files found in \"${res.folderName}\""
+          }
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(statusMessage = msg)
+          }
+        }.onFailure { err ->
+          issueRecorder.recordIssueAsync(
+            category = IssueCategory.CRYPTO_ERROR,
+            errorCode = "DECRYPT_ANY_FOLDER_FAILED",
+            rawSummary = err.message ?: "Could not decrypt device folder",
           )
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(errorMessage = err.message ?: "Could not decrypt device folder")
+          }
         }
-      }.onFailure { err ->
-        issueRecorder.recordIssueAsync(
-          category = IssueCategory.CRYPTO_ERROR,
-          errorCode = "DECRYPT_ANY_FOLDER_FAILED",
-          rawSummary = err.message ?: "Could not decrypt device folder",
-        )
-        _uiState.update {
-          it.copy(
-            encryptionProgress = null,
-            errorMessage = err.message ?: "Could not decrypt device folder",
-          )
-        }
+      } finally {
+        updateEncryptionProgress(null)
+        releaseBusyFolders(listOf(lockKey))
       }
     }
   }
@@ -1570,21 +1783,26 @@ class VaultViewModel private constructor(
     reloadDetail: Boolean = true,
   ) {
     if (fileIds.isEmpty()) return
+    if (!tryAcquireBusyFolders(listOf(folderId))) return
     viewModelScope.launch {
-      folderRepo.removeFilesInFolder(folderId, fileIds)
-        .onSuccess { updated ->
-          if (reloadDetail) loadFolderFiles(folderId)
-          _uiState.update {
-            it.copy(
-              statusMessage = "Removed ${fileIds.size} file(s) from \"${updated.name}\"",
-            )
+      try {
+        folderRepo.removeFilesInFolder(folderId, fileIds)
+          .onSuccess { updated ->
+            if (reloadDetail) loadFolderFiles(folderId)
+            _uiState.update {
+              it.copy(
+                statusMessage = "Removed ${fileIds.size} file(s) from \"${updated.name}\"",
+              )
+            }
           }
-        }
-        .onFailure { err ->
-          _uiState.update {
-            it.copy(errorMessage = err.message ?: "Failed to remove selected file(s)")
+          .onFailure { err ->
+            _uiState.update {
+              it.copy(errorMessage = err.message ?: "Failed to remove selected file(s)")
+            }
           }
-        }
+      } finally {
+        releaseBusyFolders(listOf(folderId))
+      }
     }
   }
 
@@ -1634,30 +1852,41 @@ class VaultViewModel private constructor(
     val dek = sessionDek ?: return
     val ids = _uiState.value.selectedFolderIds.toList()
     if (ids.isEmpty()) return
+    if (!tryAcquireBusyFolders(ids)) {
+      _uiState.update {
+        it.copy(statusMessage = "Wait until active encryption or decryption completes on selected folders")
+      }
+      return
+    }
 
     viewModelScope.launch {
-      val result = folderRepo.lockFoldersBatch(ids, dek) { progress ->
-        _uiState.update { it.copy(encryptionProgress = progress) }
-      }
-      val msg = when {
-        result.succeededCount == 0 && result.failedCount == 0 ->
-          "Selected folders are already encrypted"
-        result.failedCount > 0 ->
-          "Encrypted ${result.succeededCount} folder(s); ${result.failedCount} failed (${result.firstError.orEmpty()})"
-        else ->
-          "Encrypted ${result.succeededCount} folder(s) (${result.totalFiles} files) with AES-256-GCM"
-      }
-      _uiState.update {
-        it.copy(
-          encryptionProgress = null,
-          isSelectionMode = false,
-          selectedFolderIds = emptySet(),
-          statusMessage = if (result.failedCount == 0) msg else null,
-          errorMessage = if (result.failedCount > 0) msg else null,
-        )
-      }
-      if (result.succeededCount > 0) {
-        maybeRunAutoCloudSync(dek)
+      try {
+        val result = folderRepo.lockFoldersBatch(ids, dek) { progress ->
+          updateEncryptionProgress(progress)
+        }
+        val msg = when {
+          result.succeededCount == 0 && result.failedCount == 0 ->
+            "Selected folders are already encrypted"
+          result.failedCount > 0 ->
+            "Encrypted ${result.succeededCount} folder(s); ${result.failedCount} failed (${result.firstError.orEmpty()})"
+          else ->
+            "Encrypted ${result.succeededCount} folder(s) (${result.totalFiles} files) with AES-256-GCM"
+        }
+        updateEncryptionProgress(null)
+        _uiState.update {
+          it.copy(
+            isSelectionMode = false,
+            selectedFolderIds = emptySet(),
+            statusMessage = if (result.failedCount == 0) msg else null,
+            errorMessage = if (result.failedCount > 0) msg else null,
+          )
+        }
+        if (result.succeededCount > 0) {
+          maybeRunAutoCloudSync(dek)
+        }
+      } finally {
+        updateEncryptionProgress(null)
+        releaseBusyFolders(ids)
       }
     }
   }
@@ -1666,27 +1895,38 @@ class VaultViewModel private constructor(
     val dek = sessionDek ?: return
     val ids = _uiState.value.selectedFolderIds.toList()
     if (ids.isEmpty()) return
+    if (!tryAcquireBusyFolders(ids)) {
+      _uiState.update {
+        it.copy(statusMessage = "Wait until active encryption or decryption completes on selected folders")
+      }
+      return
+    }
 
     viewModelScope.launch {
-      val result = folderRepo.unlockFoldersBatch(ids, dek) { progress ->
-        _uiState.update { it.copy(encryptionProgress = progress) }
-      }
-      val msg = when {
-        result.succeededCount == 0 && result.failedCount == 0 ->
-          "Selected folders are already unlocked"
-        result.failedCount > 0 ->
-          "Decrypted ${result.succeededCount} folder(s); ${result.failedCount} failed (${result.firstError.orEmpty()})"
-        else ->
-          "Decrypted ${result.succeededCount} folder(s) (${result.totalFiles} files)"
-      }
-      _uiState.update {
-        it.copy(
-          encryptionProgress = null,
-          isSelectionMode = false,
-          selectedFolderIds = emptySet(),
-          statusMessage = if (result.failedCount == 0) msg else null,
-          errorMessage = if (result.failedCount > 0) msg else null,
-        )
+      try {
+        val result = folderRepo.unlockFoldersBatch(ids, dek) { progress ->
+          updateEncryptionProgress(progress)
+        }
+        val msg = when {
+          result.succeededCount == 0 && result.failedCount == 0 ->
+            "Selected folders are already unlocked"
+          result.failedCount > 0 ->
+            "Decrypted ${result.succeededCount} folder(s); ${result.failedCount} failed (${result.firstError.orEmpty()})"
+          else ->
+            "Decrypted ${result.succeededCount} folder(s) (${result.totalFiles} files)"
+        }
+        updateEncryptionProgress(null)
+        _uiState.update {
+          it.copy(
+            isSelectionMode = false,
+            selectedFolderIds = emptySet(),
+            statusMessage = if (result.failedCount == 0) msg else null,
+            errorMessage = if (result.failedCount > 0) msg else null,
+          )
+        }
+      } finally {
+        updateEncryptionProgress(null)
+        releaseBusyFolders(ids)
       }
     }
   }
@@ -1739,37 +1979,48 @@ class VaultViewModel private constructor(
     val dek = sessionDek ?: return
     val ids = _uiState.value.selectedFolderIds.toList()
     if (ids.isEmpty()) return
+    if (!tryAcquireBusyFolders(ids)) {
+      _uiState.update {
+        it.copy(statusMessage = "Wait until active encryption or decryption completes on selected folders")
+      }
+      return
+    }
 
     viewModelScope.launch {
-      val result = folderRepo.reencryptFoldersBatch(
-        folderIds = ids,
-        masterDek = dek,
-        encryptUnlockedFolders = encryptUnlockedFolders,
-      ) { progress ->
-        _uiState.update { it.copy(encryptionProgress = progress) }
-      }
-      val msg = when {
-        result.failedCount > 0 ->
-          "Rotated keys for ${result.succeededCount} folder(s); ${result.failedCount} failed (${result.firstError.orEmpty()})"
-        result.succeededCount == 0 && result.skippedCount > 0 ->
-          "Skipped ${result.skippedCount} unlocked folder(s)"
-        result.skippedCount > 0 ->
-          "Rotated keys for ${result.succeededCount} folder(s) (${result.totalFiles} files); skipped ${result.skippedCount} unlocked"
-        else ->
-          "Rotated AES-256 keys & re-encrypted ${result.succeededCount} folder(s) (${result.totalFiles} files)"
-      }
-      _uiState.update {
-        it.copy(
-          encryptionProgress = null,
-          isSelectionMode = false,
-          selectedFolderIds = emptySet(),
-          statusMessage = if (result.failedCount == 0) msg else null,
-          errorMessage = if (result.failedCount > 0) msg else null,
-        )
-      }
-      if (result.succeededCount > 0) {
-        syncDualKeyVaultInternal(dek)
-        maybeRunAutoCloudSync(dek)
+      try {
+        val result = folderRepo.reencryptFoldersBatch(
+          folderIds = ids,
+          masterDek = dek,
+          encryptUnlockedFolders = encryptUnlockedFolders,
+        ) { progress ->
+          updateEncryptionProgress(progress)
+        }
+        val msg = when {
+          result.failedCount > 0 ->
+            "Rotated keys for ${result.succeededCount} folder(s); ${result.failedCount} failed (${result.firstError.orEmpty()})"
+          result.succeededCount == 0 && result.skippedCount > 0 ->
+            "Skipped ${result.skippedCount} unlocked folder(s)"
+          result.skippedCount > 0 ->
+            "Rotated keys for ${result.succeededCount} folder(s) (${result.totalFiles} files); skipped ${result.skippedCount} unlocked"
+          else ->
+            "Rotated AES-256 keys & re-encrypted ${result.succeededCount} folder(s) (${result.totalFiles} files)"
+        }
+        updateEncryptionProgress(null)
+        _uiState.update {
+          it.copy(
+            isSelectionMode = false,
+            selectedFolderIds = emptySet(),
+            statusMessage = if (result.failedCount == 0) msg else null,
+            errorMessage = if (result.failedCount > 0) msg else null,
+          )
+        }
+        if (result.succeededCount > 0) {
+          syncDualKeyVaultInternal(dek)
+          maybeRunAutoCloudSync(dek)
+        }
+      } finally {
+        updateEncryptionProgress(null)
+        releaseBusyFolders(ids)
       }
     }
   }
@@ -1779,34 +2030,40 @@ class VaultViewModel private constructor(
     renameMap: Map<String, String>,
   ) {
     if (renameMap.isEmpty()) return
+    if (!tryAcquireBusyFolders(listOf(folderId))) return
     val dek = sessionDek
     viewModelScope.launch {
-      folderRepo.batchRenameFolderFiles(folderId, renameMap, dek) { progress ->
-        _uiState.update { it.copy(encryptionProgress = progress) }
-      }.onSuccess { res ->
-        loadFolderFiles(folderId)
-        val msg = when {
-          res.failedCount > 0 ->
-            "Renamed ${res.renamedCount} file(s); ${res.failedCount} failed (${res.firstError.orEmpty()})"
-          res.renamedCount == 0 ->
-            "All selected filenames already match the target format"
-          else ->
-            "Renamed ${res.renamedCount} file(s) without decrypting payloads"
+      try {
+        folderRepo.batchRenameFolderFiles(folderId, renameMap, dek) { progress ->
+          updateEncryptionProgress(progress)
+        }.onSuccess { res ->
+          loadFolderFiles(folderId)
+          val msg = when {
+            res.failedCount > 0 ->
+              "Renamed ${res.renamedCount} file(s); ${res.failedCount} failed (${res.firstError.orEmpty()})"
+            res.renamedCount == 0 ->
+              "All selected filenames already match the target format"
+            else ->
+              "Renamed ${res.renamedCount} file(s) without decrypting payloads"
+          }
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(
+              statusMessage = if (res.failedCount == 0) msg else null,
+              errorMessage = if (res.failedCount > 0) msg else null,
+            )
+          }
+        }.onFailure { err ->
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(
+              errorMessage = err.message ?: "Batch file rename failed",
+            )
+          }
         }
-        _uiState.update {
-          it.copy(
-            encryptionProgress = null,
-            statusMessage = if (res.failedCount == 0) msg else null,
-            errorMessage = if (res.failedCount > 0) msg else null,
-          )
-        }
-      }.onFailure { err ->
-        _uiState.update {
-          it.copy(
-            encryptionProgress = null,
-            errorMessage = err.message ?: "Batch file rename failed",
-          )
-        }
+      } finally {
+        updateEncryptionProgress(null)
+        releaseBusyFolders(listOf(folderId))
       }
     }
   }
@@ -1911,6 +2168,7 @@ class VaultViewModel private constructor(
               },
             )
           }
+          flushDeferredAutoLockIfReady()
         }.onFailure { err ->
           _uiState.update {
             it.copy(
@@ -1918,6 +2176,7 @@ class VaultViewModel private constructor(
               errorMessage = err.message ?: "Auto-sync destination linked, but initial upload failed",
             )
           }
+          flushDeferredAutoLockIfReady()
         }
       }
     }
@@ -1962,6 +2221,7 @@ class VaultViewModel private constructor(
             },
           )
         }
+        flushDeferredAutoLockIfReady()
       }.onFailure { err ->
         _uiState.update {
           it.copy(
@@ -1969,6 +2229,7 @@ class VaultViewModel private constructor(
             errorMessage = err.message ?: "Auto cloud backup sync failed",
           )
         }
+        flushDeferredAutoLockIfReady()
       }
     }
   }
@@ -2128,6 +2389,7 @@ class VaultViewModel private constructor(
     obfuscateFilenames: Boolean,
     requireAuthOnOpen: Boolean? = null,
   ) {
+    if (_uiState.value.isFolderBusy(folderId)) return
     viewModelScope.launch {
       folderRepo.updateFolderSecurityOptions(folderId, requireBio, obfuscateFilenames, requireAuthOnOpen)
     }
@@ -2137,26 +2399,36 @@ class VaultViewModel private constructor(
     folderId: String,
     decryptLockedSafFirst: Boolean = true,
   ) {
+    if (!tryAcquireBusyFolders(listOf(folderId))) return
     viewModelScope.launch {
-      runCatching {
-        folderRepo.removeFolderFromVault(
-          folderId = folderId,
-          dek = sessionDek,
-          decryptLockedSafFirst = decryptLockedSafFirst,
-        )
-      }.onSuccess {
-        _uiState.update {
-          it.copy(
-            selectedFolderIds = it.selectedFolderIds - folderId,
-            activeFolderFiles = emptyList(),
-            securePreview = null,
-            statusMessage = "Folder removed from BeastLock",
-          )
+      try {
+        runCatching {
+          folderRepo.removeFolderFromVault(
+            folderId = folderId,
+            dek = sessionDek,
+            decryptLockedSafFirst = decryptLockedSafFirst,
+          ) { progress ->
+            updateEncryptionProgress(progress)
+          }
+        }.onSuccess {
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(
+              selectedFolderIds = it.selectedFolderIds - folderId,
+              activeFolderFiles = emptyList(),
+              securePreview = null,
+              statusMessage = "Folder removed from BeastLock",
+            )
+          }
+        }.onFailure { err ->
+          updateEncryptionProgress(null)
+          _uiState.update {
+            it.copy(errorMessage = err.message ?: "Failed to remove folder from BeastLock")
+          }
         }
-      }.onFailure { err ->
-        _uiState.update {
-          it.copy(errorMessage = err.message ?: "Failed to remove folder from BeastLock")
-        }
+      } finally {
+        updateEncryptionProgress(null)
+        releaseBusyFolders(listOf(folderId))
       }
     }
   }
@@ -2164,29 +2436,40 @@ class VaultViewModel private constructor(
   fun removeSelectedFolders(decryptLockedSafFirst: Boolean = true) {
     val ids = _uiState.value.selectedFolderIds.toList()
     if (ids.isEmpty()) return
-    viewModelScope.launch {
-      val result = folderRepo.removeFoldersBatch(
-        folderIds = ids,
-        dek = sessionDek,
-        decryptLockedSafFirst = decryptLockedSafFirst,
-      ) { progress ->
-        _uiState.update { it.copy(encryptionProgress = progress) }
-      }
-      val msg = if (result.failedCount > 0) {
-        "Removed ${result.succeededCount} folder(s); ${result.failedCount} failed (${result.firstError.orEmpty()})"
-      } else {
-        "Removed ${result.succeededCount} folder(s) from BeastLock list"
-      }
+    if (!tryAcquireBusyFolders(ids)) {
       _uiState.update {
-        it.copy(
-          encryptionProgress = null,
-          isSelectionMode = false,
-          selectedFolderIds = emptySet(),
-          activeFolderFiles = emptyList(),
-          securePreview = null,
-          statusMessage = if (result.failedCount == 0) msg else null,
-          errorMessage = if (result.failedCount > 0) msg else null,
-        )
+        it.copy(statusMessage = "Wait until active encryption or decryption completes on selected folders")
+      }
+      return
+    }
+    viewModelScope.launch {
+      try {
+        val result = folderRepo.removeFoldersBatch(
+          folderIds = ids,
+          dek = sessionDek,
+          decryptLockedSafFirst = decryptLockedSafFirst,
+        ) { progress ->
+          updateEncryptionProgress(progress)
+        }
+        val msg = if (result.failedCount > 0) {
+          "Removed ${result.succeededCount} folder(s); ${result.failedCount} failed (${result.firstError.orEmpty()})"
+        } else {
+          "Removed ${result.succeededCount} folder(s) from BeastLock list"
+        }
+        updateEncryptionProgress(null)
+        _uiState.update {
+          it.copy(
+            isSelectionMode = false,
+            selectedFolderIds = emptySet(),
+            activeFolderFiles = emptyList(),
+            securePreview = null,
+            statusMessage = if (result.failedCount == 0) msg else null,
+            errorMessage = if (result.failedCount > 0) msg else null,
+          )
+        }
+      } finally {
+        updateEncryptionProgress(null)
+        releaseBusyFolders(ids)
       }
     }
   }
@@ -2248,6 +2531,7 @@ class VaultViewModel private constructor(
             statusMessage = "Encrypted backup saved to $providerLabel (${result.record.fileCount} files)$skippedNote",
           )
         }
+        flushDeferredAutoLockIfReady()
       }.onFailure { err ->
         _uiState.update {
           it.copy(
@@ -2255,6 +2539,7 @@ class VaultViewModel private constructor(
             errorMessage = err.message ?: "Cloud backup failed",
           )
         }
+        flushDeferredAutoLockIfReady()
       }
     }
   }
@@ -2285,6 +2570,7 @@ class VaultViewModel private constructor(
             )
           }
         }
+        flushDeferredAutoLockIfReady()
       }.onFailure { err ->
         _uiState.update {
           it.copy(
@@ -2292,6 +2578,7 @@ class VaultViewModel private constructor(
             errorMessage = err.message ?: "Failed to restore cloud backup",
           )
         }
+        flushDeferredAutoLockIfReady()
       }
     }
   }
@@ -2433,6 +2720,7 @@ class VaultViewModel private constructor(
             },
           )
         }
+        flushDeferredAutoLockIfReady()
       }.onFailure { err ->
         if (err is DriveAuthExpiredException) {
           driveAccessToken = null
@@ -2445,6 +2733,7 @@ class VaultViewModel private constructor(
             errorMessage = err.message ?: "Google Drive sync failed",
           )
         }
+        flushDeferredAutoLockIfReady()
       }
     }
   }
@@ -2494,6 +2783,7 @@ class VaultViewModel private constructor(
             )
           }
         }
+        flushDeferredAutoLockIfReady()
       }.onFailure { err ->
         if (err is DriveAuthExpiredException) {
           driveAccessToken = null
@@ -2506,6 +2796,7 @@ class VaultViewModel private constructor(
             errorMessage = err.message ?: "Failed to restore Google Drive backup",
           )
         }
+        flushDeferredAutoLockIfReady()
       }
     }
   }
@@ -3021,6 +3312,7 @@ class VaultViewModel private constructor(
             },
           )
         }
+        flushDeferredAutoLockIfReady()
       }.onFailure { err ->
         _uiState.update {
           it.copy(
@@ -3028,6 +3320,7 @@ class VaultViewModel private constructor(
             errorMessage = err.message ?: "Failed to clear orphaned files",
           )
         }
+        flushDeferredAutoLockIfReady()
       }
     }
   }
@@ -3065,6 +3358,7 @@ class VaultViewModel private constructor(
             },
           )
         }
+        flushDeferredAutoLockIfReady()
       }.onFailure { err ->
         if (err !is CancellationException) {
           _uiState.update {
@@ -3074,6 +3368,7 @@ class VaultViewModel private constructor(
               errorMessage = err.message ?: "Failed to run integrity diagnostic scan",
             )
           }
+          flushDeferredAutoLockIfReady()
         }
       }
     }
@@ -3088,6 +3383,7 @@ class VaultViewModel private constructor(
         integrityScanProgress = null,
       )
     }
+    flushDeferredAutoLockIfReady()
   }
 
   fun dismissIntegrityReport() {
@@ -3138,6 +3434,7 @@ class VaultViewModel private constructor(
             deviceStorageInfo = readDeviceStorageInfo(),
           )
         }
+        flushDeferredAutoLockIfReady()
       }.onFailure { err ->
         if (err is CancellationException) {
           _uiState.update {
@@ -3154,6 +3451,7 @@ class VaultViewModel private constructor(
             )
           }
         }
+        flushDeferredAutoLockIfReady()
       }
     }
   }
@@ -3162,6 +3460,7 @@ class VaultViewModel private constructor(
     migrationJob?.cancel()
     migrationJob = null
     _uiState.update { it.copy(migrationProgress = null) }
+    flushDeferredAutoLockIfReady()
   }
 
   fun dismissMigrationResult() {

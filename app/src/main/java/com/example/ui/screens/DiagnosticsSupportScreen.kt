@@ -63,6 +63,7 @@ import com.example.data.telemetry.CloudDiagnosticReport
 import com.example.data.telemetry.IssueCategory
 import com.example.data.telemetry.SystemIssueRecorder
 import com.example.ui.VaultUiState
+import com.example.ui.components.VaultCircularProgressIndicator
 import com.example.ui.components.formatTimestamp
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -201,7 +202,7 @@ fun DiagnosticsSupportScreen(
               }
               Spacer(modifier = Modifier.width(8.dp))
               if (state.isSigningInFirebase) {
-                CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.5.dp)
+                VaultCircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.5.dp)
               } else if (isSignedIn) {
                 OutlinedButton(
                   onClick = onSignOut,
