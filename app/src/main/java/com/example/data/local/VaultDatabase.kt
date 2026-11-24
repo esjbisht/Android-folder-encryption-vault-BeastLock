@@ -8,8 +8,13 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-  entities = [VaultFolderEntity::class, AuditLogEntity::class, BackupRecordEntity::class],
-  version = 4,
+  entities = [
+    VaultFolderEntity::class,
+    AuditLogEntity::class,
+    BackupRecordEntity::class,
+    SystemIssueReportEntity::class,
+  ],
+  version = 6,
   exportSchema = false,
 )
 abstract class VaultDatabase : RoomDatabase() {
@@ -41,6 +46,38 @@ abstract class VaultDatabase : RoomDatabase() {
       }
     }
 
+    private val MIGRATION_4_5 = object : Migration(4, 5) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE vault_folders ADD COLUMN requireAuthOnOpen INTEGER NOT NULL DEFAULT 1")
+        db.execSQL(
+          """
+          CREATE TABLE IF NOT EXISTS `system_issue_reports` (
+            `id` TEXT NOT NULL,
+            `occurredAtMillis` INTEGER NOT NULL,
+            `category` TEXT NOT NULL,
+            `errorCode` TEXT NOT NULL,
+            `sanitizedSummary` TEXT NOT NULL,
+            `healthSnapshot` TEXT NOT NULL,
+            `userFeedback` TEXT NOT NULL,
+            `appVersion` TEXT NOT NULL,
+            `androidSdk` INTEGER NOT NULL,
+            `deviceModel` TEXT NOT NULL,
+            `syncStatus` TEXT NOT NULL,
+            `cloudDocumentId` TEXT,
+            PRIMARY KEY(`id`)
+          )
+          """.trimIndent(),
+        )
+      }
+    }
+
+    private val MIGRATION_5_6 = object : Migration(5, 6) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE vault_folders ADD COLUMN isStealthHidden INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("UPDATE vault_folders SET isStealthHidden = 1 WHERE isInternalVault = 1")
+      }
+    }
+
     fun getInstance(context: Context): VaultDatabase {
       return INSTANCE ?: synchronized(this) {
         INSTANCE ?: Room.databaseBuilder(
@@ -48,7 +85,7 @@ abstract class VaultDatabase : RoomDatabase() {
           VaultDatabase::class.java,
           "vaultlock_db",
         )
-          .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+          .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
           .build()
           .also { INSTANCE = it }
       }

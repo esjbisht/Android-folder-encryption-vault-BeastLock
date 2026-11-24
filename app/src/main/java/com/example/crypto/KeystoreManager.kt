@@ -5,7 +5,6 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
-import androidx.biometric.BiometricManager
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -41,36 +40,8 @@ class KeystoreManager(
     private const val IV_BYTES = 12
   }
 
-  fun checkBiometricAvailability(): BiometricAvailability {
-    val manager = BiometricManager.from(context)
-    val strongOrDevice = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-      BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL
-    } else {
-      BiometricManager.Authenticators.BIOMETRIC_STRONG
-    }
-    return when (manager.canAuthenticate(strongOrDevice)) {
-      BiometricManager.BIOMETRIC_SUCCESS -> BiometricAvailability.AVAILABLE_STRONG
-      BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> {
-        val weak = manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
-        if (weak == BiometricManager.BIOMETRIC_SUCCESS) {
-          BiometricAvailability.AVAILABLE_WEAK_OR_DEVICE
-        } else {
-          BiometricAvailability.NONE_ENROLLED
-        }
-      }
-      else -> {
-        val weak = manager.canAuthenticate(
-          BiometricManager.Authenticators.BIOMETRIC_WEAK or
-            BiometricManager.Authenticators.DEVICE_CREDENTIAL
-        )
-        when (weak) {
-          BiometricManager.BIOMETRIC_SUCCESS -> BiometricAvailability.AVAILABLE_WEAK_OR_DEVICE
-          BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> BiometricAvailability.NONE_ENROLLED
-          else -> BiometricAvailability.UNAVAILABLE
-        }
-      }
-    }
-  }
+  fun checkBiometricAvailability(): BiometricAvailability =
+    BiometricHelper.checkAvailability(context)
 
   private fun getOrCreateKeystoreKey(alias: String = KEY_ALIAS): SecretKey {
     val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
@@ -101,17 +72,28 @@ class KeystoreManager(
     return Base64.encodeToString(iv + encrypted, Base64.NO_WRAP)
   }
 
-  fun unwrapDekWithKeystore(wrappedBase64: String): SecretKey {
+  fun prepareDekUnwrapCipher(wrappedBase64: String): Cipher {
     val masterKey = overrideTestMasterKey ?: getOrCreateKeystoreKey(KEY_ALIAS)
     val payload = Base64.decode(wrappedBase64, Base64.NO_WRAP)
     require(payload.size > IV_BYTES + 16) { "Corrupted keystore wrapped payload" }
     val iv = payload.copyOfRange(0, IV_BYTES)
-    val ciphertext = payload.copyOfRange(IV_BYTES, payload.size)
     val cipher = Cipher.getInstance("AES/GCM/NoPadding")
     cipher.init(Cipher.DECRYPT_MODE, masterKey, GCMParameterSpec(GCM_TAG_BITS, iv))
+    return cipher
+  }
+
+  fun finishUnwrapDekWithCipher(wrappedBase64: String, cipher: Cipher): SecretKey {
+    val payload = Base64.decode(wrappedBase64, Base64.NO_WRAP)
+    require(payload.size > IV_BYTES + 16) { "Corrupted keystore wrapped payload" }
     cipher.updateAAD("VLK1-KS".toByteArray(StandardCharsets.UTF_8))
+    val ciphertext = payload.copyOfRange(IV_BYTES, payload.size)
     val rawKey = cipher.doFinal(ciphertext)
     return AesFolderCipher.secretKeyFromBytes(rawKey)
+  }
+
+  fun unwrapDekWithKeystore(wrappedBase64: String): SecretKey {
+    val cipher = prepareDekUnwrapCipher(wrappedBase64)
+    return finishUnwrapDekWithCipher(wrappedBase64, cipher)
   }
 
   fun encryptAuditPayload(plaintext: ByteArray, overrideKey: SecretKey? = null): ByteArray {

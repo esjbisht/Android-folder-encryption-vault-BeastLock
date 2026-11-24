@@ -6,8 +6,9 @@
    See https://developer.android.com/about/versions/12/backup-restore
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <exclude domain="file" path=".beastlock_private"/>
+    <exclude domain="file" path=".beastlock_keystore"/>
+    <exclude domain="file" path="vaults"/>
+    <exclude domain="file" path="security"/>
+    <exclude domain="database" path="vaultlock_db"/>
 </full-backup-content>

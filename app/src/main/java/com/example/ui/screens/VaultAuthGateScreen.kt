@@ -20,11 +20,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Dialpad
 import androidx.compose.material.icons.rounded.Fingerprint
 import androidx.compose.material.icons.rounded.Gesture
 import androidx.compose.material.icons.rounded.HelpOutline
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Pin
+import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilledTonalButton
@@ -52,9 +54,11 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.crypto.BiometricAvailability
+import com.example.data.preferences.PrimaryLockType
 import com.example.data.preferences.SecuritySettings
 import com.example.ui.components.NumericPinKeypad
 import com.example.ui.components.PatternLockGrid
@@ -68,17 +72,38 @@ fun VaultAuthGateScreen(
   biometricAvailability: BiometricAvailability,
   authError: String?,
   recoveryError: String?,
+  biometricFallbackTrigger: Int = 0,
+  biometricFallbackReason: String? = null,
   onPinSubmitted: (String) -> Unit,
   onPatternSubmitted: (List<Int>) -> Unit,
   onRequestBiometricPrompt: () -> Unit,
-  onRecoverPin: (answer1: String, answer2: String, newPin: String) -> Unit,
+  onRecoverCredentials: (
+    answer1: String,
+    answer2: String,
+    newPin: String?,
+    newPatternNodes: List<Int>?,
+    targetLockType: PrimaryLockType,
+  ) -> Unit,
   onSelectThemeMode: (ThemeMode) -> Unit,
   onClearErrors: () -> Unit,
 ) {
   var enteredPin by remember { mutableStateOf("") }
   var showRecoveryDialog by remember { mutableStateOf(false) }
-  var usePatternMode by remember(settings.hasPatternLock, settings.preferPatternFallback) {
-    mutableStateOf(settings.hasPatternLock && settings.preferPatternFallback)
+
+  val hasBothPinAndPattern = settings.hasPinCredential && settings.hasPatternLock
+  var usePatternMode by remember(
+    settings.hasPatternLock,
+    settings.hasPinCredential,
+    settings.primaryLockType,
+    settings.preferPatternFallback,
+  ) {
+    mutableStateOf(
+      when {
+        !settings.hasPinCredential && settings.hasPatternLock -> true
+        settings.hasPatternLock && (settings.primaryLockType == PrimaryLockType.PATTERN || settings.preferPatternFallback) -> true
+        else -> false
+      },
+    )
   }
   var localPatternHint by remember { mutableStateOf<String?>(null) }
 
@@ -88,9 +113,22 @@ fun VaultAuthGateScreen(
   val canUseBiometrics = biometricsSupported &&
     (settings.biometricEnabled || (settings.wasAutoLocked && settings.requireBiometricAfterAutoLock))
 
+  val expectedPinDigits = settings.pinLength.let { if (it == 4) 4 else 6 }
+
   LaunchedEffect(canUseBiometrics, settings.wasAutoLocked, settings.wasPanicLocked) {
     if (canUseBiometrics && !settings.wasPanicLocked) {
       onRequestBiometricPrompt()
+    }
+  }
+
+  LaunchedEffect(biometricFallbackTrigger) {
+    if (biometricFallbackTrigger > 0) {
+      if (settings.hasPatternLock && (settings.primaryLockType == PrimaryLockType.PATTERN || !settings.hasPinCredential || settings.preferPatternFallback)) {
+        usePatternMode = true
+      }
+      if (!biometricFallbackReason.isNullOrBlank()) {
+        localPatternHint = biometricFallbackReason
+      }
     }
   }
 
@@ -184,16 +222,45 @@ fun VaultAuthGateScreen(
             )
           }
         }
+        if (canUseBiometrics) {
+          Spacer(modifier = Modifier.height(8.dp))
+          Surface(
+            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+            shape = MaterialTheme.shapes.small,
+            modifier = Modifier.testTag("auth_secondary_method_badge"),
+          ) {
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.spacedBy(6.dp),
+              modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            ) {
+              Icon(
+                imageVector = Icons.Rounded.VerifiedUser,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+              )
+              Text(
+                text = "Biometrics + ${settings.primaryLockType.label} Ready",
+                style = MaterialTheme.typography.labelSmall,
+              )
+            }
+          }
+        }
         Spacer(modifier = Modifier.height(10.dp))
         val activeError = localPatternHint ?: authError
         val subtitleText = when {
           activeError != null -> activeError
           usePatternMode && settings.hasPatternLock ->
-            if (canUseBiometrics) "Draw your Unlock Pattern or use biometrics" else "Draw your Unlock Pattern (fallback active)"
-          settings.hasPatternLock ->
-            if (canUseBiometrics) "Enter your 6-digit PIN, Pattern, or use biometrics" else "Enter your 6-digit PIN or switch to Pattern"
-          canUseBiometrics -> "Enter your 6-digit Master PIN or use biometrics"
-          else -> "Enter your 6-digit Master PIN (non-biometric access)"
+            if (canUseBiometrics) "Draw your 3×3 Pattern or use biometrics" else "Draw your 3×3 Unlock Pattern"
+          hasBothPinAndPattern ->
+            if (canUseBiometrics) {
+              "Enter your $expectedPinDigits-digit PIN, 3×3 Pattern, or biometrics"
+            } else {
+              "Enter your $expectedPinDigits-digit PIN or switch to Pattern"
+            }
+          canUseBiometrics -> "Enter your $expectedPinDigits-digit Master PIN or use biometrics"
+          else -> "Enter your $expectedPinDigits-digit Master PIN"
         }
         Text(
           text = subtitleText,
@@ -211,10 +278,10 @@ fun VaultAuthGateScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(16.dp),
       ) {
-        if (settings.hasPatternLock) {
+        if (hasBothPinAndPattern) {
           SingleChoiceSegmentedButtonRow(
             modifier = Modifier
-              .widthIn(max = 260.dp)
+              .widthIn(max = 280.dp)
               .fillMaxWidth()
               .testTag("auth_method_switcher"),
           ) {
@@ -231,7 +298,7 @@ fun VaultAuthGateScreen(
               },
               modifier = Modifier.testTag("auth_switch_pin"),
             ) {
-              Text("PIN")
+              Text("${expectedPinDigits}-Digit PIN")
             }
             SegmentedButton(
               selected = usePatternMode,
@@ -247,7 +314,7 @@ fun VaultAuthGateScreen(
               },
               modifier = Modifier.testTag("auth_switch_pattern"),
             ) {
-              Text("Pattern")
+              Text("3×3 Pattern")
             }
           }
         }
@@ -255,7 +322,12 @@ fun VaultAuthGateScreen(
         if (usePatternMode && settings.hasPatternLock) {
           PatternLockGrid(
             isError = localPatternHint != null || authError != null,
-            helperText = "Draw 3×3 Unlock Pattern (min 4 dots)",
+            stealthMode = settings.patternStealthMode,
+            helperText = if (settings.patternStealthMode) {
+              "Stealth Pattern active (path hidden • min 4 dots)"
+            } else {
+              "Draw 3×3 Unlock Pattern (min 4 dots)"
+            },
             onPatternCompleted = { nodes ->
               if (nodes.size < 4) {
                 localPatternHint = "Connect at least 4 dots to unlock."
@@ -269,17 +341,18 @@ fun VaultAuthGateScreen(
           )
         } else {
           PinDotsIndicator(
+            totalDigits = expectedPinDigits,
             enteredDigits = enteredPin.length,
             isError = authError != null,
           )
 
           NumericPinKeypad(
             onDigit = { digit ->
-              if (enteredPin.length < 6) {
+              if (enteredPin.length < expectedPinDigits) {
                 localPatternHint = null
                 onClearErrors()
                 enteredPin += digit
-                if (enteredPin.length == 6) {
+                if (enteredPin.length == expectedPinDigits) {
                   onPinSubmitted(enteredPin)
                 }
               }
@@ -323,7 +396,7 @@ fun VaultAuthGateScreen(
               modifier = Modifier.size(18.dp),
             )
             Spacer(modifier = Modifier.width(6.dp))
-            Text("Forgot PIN? Recover with Security Questions")
+            Text("Forgot Lock? Recover with Security Questions")
           }
         }
       }
@@ -341,7 +414,8 @@ fun VaultAuthGateScreen(
   }
 
   if (showRecoveryDialog) {
-    PinRecoveryDialog(
+    CredentialRecoveryDialog(
+      initialLockType = settings.primaryLockType,
       question1 = settings.securityQuestion1,
       question2 = settings.securityQuestion2,
       errorMessage = recoveryError,
@@ -349,31 +423,43 @@ fun VaultAuthGateScreen(
         onClearErrors()
         showRecoveryDialog = false
       },
-      onSubmitRecovery = { a1, a2, newPin ->
-        onRecoverPin(a1, a2, newPin)
+      onSubmitRecovery = { a1, a2, newPin, newPattern, targetType ->
+        onRecoverCredentials(a1, a2, newPin, newPattern, targetType)
       },
     )
   }
 }
 
 @Composable
-private fun PinRecoveryDialog(
+private fun CredentialRecoveryDialog(
+  initialLockType: PrimaryLockType,
   question1: String,
   question2: String,
   errorMessage: String?,
   onDismiss: () -> Unit,
-  onSubmitRecovery: (answer1: String, answer2: String, newPin: String) -> Unit,
+  onSubmitRecovery: (
+    answer1: String,
+    answer2: String,
+    newPin: String?,
+    newPattern: List<Int>?,
+    targetType: PrimaryLockType,
+  ) -> Unit,
 ) {
   var answer1 by remember { mutableStateOf("") }
   var answer2 by remember { mutableStateOf("") }
+  var resetMode by remember { mutableStateOf(initialLockType) }
   var newPin by remember { mutableStateOf("") }
   var confirmPin by remember { mutableStateOf("") }
+  var patternDraft by remember { mutableStateOf<List<Int>?>(null) }
+  var confirmedPattern by remember { mutableStateOf<List<Int>?>(null) }
   var localError by remember { mutableStateOf<String?>(null) }
+
+  val targetPinDigits = if (resetMode == PrimaryLockType.PIN_4) 4 else 6
 
   AlertDialog(
     onDismissRequest = onDismiss,
     title = {
-      Text("Recover Master PIN", style = MaterialTheme.typography.titleLarge)
+      Text("Recover Vault Access", style = MaterialTheme.typography.titleLarge)
     },
     text = {
       Column(
@@ -381,7 +467,7 @@ private fun PinRecoveryDialog(
         modifier = Modifier.verticalScroll(rememberScrollState()),
       ) {
         Text(
-          text = "Answer both security questions to unwrap your AES-256 vault key and assign a new 6-digit PIN.",
+          text = "Answer both security questions to unwrap your AES-256 vault key and set a new lock credential.",
           style = MaterialTheme.typography.bodySmall,
           color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -411,36 +497,95 @@ private fun PinRecoveryDialog(
             .fillMaxWidth()
             .testTag("recover_dialog_a2"),
         )
-        OutlinedTextField(
-          value = newPin,
-          onValueChange = {
-            if (it.length <= 6 && it.all(Char::isDigit)) {
-              newPin = it
-              localError = null
+
+        Text("New Lock Type", style = MaterialTheme.typography.labelMedium)
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+          val types = listOf(
+            Triple(PrimaryLockType.PATTERN, "Pattern", Icons.Rounded.Gesture),
+            Triple(PrimaryLockType.PIN_4, "4-PIN", Icons.Rounded.Dialpad),
+            Triple(PrimaryLockType.PIN_6, "6-PIN", Icons.Rounded.Pin),
+          )
+          types.forEachIndexed { idx, (type, label, icon) ->
+            SegmentedButton(
+              selected = resetMode == type,
+              onClick = {
+                resetMode = type
+                newPin = ""
+                confirmPin = ""
+                patternDraft = null
+                confirmedPattern = null
+                localError = null
+              },
+              shape = SegmentedButtonDefaults.itemShape(index = idx, count = types.size),
+              icon = { Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp)) },
+            ) {
+              Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-          },
-          label = { Text("New 6-digit PIN") },
-          visualTransformation = PasswordVisualTransformation(),
-          singleLine = true,
-          modifier = Modifier
-            .fillMaxWidth()
-            .testTag("recover_dialog_new_pin"),
-        )
-        OutlinedTextField(
-          value = confirmPin,
-          onValueChange = {
-            if (it.length <= 6 && it.all(Char::isDigit)) {
-              confirmPin = it
-              localError = null
-            }
-          },
-          label = { Text("Confirm new 6-digit PIN") },
-          visualTransformation = PasswordVisualTransformation(),
-          singleLine = true,
-          modifier = Modifier
-            .fillMaxWidth()
-            .testTag("recover_dialog_confirm_pin"),
-        )
+          }
+        }
+
+        if (resetMode == PrimaryLockType.PATTERN) {
+          PatternLockGrid(
+            isError = localError != null,
+            helperText = when {
+              confirmedPattern != null -> "New pattern confirmed (${confirmedPattern!!.size} dots)"
+              patternDraft != null -> "Redraw the same 3×3 pattern to confirm"
+              else -> "Draw new 3×3 pattern (min 4 dots)"
+            },
+            onPatternCompleted = { nodes ->
+              if (nodes.size < 4) {
+                localError = "Connect at least 4 dots."
+                return@PatternLockGrid
+              }
+              val first = patternDraft
+              if (first == null) {
+                patternDraft = nodes
+                confirmedPattern = null
+                localError = null
+              } else if (first == nodes) {
+                confirmedPattern = nodes
+                localError = null
+              } else {
+                localError = "Patterns didn't match. Draw again."
+                patternDraft = null
+                confirmedPattern = null
+              }
+            },
+            modifier = Modifier.testTag("recover_dialog_pattern_grid"),
+          )
+        } else {
+          OutlinedTextField(
+            value = newPin,
+            onValueChange = {
+              if (it.length <= targetPinDigits && it.all(Char::isDigit)) {
+                newPin = it
+                localError = null
+              }
+            },
+            label = { Text("New $targetPinDigits-digit PIN") },
+            visualTransformation = PasswordVisualTransformation(),
+            singleLine = true,
+            modifier = Modifier
+              .fillMaxWidth()
+              .testTag("recover_dialog_new_pin"),
+          )
+          OutlinedTextField(
+            value = confirmPin,
+            onValueChange = {
+              if (it.length <= targetPinDigits && it.all(Char::isDigit)) {
+                confirmPin = it
+                localError = null
+              }
+            },
+            label = { Text("Confirm new $targetPinDigits-digit PIN") },
+            visualTransformation = PasswordVisualTransformation(),
+            singleLine = true,
+            modifier = Modifier
+              .fillMaxWidth()
+              .testTag("recover_dialog_confirm_pin"),
+          )
+        }
+
         val err = localError ?: errorMessage
         if (err != null) {
           Text(
@@ -457,14 +602,22 @@ private fun PinRecoveryDialog(
         onClick = {
           when {
             answer1.isBlank() || answer2.isBlank() -> localError = "Answer both questions."
-            newPin.length != 6 -> localError = "New PIN must be 6 digits."
+            resetMode == PrimaryLockType.PATTERN -> {
+              val pat = confirmedPattern
+              if (pat == null) {
+                localError = "Draw and confirm your new 3×3 pattern first."
+              } else {
+                onSubmitRecovery(answer1, answer2, null, pat, PrimaryLockType.PATTERN)
+              }
+            }
+            newPin.length != targetPinDigits -> localError = "New PIN must be $targetPinDigits digits."
             newPin != confirmPin -> localError = "New PINs do not match."
-            else -> onSubmitRecovery(answer1, answer2, newPin)
+            else -> onSubmitRecovery(answer1, answer2, newPin, null, resetMode)
           }
         },
         modifier = Modifier.testTag("recover_dialog_submit"),
       ) {
-        Text("Reset PIN & Unlock")
+        Text("Reset & Unlock")
       }
     },
     dismissButton = {

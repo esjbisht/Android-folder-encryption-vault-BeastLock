@@ -46,6 +46,7 @@ fun PatternLockGrid(
   modifier: Modifier = Modifier,
   isError: Boolean = false,
   enabled: Boolean = true,
+  stealthMode: Boolean = false,
   helperText: String = "Draw pattern (connect at least 4 dots)",
 ) {
   val haptic = LocalHapticFeedback.current
@@ -165,8 +166,8 @@ fun PatternLockGrid(
           val activeDotRadiusPx = 12.dp.toPx()
           val haloRadiusPx = 23.dp.toPx()
 
-          // Draw connecting path segments between selected nodes
-          if (selectedNodes.size >= 2) {
+          // Draw connecting path segments between selected nodes (hidden in stealth mode unless error)
+          if ((!stealthMode || isError) && selectedNodes.size >= 2) {
             for (i in 0 until selectedNodes.size - 1) {
               val start = centers[selectedNodes[i]]
               val end = centers[selectedNodes[i + 1]]
@@ -187,10 +188,10 @@ fun PatternLockGrid(
             }
           }
 
-          // Trailing line to active finger position
+          // Trailing line to active finger position (hidden in stealth mode)
           val lastIdx = selectedNodes.lastOrNull()
           val dragPos = pointerOffset
-          if (lastIdx != null && dragPos != null) {
+          if ((!stealthMode || isError) && lastIdx != null && dragPos != null) {
             drawLine(
               color = activeColor.copy(alpha = 0.65f),
               start = centers[lastIdx],
@@ -204,7 +205,7 @@ fun PatternLockGrid(
           for (idx in centers.indices) {
             val center = centers[idx]
             val isSelected = idx in selectedNodes
-            if (isSelected) {
+            if (isSelected && (!stealthMode || isError)) {
               drawCircle(
                 color = activeColor.copy(alpha = 0.16f),
                 radius = haloRadiusPx,
@@ -222,6 +223,18 @@ fun PatternLockGrid(
               drawCircle(
                 color = activeColor,
                 radius = activeDotRadiusPx,
+                center = center,
+              )
+            } else if (isSelected && stealthMode) {
+              // Subtle tactile pulse without revealing full shape
+              drawCircle(
+                color = surfaceDotColor,
+                radius = baseRadiusPx + 6.dp.toPx(),
+                center = center,
+              )
+              drawCircle(
+                color = activeColor.copy(alpha = 0.45f),
+                radius = baseRadiusPx + 1.dp.toPx(),
                 center = center,
               )
             } else {

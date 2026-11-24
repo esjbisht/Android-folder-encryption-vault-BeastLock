@@ -15,6 +15,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,6 +27,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -37,11 +39,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.BatteryAlert
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Checklist
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CloudOff
 import androidx.compose.material.icons.rounded.CloudSync
-import androidx.compose.material.icons.rounded.CreateNewFolder
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.DriveFileRenameOutline
 import androidx.compose.material.icons.rounded.Folder
@@ -50,9 +52,11 @@ import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.PieChart
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.VerifiedUser
+import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -74,6 +78,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -91,26 +97,35 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.crypto.UriPermissionStatus
 import com.example.data.local.VaultFolderEntity
+import com.example.data.preferences.StealthGestureMode
 import com.example.ui.FolderFilter
 import com.example.ui.VaultUiState
 import com.example.ui.components.BatchFolderRenameDialog
 import com.example.ui.components.ConfirmRemoveFoldersDialog
+import com.example.ui.components.FolderPickerPreviewSheet
+import com.example.ui.components.PermissionStatusPill
 import com.example.ui.components.ThemeModeDropdownButton
 import com.example.ui.components.VaultStatusBadge
 import com.example.ui.components.formatByteSize
 import com.example.ui.components.formatTimestamp
 import com.example.ui.theme.ThemeMode
 
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun VaultDashboardScreen(
   state: VaultUiState,
   onSelectFilter: (FolderFilter) -> Unit,
   onSearchQueryChange: (String) -> Unit,
   onPickDeviceFolder: (Uri) -> Unit,
+  onPreviewPickedFolder: (Uri) -> Unit = onPickDeviceFolder,
+  onUpdateFolderPickerOptions: (obfuscateFilenames: Boolean, requireAuthOnOpen: Boolean) -> Unit = { _, _ -> },
+  onConfirmFolderPickerPreview: (encryptNow: Boolean) -> Unit = {},
+  onDismissFolderPickerPreview: () -> Unit = {},
+  onRegrantFolderPermission: (folderId: String, treeUri: Uri) -> Unit = { _, _ -> },
   onDecryptAnyDeviceFolder: (Uri) -> Unit,
-  onCreatePrivateFolder: (String) -> Unit,
+  onCreatePrivateFolder: (String) -> Unit = {},
   onOpenFolder: (String) -> Unit,
   onToggleLockFolder: (VaultFolderEntity) -> Unit,
   onRemoveFolder: (folderId: String, decryptLockedSafFirst: Boolean) -> Unit,
@@ -126,15 +141,19 @@ fun VaultDashboardScreen(
   onSetSelectedAutoCloudSync: (enabled: Boolean) -> Unit,
   onBatchRenameFolders: (Map<String, String>) -> Unit,
   onOpenStorageCharts: () -> Unit,
+  onOpenDiagnostics: () -> Unit = {},
+  onTriggerStealthGesture: () -> Unit = {},
   onLockVaultNow: () -> Unit,
   onSelectThemeMode: (ThemeMode) -> Unit,
   modifier: Modifier = Modifier,
 ) {
-  var showNewFolderDialog by remember { mutableStateOf(false) }
   var showReencryptConfirmDialog by remember { mutableStateOf(false) }
   var showBatchFolderRenameDialog by remember { mutableStateOf(false) }
   var pendingRemoveFolders by remember { mutableStateOf<List<VaultFolderEntity>>(emptyList()) }
   var isRemovingBatchFolders by remember { mutableStateOf(false) }
+  var pendingRegrantFolderId by remember { mutableStateOf<String?>(null) }
+  val haptic = LocalHapticFeedback.current
+  val publicFolders = state.publicFolders
 
   BackHandler(enabled = state.isSelectionMode) {
     onClearSelection()
@@ -144,7 +163,17 @@ fun VaultDashboardScreen(
     contract = ActivityResultContracts.OpenDocumentTree(),
   ) { uri ->
     if (uri != null) {
-      onPickDeviceFolder(uri)
+      onPreviewPickedFolder(uri)
+    }
+  }
+
+  val regrantFolderLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.OpenDocumentTree(),
+  ) { uri ->
+    val targetFolderId = pendingRegrantFolderId
+    pendingRegrantFolderId = null
+    if (uri != null && targetFolderId != null) {
+      onRegrantFolderPermission(targetFolderId, uri)
     }
   }
 
@@ -156,8 +185,8 @@ fun VaultDashboardScreen(
     }
   }
 
-  val selectedFolders = remember(state.folders, state.selectedFolderIds) {
-    state.folders.filter { it.id in state.selectedFolderIds }
+  val selectedFolders = remember(publicFolders, state.selectedFolderIds) {
+    publicFolders.filter { it.id in state.selectedFolderIds }
   }
   val unlockedSelectedCount = remember(selectedFolders) {
     selectedFolders.count { !it.isLocked || it.encryptedFileCount < it.fileCount }
@@ -220,12 +249,50 @@ fun VaultDashboardScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 modifier = Modifier.fillMaxWidth(),
               ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                var tripleTapCount by remember { mutableIntStateOf(0) }
+                var lastTapAt by remember { mutableLongStateOf(0L) }
+                val stealthInteraction = remember { MutableInteractionSource() }
+                val stealthModifier = if (state.securitySettings.stealthGestureMode == StealthGestureMode.LONG_PRESS_SHIELD) {
+                  Modifier
+                    .heightIn(min = 48.dp)
+                    .combinedClickable(
+                      interactionSource = stealthInteraction,
+                      indication = null,
+                      onClick = {},
+                      onLongClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onTriggerStealthGesture()
+                      },
+                    )
+                    .testTag("hero_stealth_trigger")
+                } else {
+                  Modifier
+                    .heightIn(min = 48.dp)
+                    .clickable(
+                      interactionSource = stealthInteraction,
+                      indication = null,
+                    ) {
+                      val now = System.currentTimeMillis()
+                      tripleTapCount = if (now - lastTapAt <= 900L) tripleTapCount + 1 else 1
+                      lastTapAt = now
+                      if (tripleTapCount >= 3) {
+                        tripleTapCount = 0
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onTriggerStealthGesture()
+                      }
+                    }
+                    .testTag("hero_stealth_trigger")
+                }
+
+                Row(
+                  verticalAlignment = Alignment.CenterVertically,
+                  modifier = stealthModifier,
+                ) {
                   Icon(
                     imageVector = Icons.Rounded.VerifiedUser,
-                    contentDescription = null,
+                    contentDescription = "BeastLock security badge",
                     tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(20.dp),
+                    modifier = Modifier.size(22.dp),
                   )
                   Spacer(modifier = Modifier.width(8.dp))
                   Text(
@@ -260,10 +327,10 @@ fun VaultDashboardScreen(
               }
 
               Text(
-                text = if (state.folders.isEmpty()) {
+                text = if (publicFolders.isEmpty()) {
                   "Protect Any Android Folder"
                 } else {
-                  "${state.lockedFoldersCount} of ${state.folders.size} Folders Sealed"
+                  "${state.lockedFoldersCount} of ${publicFolders.size} Folders Sealed"
                 },
                 style = MaterialTheme.typography.headlineMedium,
                 color = Color.White,
@@ -358,36 +425,65 @@ fun VaultDashboardScreen(
         }
       }
 
-      // Primary Action Row: Pick any Android folder via SAF, Create private vault folder, or Decrypt any folder
+      // Pending Diagnostics / Dual Key Alert Strip
+      if (state.pendingIssuesCount > 0 || state.securitySettings.dualKeyTamperAlert.isNotBlank()) {
+        item(key = "diagnostics_alert_banner") {
+          Surface(
+            color = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+            shape = MaterialTheme.shapes.medium,
+            modifier = Modifier
+              .fillMaxWidth()
+              .clip(MaterialTheme.shapes.medium)
+              .clickable(onClick = onOpenDiagnostics)
+              .testTag("dashboard_diagnostics_alert_card"),
+          ) {
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            ) {
+              Icon(
+                imageVector = Icons.Rounded.BugReport,
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+              )
+              Spacer(modifier = Modifier.width(10.dp))
+              Column(modifier = Modifier.weight(1f)) {
+                Text(
+                  text = if (state.securitySettings.dualKeyTamperAlert.isNotBlank()) {
+                    "Key Recovery Vault Alert"
+                  } else {
+                    "${state.pendingIssuesCount} System Diagnostic(s) Recorded"
+                  },
+                  style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                  text = state.securitySettings.dualKeyTamperAlert.ifBlank {
+                    "Tap to review sanitized logs & send a report on your own"
+                  },
+                  style = MaterialTheme.typography.bodySmall,
+                  maxLines = 2,
+                  overflow = TextOverflow.Ellipsis,
+                )
+              }
+            }
+          }
+        }
+      }
+
+      // Primary Action Row: Pick any Android folder via SAF or Decrypt any folder
       item(key = "actions_row") {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-          Row(
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            modifier = Modifier.fillMaxWidth(),
+          Button(
+            onClick = { openFolderLauncher.launch(null) },
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+            modifier = Modifier
+              .fillMaxWidth()
+              .testTag("pick_device_folder_button"),
           ) {
-            Button(
-              onClick = { openFolderLauncher.launch(null) },
-              contentPadding = PaddingValues(horizontal = 14.dp, vertical = 14.dp),
-              modifier = Modifier
-                .weight(1f)
-                .testTag("pick_device_folder_button"),
-            ) {
-              Icon(Icons.Rounded.FolderOpen, contentDescription = null, modifier = Modifier.size(19.dp))
-              Spacer(modifier = Modifier.width(8.dp))
-              Text("Lock Device Folder", maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-
-            FilledTonalButton(
-              onClick = { showNewFolderDialog = true },
-              contentPadding = PaddingValues(horizontal = 14.dp, vertical = 14.dp),
-              modifier = Modifier
-                .weight(1f)
-                .testTag("create_private_folder_button"),
-            ) {
-              Icon(Icons.Rounded.CreateNewFolder, contentDescription = null, modifier = Modifier.size(19.dp))
-              Spacer(modifier = Modifier.width(8.dp))
-              Text("Private Folder", maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
+            Icon(Icons.Rounded.FolderOpen, contentDescription = null, modifier = Modifier.size(19.dp))
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Lock Device Folder (Internal / External)", maxLines = 1, overflow = TextOverflow.Ellipsis)
           }
 
           OutlinedButton(
@@ -405,7 +501,7 @@ fun VaultDashboardScreen(
       }
 
       // Storage Split Summary Strip (links to full Visualization Dashboard)
-      if (state.folders.isNotEmpty()) {
+      if (publicFolders.isNotEmpty()) {
         item(key = "storage_split_preview") {
           StorageUsagePreviewCard(
             encryptedBytes = state.totalEncryptedBytes,
@@ -415,47 +511,49 @@ fun VaultDashboardScreen(
         }
       }
 
-      // Search & Filter Controls
-      if (state.folders.isNotEmpty() || state.searchQuery.isNotBlank()) {
-        item(key = "search_filters") {
-          Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedTextField(
-              value = state.searchQuery,
-              onValueChange = onSearchQueryChange,
-              placeholder = { Text("Search by name or status (locked / unlocked)...") },
-              leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
-              trailingIcon = {
-                if (state.searchQuery.isNotEmpty()) {
-                  IconButton(
-                    onClick = { onSearchQueryChange("") },
-                    modifier = Modifier.testTag("clear_folder_search_button"),
-                  ) {
-                    Icon(
-                      imageVector = Icons.Rounded.Close,
-                      contentDescription = "Clear search query",
-                    )
-                  }
-                }
-              },
-              supportingText = if (state.searchQuery.isNotBlank() || state.folderFilter != FolderFilter.ALL) {
-                {
-                  Text(
-                    text = "${state.filteredFolders.size} of ${state.folders.size} folder(s) matching",
-                    modifier = Modifier.testTag("folder_search_match_count"),
+      // Search & Filter Controls (Search bar always remains present for quick navigation & stealth access code)
+      item(key = "search_filters") {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+          OutlinedTextField(
+            value = state.searchQuery,
+            onValueChange = onSearchQueryChange,
+            placeholder = { Text("Search by folder name or status (locked / unlocked)...") },
+            leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
+            trailingIcon = {
+              if (state.searchQuery.isNotEmpty()) {
+                IconButton(
+                  onClick = { onSearchQueryChange("") },
+                  modifier = Modifier.testTag("clear_folder_search_button"),
+                ) {
+                  Icon(
+                    imageVector = Icons.Rounded.Close,
+                    contentDescription = "Clear search query",
                   )
                 }
-              } else {
-                {
-                  Text("Type a folder name or status (e.g. locked, unlocked) to filter live")
-                }
-              },
-              singleLine = true,
-              shape = MaterialTheme.shapes.medium,
-              modifier = Modifier
-                .fillMaxWidth()
-                .testTag("folder_search_input"),
-            )
+              }
+            },
+            supportingText = if (publicFolders.isNotEmpty() &&
+              (state.searchQuery.isNotBlank() || state.folderFilter != FolderFilter.ALL)
+            ) {
+              {
+                Text(
+                  text = "${state.filteredFolders.size} of ${publicFolders.size} folder(s) matching",
+                  modifier = Modifier.testTag("folder_search_match_count"),
+                )
+              }
+            } else {
+              {
+                Text("Type a folder name or status (e.g. locked, unlocked) to filter live")
+              }
+            },
+            singleLine = true,
+            shape = MaterialTheme.shapes.medium,
+            modifier = Modifier
+              .fillMaxWidth()
+              .testTag("folder_search_input"),
+          )
 
+          if (publicFolders.isNotEmpty() || state.folderFilter != FolderFilter.ALL) {
             FlowRow(
               horizontalArrangement = Arrangement.spacedBy(8.dp),
               verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -568,19 +666,19 @@ fun VaultDashboardScreen(
                 )
               }
               Text(
-                text = if (state.folders.isEmpty()) "No Protected Folders Yet" else "No Matching Folders",
+                text = if (publicFolders.isEmpty()) "No Protected Folders Yet" else "No Matching Folders",
                 style = MaterialTheme.typography.titleLarge,
               )
               Text(
-                text = if (state.folders.isEmpty()) {
-                  "Tap \"Lock Device Folder\" to select any folder from storage via Android's Storage Access Framework, or create a sandboxed Private Folder and import files."
+                text = if (publicFolders.isEmpty()) {
+                  "Tap \"Lock Device Folder\" to select any folder from internal or external storage via Android's Storage Access Framework."
                 } else {
                   "No folders matched \"${state.searchQuery.ifBlank { state.folderFilter.label }}\". Try another name or status (locked / unlocked)."
                 },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
               )
-              if (state.folders.isNotEmpty()) {
+              if (publicFolders.isNotEmpty()) {
                 OutlinedButton(
                   onClick = {
                     onSearchQueryChange("")
@@ -601,8 +699,10 @@ fun VaultDashboardScreen(
       // Folder Cards
       items(state.filteredFolders, key = { it.id }) { folder ->
         val isSelected = folder.id in state.selectedFolderIds
+        val permStatus = state.folderPermissionStatuses[folder.id]
         VaultFolderCard(
           folder = folder,
+          permissionStatus = permStatus,
           isSelectionMode = state.isSelectionMode,
           isSelected = isSelected,
           onOpen = {
@@ -617,6 +717,13 @@ fun VaultDashboardScreen(
           onRequestRemove = {
             isRemovingBatchFolders = false
             pendingRemoveFolders = listOf(folder)
+          },
+          onRegrantPermission = {
+            pendingRegrantFolderId = folder.id
+            val initialUri = runCatching {
+              Uri.parse(folder.treeUri).takeIf { it.scheme == "content" }
+            }.getOrNull()
+            regrantFolderLauncher.launch(initialUri)
           },
           onToggleAutoCloudSync = { enabled ->
             onToggleFolderAutoCloudSync(folder.id, enabled)
@@ -795,16 +902,6 @@ fun VaultDashboardScreen(
     }
   }
 
-  if (showNewFolderDialog) {
-    CreatePrivateFolderDialog(
-      onDismiss = { showNewFolderDialog = false },
-      onCreate = { name ->
-        showNewFolderDialog = false
-        onCreatePrivateFolder(name)
-      },
-    )
-  }
-
   if (showReencryptConfirmDialog && selectedFolders.isNotEmpty()) {
     ReencryptConfirmDialog(
       totalSelected = selectedFolders.size,
@@ -821,7 +918,7 @@ fun VaultDashboardScreen(
   if (showBatchFolderRenameDialog && selectedFolders.isNotEmpty()) {
     BatchFolderRenameDialog(
       selectedFolders = selectedFolders,
-      allFolders = state.folders,
+      allFolders = publicFolders,
       onDismiss = { showBatchFolderRenameDialog = false },
       onConfirm = { renameMap ->
         showBatchFolderRenameDialog = false
@@ -843,6 +940,15 @@ fun VaultDashboardScreen(
           onRemoveFolder(targets.first().id, decryptLockedSafFirst)
         }
       },
+    )
+  }
+
+  state.pendingFolderPickerPreview?.let { preview ->
+    FolderPickerPreviewSheet(
+      preview = preview,
+      onUpdateOptions = onUpdateFolderPickerOptions,
+      onConfirm = onConfirmFolderPickerPreview,
+      onDismiss = onDismissFolderPickerPreview,
     )
   }
 }
@@ -880,12 +986,14 @@ private fun StatPill(
 @Composable
 private fun VaultFolderCard(
   folder: VaultFolderEntity,
+  permissionStatus: UriPermissionStatus?,
   isSelectionMode: Boolean,
   isSelected: Boolean,
   onOpen: () -> Unit,
   onLongPress: () -> Unit,
   onToggleLock: () -> Unit,
   onRequestRemove: () -> Unit,
+  onRegrantPermission: () -> Unit,
   onToggleAutoCloudSync: (Boolean) -> Unit,
 ) {
   val haptic = LocalHapticFeedback.current
@@ -1018,6 +1126,66 @@ private fun VaultFolderCard(
         }
       }
 
+      AnimatedVisibility(visible = permissionStatus?.needsRegrant == true && !folder.isInternalVault) {
+        permissionStatus?.let { status ->
+          Surface(
+            color = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+            shape = MaterialTheme.shapes.small,
+            modifier = Modifier
+              .fillMaxWidth()
+              .padding(start = 16.dp, end = 16.dp, bottom = 12.dp)
+              .testTag("folder_permission_warning_${folder.id}"),
+          ) {
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.spacedBy(10.dp),
+              modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            ) {
+              Icon(
+                imageVector = Icons.Rounded.WarningAmber,
+                contentDescription = status.label,
+                modifier = Modifier.size(18.dp),
+              )
+              Column(modifier = Modifier.weight(1f)) {
+                Text(
+                  text = status.label,
+                  style = MaterialTheme.typography.labelMedium,
+                  fontWeight = FontWeight.Bold,
+                )
+                Text(
+                  text = if (status == UriPermissionStatus.READ_ONLY) {
+                    "Write grant missing — re-grant to encrypt or decrypt"
+                  } else {
+                    "SAF persistent folder grant lost — tap to restore"
+                  },
+                  style = MaterialTheme.typography.labelSmall,
+                  maxLines = 2,
+                  overflow = TextOverflow.Ellipsis,
+                )
+              }
+              FilledTonalButton(
+                onClick = onRegrantPermission,
+                colors = ButtonDefaults.filledTonalButtonColors(
+                  containerColor = MaterialTheme.colorScheme.error,
+                  contentColor = MaterialTheme.colorScheme.onError,
+                ),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                modifier = Modifier
+                  .heightIn(min = 48.dp)
+                  .testTag("folder_regrant_${folder.id}"),
+              ) {
+                Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Re-grant", maxLines = 1)
+              }
+            }
+          }
+        }
+      }
+
       AnimatedVisibility(visible = isSelectionMode) {
         Column(modifier = Modifier.fillMaxWidth()) {
           HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
@@ -1064,51 +1232,6 @@ private fun VaultFolderCard(
       }
     }
   }
-}
-
-@Composable
-private fun CreatePrivateFolderDialog(
-  onDismiss: () -> Unit,
-  onCreate: (String) -> Unit,
-) {
-  var name by remember { mutableStateOf("") }
-
-  AlertDialog(
-    onDismissRequest = onDismiss,
-    title = { Text("New Private Vault Folder") },
-    text = {
-      Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text(
-          text = "Creates an app-sandboxed encrypted folder where you can import photos, documents, and sensitive files.",
-          style = MaterialTheme.typography.bodySmall,
-          color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        OutlinedTextField(
-          value = name,
-          onValueChange = { name = it },
-          label = { Text("Folder Name") },
-          placeholder = { Text("e.g. Passports & Tax Docs") },
-          singleLine = true,
-          modifier = Modifier
-            .fillMaxWidth()
-            .testTag("new_private_folder_name_input"),
-        )
-      }
-    },
-    confirmButton = {
-      Button(
-        onClick = { onCreate(name.ifBlank { "Private Vault" }) },
-        modifier = Modifier.testTag("confirm_create_private_folder"),
-      ) {
-        Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-        Spacer(modifier = Modifier.width(6.dp))
-        Text("Create")
-      }
-    },
-    dismissButton = {
-      TextButton(onClick = onDismiss) { Text("Cancel") }
-    },
-  )
 }
 
 @Composable

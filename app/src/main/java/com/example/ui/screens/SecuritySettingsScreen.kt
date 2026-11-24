@@ -1,6 +1,10 @@
 package com.example.ui.screens
 
+import android.net.Uri
 import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -15,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -25,12 +30,17 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.BatteryAlert
 import androidx.compose.material.icons.rounded.BatterySaver
 import androidx.compose.material.icons.rounded.BrightnessAuto
+import androidx.compose.material.icons.rounded.BugReport
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.CleaningServices
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.DarkMode
+import androidx.compose.material.icons.rounded.Dialpad
 import androidx.compose.material.icons.rounded.DriveFileMove
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.EnhancedEncryption
 import androidx.compose.material.icons.rounded.Fingerprint
+import androidx.compose.material.icons.rounded.FolderSpecial
 import androidx.compose.material.icons.rounded.Gesture
 import androidx.compose.material.icons.rounded.HelpOutline
 import androidx.compose.material.icons.rounded.Home
@@ -39,20 +49,29 @@ import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockClock
 import androidx.compose.material.icons.rounded.Palette
+import androidx.compose.material.icons.rounded.Pin
 import androidx.compose.material.icons.rounded.Shield
+import androidx.compose.material.icons.rounded.Screenshot
 import androidx.compose.material.icons.rounded.Timer
+import androidx.compose.material.icons.rounded.TouchApp
 import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material.icons.rounded.Vibration
 import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material.icons.rounded.Widgets
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SegmentedButton
@@ -64,21 +83,29 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.crypto.BiometricAvailability
+import com.example.crypto.DualKeyMirrorStatus
+import com.example.data.preferences.PrimaryLockType
+import com.example.data.preferences.SecurityPreferencesRepository
 import com.example.data.preferences.SecuritySettings
+import com.example.data.preferences.StealthGestureMode
 import com.example.security.DevicePowerState
 import com.example.security.PanicSensitivity
 import com.example.ui.components.PatternLockGrid
 import com.example.ui.components.formatByteSize
+import com.example.ui.components.formatTimestamp
 import com.example.ui.theme.ThemeMode
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -94,7 +121,10 @@ fun SecuritySettingsScreen(
   isScanningOrphans: Boolean,
   isScanningIntegrity: Boolean,
   lastIntegrityCorruptedCount: Int?,
+  dualKeyStatus: DualKeyMirrorStatus?,
+  pendingIssuesCount: Int,
   onToggleBiometric: (Boolean) -> Unit,
+  onSelectPrimaryLockType: (PrimaryLockType) -> Unit,
   onToggleAutoLockEnabled: (Boolean) -> Unit,
   onSelectAutoLockSeconds: (Int) -> Unit,
   onToggleAutoLockReencrypt: (Boolean) -> Unit,
@@ -116,10 +146,26 @@ fun SecuritySettingsScreen(
   onSavePattern: (nodes: List<Int>, onDone: (Boolean) -> Unit) -> Unit,
   onRemovePattern: () -> Unit,
   onTogglePreferPatternFallback: (Boolean) -> Unit,
-  onUpdateRecoveryQuestions: (q1: String, a1: String, q2: String, a2: String, onDone: () -> Unit) -> Unit,
+  onTogglePatternStealthMode: (Boolean) -> Unit,
+  onUpdateRecoveryQuestions: (
+    q1: String,
+    a1: String,
+    q2: String,
+    a2: String,
+    customQuestionsToShare: List<String>,
+    shareCustomSuggestions: Boolean,
+    onDone: () -> Unit,
+  ) -> Unit,
+  onLinkExternalDualKeyFolder: (Uri) -> Unit,
+  onVerifyDualKeyVault: () -> Unit,
+  onOpenDiagnostics: () -> Unit,
   onOpenOrphanCleanup: () -> Unit,
   onOpenIntegrityDiagnostic: () -> Unit,
   onOpenMigrateOut: () -> Unit,
+  onSelectStealthGestureMode: (StealthGestureMode) -> Unit = {},
+  onToggleAlwaysBlockScreenshots: (Boolean) -> Unit = {},
+  onChangeStealthCode: (newCode: String, onDone: (Boolean) -> Unit) -> Unit = { _, done -> done(false) },
+  onOpenStealthVault: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   var showChangePinDialog by remember { mutableStateOf(false) }
@@ -128,6 +174,15 @@ fun SecuritySettingsScreen(
   var showOpenSourceSpecDialog by remember { mutableStateOf(false) }
   var showCustomDurationDialog by remember { mutableStateOf(false) }
   var showCustomIdleDurationDialog by remember { mutableStateOf(false) }
+  var showChangeStealthCodeDialog by remember { mutableStateOf(false) }
+
+  val dualKeyExternalPicker = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.OpenDocumentTree(),
+  ) { uri ->
+    if (uri != null) {
+      onLinkExternalDualKeyFolder(uri)
+    }
+  }
 
   val bioSupported = biometricAvailability == BiometricAvailability.AVAILABLE_STRONG ||
     biometricAvailability == BiometricAvailability.AVAILABLE_WEAK_OR_DEVICE
@@ -200,6 +255,105 @@ fun SecuritySettingsScreen(
                 onCheckedChange = onToggleObfuscateDefault,
                 modifier = Modifier.testTag("settings_obfuscate_switch"),
               )
+            }
+          }
+        }
+      }
+
+      // Stealth Private Vault & Screen Protection
+      item(key = "stealth_vault_card") {
+        Card(
+          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+          modifier = Modifier
+            .fillMaxWidth()
+            .testTag("settings_stealth_vault_card"),
+        ) {
+          Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+              Icon(Icons.Rounded.VisibilityOff, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+              Spacer(modifier = Modifier.width(12.dp))
+              Column(modifier = Modifier.weight(1f)) {
+                Text("Stealth Private Vault", style = MaterialTheme.typography.titleSmall)
+                Text(
+                  text = "Private folders stay hidden from Dashboard, Search & Analytics; encrypted with .nomedia & auto-sealed on exit.",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              }
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Rounded.TouchApp, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Dashboard Hero Shield Gesture", style = MaterialTheme.typography.labelLarge)
+              }
+              FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+              ) {
+                StealthGestureMode.entries.forEach { mode ->
+                  FilterChip(
+                    selected = settings.stealthGestureMode == mode,
+                    onClick = { onSelectStealthGestureMode(mode) },
+                    label = { Text(mode.label) },
+                    modifier = Modifier.testTag("stealth_gesture_${mode.name.lowercase()}"),
+                  )
+                }
+              }
+            }
+
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              modifier = Modifier
+                .fillMaxWidth()
+                .clickable { showChangeStealthCodeDialog = true }
+                .padding(vertical = 4.dp)
+                .testTag("settings_change_stealth_code_row"),
+            ) {
+              Icon(Icons.Rounded.Code, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+              Spacer(modifier = Modifier.width(12.dp))
+              Column(modifier = Modifier.weight(1f)) {
+                Text("Stealth Search Access Code", style = MaterialTheme.typography.titleSmall)
+                Text(
+                  text = if (settings.hasCustomStealthCode) {
+                    "Custom hashed code active • Type in Dashboard search bar to open"
+                  } else {
+                    "Default (${SecurityPreferencesRepository.DEFAULT_STEALTH_CODE}) • Tap to set custom code"
+                  },
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              }
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+              Icon(Icons.Rounded.Screenshot, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+              Spacer(modifier = Modifier.width(12.dp))
+              Column(modifier = Modifier.weight(1f)) {
+                Text("Always Block Screenshots & Previews", style = MaterialTheme.typography.titleSmall)
+                Text(
+                  text = "Enforce Android FLAG_SECURE app-wide (always ON inside Stealth Vault)",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              }
+              Switch(
+                checked = settings.alwaysBlockScreenshots,
+                onCheckedChange = onToggleAlwaysBlockScreenshots,
+                modifier = Modifier.testTag("settings_block_screenshots_switch"),
+              )
+            }
+
+            FilledTonalButton(
+              onClick = onOpenStealthVault,
+              modifier = Modifier
+                .fillMaxWidth()
+                .testTag("settings_open_stealth_vault_button"),
+            ) {
+              Icon(Icons.Rounded.Shield, contentDescription = null, modifier = Modifier.size(18.dp))
+              Spacer(modifier = Modifier.width(8.dp))
+              Text("Open Stealth Private Vault")
             }
           }
         }
@@ -699,13 +853,60 @@ fun SecuritySettingsScreen(
         }
       }
 
-      // Master PIN & Security Questions Recovery
+      // Master PIN, Pattern, Primary Lock Method & Security Questions Recovery
       item(key = "credentials_card") {
         Card(
           colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
           modifier = Modifier.fillMaxWidth(),
         ) {
           Column {
+            Column(
+              verticalArrangement = Arrangement.spacedBy(8.dp),
+              modifier = Modifier.padding(16.dp),
+            ) {
+              Text("Primary Lock Method", style = MaterialTheme.typography.titleSmall)
+              Text(
+                text = "Active: ${settings.primaryLockType.label} • Biometrics stays ${if (settings.biometricEnabled) "ON" else "OFF"} across Pattern & PIN modes",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+              SingleChoiceSegmentedButtonRow(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .testTag("settings_primary_lock_selector"),
+              ) {
+                val methods = listOf(
+                  Triple(PrimaryLockType.PATTERN, "Pattern", Icons.Rounded.Gesture),
+                  Triple(PrimaryLockType.PIN_4, "4-Digit", Icons.Rounded.Dialpad),
+                  Triple(PrimaryLockType.PIN_6, "6-Digit", Icons.Rounded.Pin),
+                )
+                methods.forEachIndexed { idx, (type, label, icon) ->
+                  val canSelect = when (type) {
+                    PrimaryLockType.PATTERN -> settings.hasPatternLock
+                    PrimaryLockType.PIN_4 -> settings.hasPinCredential && settings.pinLength == 4
+                    PrimaryLockType.PIN_6 -> settings.hasPinCredential && settings.pinLength == 6
+                  }
+                  SegmentedButton(
+                    selected = settings.primaryLockType == type,
+                    onClick = {
+                      if (canSelect) {
+                        onSelectPrimaryLockType(type)
+                      } else if (type == PrimaryLockType.PATTERN) {
+                        showSetupPatternDialog = true
+                      } else {
+                        showChangePinDialog = true
+                      }
+                    },
+                    shape = SegmentedButtonDefaults.itemShape(index = idx, count = methods.size),
+                    icon = { Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                    modifier = Modifier.testTag("settings_lock_type_${type.name.lowercase()}"),
+                  ) {
+                    Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  }
+                }
+              }
+            }
+
             Row(
               verticalAlignment = Alignment.CenterVertically,
               modifier = Modifier
@@ -717,9 +918,16 @@ fun SecuritySettingsScreen(
               Icon(Icons.Rounded.Key, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
               Spacer(modifier = Modifier.width(12.dp))
               Column(modifier = Modifier.weight(1f)) {
-                Text("Change Master PIN", style = MaterialTheme.typography.titleSmall)
                 Text(
-                  text = "Re-wraps your 256-bit DEK without re-encrypting folders",
+                  text = if (settings.hasPinCredential) {
+                    "Change Master PIN (${settings.pinLength}-Digit Active)"
+                  } else {
+                    "Add 4- or 6-Digit Master PIN"
+                  },
+                  style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                  text = "Switch between 4-digit & 6-digit PINs or re-wrap your 256-bit DEK cleanly",
                   style = MaterialTheme.typography.bodySmall,
                   color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -737,12 +945,12 @@ fun SecuritySettingsScreen(
               Icon(Icons.Rounded.Gesture, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
               Spacer(modifier = Modifier.width(12.dp))
               Column(modifier = Modifier.weight(1f)) {
-                Text("Unlock Pattern (PIN / Pattern Fallback)", style = MaterialTheme.typography.titleSmall)
+                Text("3×3 Pattern Lock", style = MaterialTheme.typography.titleSmall)
                 Text(
                   text = if (settings.hasPatternLock) {
-                    "Configured • Switch between 6-digit PIN and 3×3 Pattern on lock screen"
+                    "Configured • Active alongside Biometrics${if (settings.hasPinCredential) " & ${settings.pinLength}-digit PIN" else ""}"
                   } else {
-                    "Not set • Draw a 3×3 Pattern to unlock alongside PIN without biometrics"
+                    "Not set • Draw a 3×3 Pattern to complement Biometrics & PIN"
                   },
                   style = MaterialTheme.typography.bodySmall,
                   color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -759,9 +967,9 @@ fun SecuritySettingsScreen(
               ) {
                 Spacer(modifier = Modifier.width(36.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                  Text("Default Lock Screen to Pattern", style = MaterialTheme.typography.titleSmall)
+                  Text("Default Lock Screen to 3×3 Pattern", style = MaterialTheme.typography.titleSmall)
                   Text(
-                    text = "Open the 3×3 Pattern grid first (PIN switcher stays available)",
+                    text = "Open the 3×3 Pattern lock screen when Biometrics is dismissed or unavailable",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                   )
@@ -770,6 +978,28 @@ fun SecuritySettingsScreen(
                   checked = settings.preferPatternFallback,
                   onCheckedChange = onTogglePreferPatternFallback,
                   modifier = Modifier.testTag("settings_prefer_pattern_switch"),
+                )
+              }
+
+              Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .padding(horizontal = 16.dp, vertical = 10.dp),
+              ) {
+                Spacer(modifier = Modifier.width(36.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                  Text("Stealth Pattern Mode", style = MaterialTheme.typography.titleSmall)
+                  Text(
+                    text = "Hide drawn connecting lines on the 3×3 Pattern grid from onlookers",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                }
+                Switch(
+                  checked = settings.patternStealthMode,
+                  onCheckedChange = onTogglePatternStealthMode,
+                  modifier = Modifier.testTag("settings_pattern_stealth_switch"),
                 )
               }
             }
@@ -788,9 +1018,9 @@ fun SecuritySettingsScreen(
                 Text("Recovery Security Questions", style = MaterialTheme.typography.titleSmall)
                 Text(
                   text = if (settings.hasSecurityQuestions) {
-                    "Configured • PBKDF2-HMAC-SHA256 key recovery active"
+                    "Configured • Supports preset or custom questions (answers stay local)"
                   } else {
-                    "Configure questions to recover forgotten Master PIN"
+                    "Configure questions to recover forgotten PIN or Pattern"
                   },
                   style = MaterialTheme.typography.bodySmall,
                   color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -898,6 +1128,145 @@ fun SecuritySettingsScreen(
         }
       }
 
+      // Dual Hidden Read-Only Key Recovery Vault
+      item(key = "dual_key_vault_card") {
+        val alertText = dualKeyStatus?.tamperAlert?.takeIf { it.isNotBlank() }
+          ?: settings.dualKeyTamperAlert.takeIf { it.isNotBlank() }
+        val isExternalLinked = settings.dualKeyExternalTreeUri.isNotBlank()
+        Card(
+          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+          border = if (alertText != null) BorderStroke(1.dp, MaterialTheme.colorScheme.error) else null,
+          modifier = Modifier
+            .fillMaxWidth()
+            .testTag("settings_dual_key_vault_card"),
+        ) {
+          Column(
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.padding(16.dp),
+          ) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+              Icon(
+                imageVector = Icons.Rounded.FolderSpecial,
+                contentDescription = null,
+                tint = if (alertText != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+              )
+              Spacer(modifier = Modifier.width(12.dp))
+              Column(modifier = Modifier.weight(1f)) {
+                Text("Dual Hidden Key Recovery Vault", style = MaterialTheme.typography.titleSmall)
+                Text(
+                  text = buildString {
+                    append("Internal: Read-Only & Hidden (.beastlock_keystore)")
+                    append(" • External (.BeastLock_Keys): ")
+                    append(if (isExternalLinked) "Linked" else "Not linked")
+                    if (settings.dualKeyLastSyncAtMillis > 0L) {
+                      append(" • Synced ${formatTimestamp(settings.dualKeyLastSyncAtMillis)}")
+                    }
+                  },
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              }
+            }
+
+            if (alertText != null) {
+              Surface(
+                color = MaterialTheme.colorScheme.errorContainer,
+                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .testTag("dual_key_tamper_banner"),
+              ) {
+                Row(
+                  verticalAlignment = Alignment.CenterVertically,
+                  modifier = Modifier.padding(10.dp),
+                ) {
+                  Icon(Icons.Rounded.Warning, contentDescription = null, modifier = Modifier.size(18.dp))
+                  Spacer(modifier = Modifier.width(8.dp))
+                  Text(alertText, style = MaterialTheme.typography.bodySmall)
+                }
+              }
+            } else {
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                  imageVector = Icons.Rounded.CheckCircle,
+                  contentDescription = null,
+                  tint = MaterialTheme.colorScheme.primary,
+                  modifier = Modifier.size(16.dp),
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                  text = "SHA-256 checksum verified • Plaintext keys are never written to disk",
+                  style = MaterialTheme.typography.labelSmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              }
+            }
+
+            Row(
+              horizontalArrangement = Arrangement.spacedBy(8.dp),
+              modifier = Modifier.fillMaxWidth(),
+            ) {
+              OutlinedButton(
+                onClick = { dualKeyExternalPicker.launch(null) },
+                modifier = Modifier
+                  .weight(1f)
+                  .testTag("settings_link_external_key_folder_button"),
+              ) {
+                Text(
+                  text = if (isExternalLinked) "Change External" else "Link External",
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis,
+                )
+              }
+              FilledTonalButton(
+                onClick = onVerifyDualKeyVault,
+                modifier = Modifier
+                  .weight(1f)
+                  .testTag("settings_verify_dual_key_button"),
+              ) {
+                Text("Verify & Sync", maxLines = 1, overflow = TextOverflow.Ellipsis)
+              }
+            }
+          }
+        }
+      }
+
+      // System Failures, Crash Log & User Feedback
+      item(key = "diagnostics_support_card") {
+        Card(
+          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+          modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onOpenDiagnostics)
+            .testTag("settings_open_diagnostics_button"),
+        ) {
+          Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(16.dp),
+          ) {
+            Icon(
+              imageVector = Icons.Rounded.BugReport,
+              contentDescription = null,
+              tint = if (pendingIssuesCount > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+              Text("Diagnostics, Crash Recorder & Feedback", style = MaterialTheme.typography.titleSmall)
+              Text(
+                text = if (pendingIssuesCount > 0) {
+                  "$pendingIssuesCount recorded system failure(s) ready for you to review & send"
+                } else {
+                  "Review sanitized diagnostics or express feedback directly to our database"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = if (pendingIssuesCount > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+          }
+        }
+      }
+
       // Open Source MIT License & Cryptographic Specification
       item(key = "opensource_card") {
         Card(
@@ -929,6 +1298,8 @@ fun SecuritySettingsScreen(
 
   if (showChangePinDialog) {
     ChangePinDialog(
+      hasExistingPin = settings.hasPinCredential,
+      currentPinLength = settings.pinLength,
       onDismiss = { showChangePinDialog = false },
       onSubmit = { current, next, onResult ->
         onChangePin(current, next) { ok ->
@@ -942,6 +1313,7 @@ fun SecuritySettingsScreen(
   if (showSetupPatternDialog) {
     SetupPatternDialog(
       hasExistingPattern = settings.hasPatternLock,
+      canRemovePattern = settings.hasPinCredential,
       onDismiss = { showSetupPatternDialog = false },
       onSavePattern = { nodes ->
         onSavePattern(nodes) { ok ->
@@ -959,9 +1331,10 @@ fun SecuritySettingsScreen(
     UpdateRecoveryQuestionsDialog(
       initialQ1 = settings.securityQuestion1.ifBlank { "What was the name of your first school?" },
       initialQ2 = settings.securityQuestion2.ifBlank { "What was the name of your first pet?" },
+      initialShareCustomSuggestions = settings.shareCustomQuestionSuggestions,
       onDismiss = { showUpdateQuestionsDialog = false },
-      onSave = { q1, a1, q2, a2 ->
-        onUpdateRecoveryQuestions(q1, a1, q2, a2) {
+      onSave = { q1, a1, q2, a2, customQuestionsToShare, shareSuggestions ->
+        onUpdateRecoveryQuestions(q1, a1, q2, a2, customQuestionsToShare, shareSuggestions) {
           showUpdateQuestionsDialog = false
         }
       },
@@ -994,6 +1367,18 @@ fun SecuritySettingsScreen(
       onConfirmSeconds = { seconds ->
         showCustomIdleDurationDialog = false
         onSelectIdleTimeoutSeconds(seconds)
+      },
+    )
+  }
+
+  if (showChangeStealthCodeDialog) {
+    ChangeStealthCodeDialog(
+      hasCustomCode = settings.hasCustomStealthCode,
+      onDismiss = { showChangeStealthCodeDialog = false },
+      onConfirmCode = { code ->
+        onChangeStealthCode(code) { ok ->
+          if (ok) showChangeStealthCodeDialog = false
+        }
       },
     )
   }
@@ -1039,38 +1424,59 @@ fun SecuritySettingsScreen(
 
 @Composable
 private fun ChangePinDialog(
+  hasExistingPin: Boolean,
+  currentPinLength: Int,
   onDismiss: () -> Unit,
   onSubmit: (current: String, next: String, callback: (Boolean) -> Unit) -> Unit,
 ) {
   var currentPin by remember { mutableStateOf("") }
+  var targetLength by remember { mutableIntStateOf(if (currentPinLength == 4) 4 else 6) }
   var newPin by remember { mutableStateOf("") }
   var confirmPin by remember { mutableStateOf("") }
   var error by remember { mutableStateOf<String?>(null) }
 
   AlertDialog(
     onDismissRequest = onDismiss,
-    title = { Text("Change Master PIN") },
+    title = { Text(if (hasExistingPin) "Change Master PIN" else "Add Master PIN") },
     text = {
       Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        OutlinedTextField(
-          value = currentPin,
-          onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) { currentPin = it; error = null } },
-          label = { Text("Current 6-digit PIN") },
-          visualTransformation = PasswordVisualTransformation(),
-          singleLine = true,
-          modifier = Modifier.fillMaxWidth().testTag("change_pin_current"),
-        )
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+          listOf(4 to "4-Digit PIN", 6 to "6-Digit PIN").forEachIndexed { idx, (digits, label) ->
+            SegmentedButton(
+              selected = targetLength == digits,
+              onClick = {
+                targetLength = digits
+                newPin = ""
+                confirmPin = ""
+                error = null
+              },
+              shape = SegmentedButtonDefaults.itemShape(index = idx, count = 2),
+            ) {
+              Text(label)
+            }
+          }
+        }
+        if (hasExistingPin) {
+          OutlinedTextField(
+            value = currentPin,
+            onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) { currentPin = it; error = null } },
+            label = { Text("Current ${if (currentPinLength == 4) "4" else "6"}-digit PIN") },
+            visualTransformation = PasswordVisualTransformation(),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().testTag("change_pin_current"),
+          )
+        }
         OutlinedTextField(
           value = newPin,
-          onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) { newPin = it; error = null } },
-          label = { Text("New 6-digit PIN") },
+          onValueChange = { if (it.length <= targetLength && it.all(Char::isDigit)) { newPin = it; error = null } },
+          label = { Text("New $targetLength-digit PIN") },
           visualTransformation = PasswordVisualTransformation(),
           singleLine = true,
           modifier = Modifier.fillMaxWidth().testTag("change_pin_new"),
         )
         OutlinedTextField(
           value = confirmPin,
-          onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) { confirmPin = it; error = null } },
+          onValueChange = { if (it.length <= targetLength && it.all(Char::isDigit)) { confirmPin = it; error = null } },
           label = { Text("Confirm New PIN") },
           visualTransformation = PasswordVisualTransformation(),
           singleLine = true,
@@ -1085,8 +1491,12 @@ private fun ChangePinDialog(
       Button(
         onClick = {
           when {
-            currentPin.length != 6 || newPin.length != 6 -> error = "PINs must be 6 digits."
-            newPin != confirmPin -> error = "New PINs do not match."
+            hasExistingPin && currentPin.length != currentPinLength ->
+              error = "Current PIN must be $currentPinLength digits."
+            newPin.length != targetLength ->
+              error = "New PIN must be $targetLength digits."
+            newPin != confirmPin ->
+              error = "New PINs do not match."
             else -> onSubmit(currentPin, newPin) { ok ->
               if (!ok) error = "Current PIN is incorrect."
             }
@@ -1094,7 +1504,7 @@ private fun ChangePinDialog(
         },
         modifier = Modifier.testTag("change_pin_submit"),
       ) {
-        Text("Update PIN")
+        Text(if (hasExistingPin) "Update PIN" else "Save PIN")
       }
     },
     dismissButton = {
@@ -1103,17 +1513,53 @@ private fun ChangePinDialog(
   )
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun UpdateRecoveryQuestionsDialog(
   initialQ1: String,
   initialQ2: String,
+  initialShareCustomSuggestions: Boolean,
   onDismiss: () -> Unit,
-  onSave: (q1: String, a1: String, q2: String, a2: String) -> Unit,
+  onSave: (
+    q1: String,
+    a1: String,
+    q2: String,
+    a2: String,
+    customQuestionsToShare: List<String>,
+    shareCustomSuggestions: Boolean,
+  ) -> Unit,
 ) {
-  var q1 by remember { mutableStateOf(initialQ1) }
+  val customSentinel = "Write custom security question…"
+  val presets1 = remember {
+    listOf(
+      "What was the name of your first school?",
+      "What city were your parents married in?",
+      "What was the model of your first mobile phone?",
+      "What is your childhood nickname?",
+    )
+  }
+  val presets2 = remember {
+    listOf(
+      "What was your favorite childhood book?",
+      "What street did your best friend live on?",
+      "What was the name of your first pet?",
+      "What is the middle name of your oldest sibling?",
+    )
+  }
+
+  var isCustomQ1 by remember { mutableStateOf(initialQ1 !in presets1) }
+  var q1Preset by remember { mutableStateOf(if (initialQ1 in presets1) initialQ1 else presets1.first()) }
+  var q1Custom by remember { mutableStateOf(if (initialQ1 !in presets1) initialQ1 else "") }
+  var q1Expanded by remember { mutableStateOf(false) }
   var a1 by remember { mutableStateOf("") }
-  var q2 by remember { mutableStateOf(initialQ2) }
+
+  var isCustomQ2 by remember { mutableStateOf(initialQ2 !in presets2) }
+  var q2Preset by remember { mutableStateOf(if (initialQ2 in presets2) initialQ2 else presets2.first()) }
+  var q2Custom by remember { mutableStateOf(if (initialQ2 !in presets2) initialQ2 else "") }
+  var q2Expanded by remember { mutableStateOf(false) }
   var a2 by remember { mutableStateOf("") }
+
+  var shareSuggestions by remember { mutableStateOf(initialShareCustomSuggestions) }
   var error by remember { mutableStateOf<String?>(null) }
 
   AlertDialog(
@@ -1124,32 +1570,100 @@ private fun UpdateRecoveryQuestionsDialog(
         verticalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.verticalScroll(rememberScrollState()),
       ) {
-        OutlinedTextField(
-          value = q1,
-          onValueChange = { q1 = it },
-          label = { Text("Security Question 1") },
-          modifier = Modifier.fillMaxWidth(),
-        )
+        ExposedDropdownMenuBox(expanded = q1Expanded, onExpandedChange = { q1Expanded = !q1Expanded }) {
+          OutlinedTextField(
+            value = if (isCustomQ1) customSentinel else q1Preset,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text("Security Question 1") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = q1Expanded) },
+            modifier = Modifier.fillMaxWidth().menuAnchor(MenuAnchorType.PrimaryNotEditable, true),
+          )
+          ExposedDropdownMenu(expanded = q1Expanded, onDismissRequest = { q1Expanded = false }) {
+            presets1.forEach { preset ->
+              DropdownMenuItem(
+                text = { Text(preset) },
+                onClick = { q1Preset = preset; isCustomQ1 = false; q1Expanded = false },
+              )
+            }
+            DropdownMenuItem(
+              leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
+              text = { Text(customSentinel) },
+              onClick = { isCustomQ1 = true; q1Expanded = false },
+            )
+          }
+        }
+        if (isCustomQ1) {
+          OutlinedTextField(
+            value = q1Custom,
+            onValueChange = { if (it.length <= 160) { q1Custom = it; error = null } },
+            label = { Text("Custom Question 1 (min 5 chars)") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().testTag("settings_custom_q1_input"),
+          )
+        }
         OutlinedTextField(
           value = a1,
           onValueChange = { a1 = it; error = null },
-          label = { Text("Answer 1") },
+          label = { Text("Answer 1 (kept local only)") },
           singleLine = true,
           modifier = Modifier.fillMaxWidth(),
         )
-        OutlinedTextField(
-          value = q2,
-          onValueChange = { q2 = it },
-          label = { Text("Security Question 2") },
-          modifier = Modifier.fillMaxWidth(),
-        )
+
+        ExposedDropdownMenuBox(expanded = q2Expanded, onExpandedChange = { q2Expanded = !q2Expanded }) {
+          OutlinedTextField(
+            value = if (isCustomQ2) customSentinel else q2Preset,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text("Security Question 2") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = q2Expanded) },
+            modifier = Modifier.fillMaxWidth().menuAnchor(MenuAnchorType.PrimaryNotEditable, true),
+          )
+          ExposedDropdownMenu(expanded = q2Expanded, onDismissRequest = { q2Expanded = false }) {
+            presets2.forEach { preset ->
+              DropdownMenuItem(
+                text = { Text(preset) },
+                onClick = { q2Preset = preset; isCustomQ2 = false; q2Expanded = false },
+              )
+            }
+            DropdownMenuItem(
+              leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
+              text = { Text(customSentinel) },
+              onClick = { isCustomQ2 = true; q2Expanded = false },
+            )
+          }
+        }
+        if (isCustomQ2) {
+          OutlinedTextField(
+            value = q2Custom,
+            onValueChange = { if (it.length <= 160) { q2Custom = it; error = null } },
+            label = { Text("Custom Question 2 (min 5 chars)") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().testTag("settings_custom_q2_input"),
+          )
+        }
         OutlinedTextField(
           value = a2,
           onValueChange = { a2 = it; error = null },
-          label = { Text("Answer 2") },
+          label = { Text("Answer 2 (kept local only)") },
           singleLine = true,
           modifier = Modifier.fillMaxWidth(),
         )
+
+        if (isCustomQ1 || isCustomQ2) {
+          Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Text(
+              text = "Share custom question wording anonymously (never answers)",
+              style = MaterialTheme.typography.bodySmall,
+              modifier = Modifier.weight(1f),
+            )
+            Switch(
+              checked = shareSuggestions,
+              onCheckedChange = { shareSuggestions = it },
+              modifier = Modifier.testTag("settings_share_custom_questions_switch"),
+            )
+          }
+        }
         if (error != null) {
           Text(error!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         }
@@ -1158,10 +1672,22 @@ private fun UpdateRecoveryQuestionsDialog(
     confirmButton = {
       Button(
         onClick = {
-          if (q1.isBlank() || q2.isBlank() || a1.trim().length < 2 || a2.trim().length < 2) {
-            error = "Provide both questions and answers (min 2 characters)."
-          } else {
-            onSave(q1, a1, q2, a2)
+          val finalQ1 = (if (isCustomQ1) q1Custom else q1Preset).trim()
+          val finalQ2 = (if (isCustomQ2) q2Custom else q2Preset).trim()
+          when {
+            finalQ1.length < 5 || finalQ2.length < 5 ->
+              error = "Each question must be at least 5 characters."
+            finalQ1.equals(finalQ2, ignoreCase = true) ->
+              error = "Questions must be distinct."
+            a1.trim().length < 2 || a2.trim().length < 2 ->
+              error = "Provide both answers (min 2 characters)."
+            else -> {
+              val customPrompts = buildList {
+                if (isCustomQ1) add(finalQ1)
+                if (isCustomQ2) add(finalQ2)
+              }
+              onSave(finalQ1, a1, finalQ2, a2, customPrompts, shareSuggestions)
+            }
           }
         },
       ) {
@@ -1275,6 +1801,7 @@ private fun formatAutoLockDuration(seconds: Int): String = when {
 @Composable
 private fun SetupPatternDialog(
   hasExistingPattern: Boolean,
+  canRemovePattern: Boolean,
   onDismiss: () -> Unit,
   onSavePattern: (List<Int>) -> Unit,
   onRemovePattern: () -> Unit,
@@ -1300,7 +1827,7 @@ private fun SetupPatternDialog(
       ) {
         Text(
           text = if (firstPattern == null) {
-            "Connect at least 4 dots on the 3×3 grid. Your Pattern wraps the vault key with PBKDF2-HMAC-SHA256 alongside your PIN."
+            "Connect at least 4 dots on the 3×3 grid. Your Pattern wraps the vault key with PBKDF2-HMAC-SHA256."
           } else {
             "Draw the same pattern again to verify and save."
           },
@@ -1348,7 +1875,7 @@ private fun SetupPatternDialog(
     },
     dismissButton = {
       Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        if (hasExistingPattern) {
+        if (hasExistingPattern && canRemovePattern) {
           TextButton(
             onClick = onRemovePattern,
             modifier = Modifier.testTag("remove_pattern_button"),
@@ -1362,5 +1889,83 @@ private fun SetupPatternDialog(
     modifier = Modifier.testTag("setup_pattern_dialog"),
   )
 }
+
+@Composable
+private fun ChangeStealthCodeDialog(
+  hasCustomCode: Boolean,
+  onDismiss: () -> Unit,
+  onConfirmCode: (String) -> Unit,
+) {
+  var rawCode by remember { mutableStateOf("") }
+  var error by remember { mutableStateOf<String?>(null) }
+  val normalizedPreview = remember(rawCode) {
+    SecurityPreferencesRepository.normalizeStealthCode(rawCode)
+  }
+
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    icon = {
+      Icon(
+        imageVector = Icons.Rounded.VisibilityOff,
+        contentDescription = null,
+        tint = MaterialTheme.colorScheme.primary,
+      )
+    },
+    title = { Text(if (hasCustomCode) "Update Stealth Search Code" else "Set Custom Stealth Code") },
+    text = {
+      Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+          text = "Type this code into BeastLock's Dashboard search bar to summon the authenticated Stealth Vault Drawer. Codes are stored solely as salted PBKDF2 hashes.",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedTextField(
+          value = rawCode,
+          onValueChange = { input ->
+            if (input.length <= 32) {
+              rawCode = input
+              error = null
+            }
+          },
+          label = { Text("New Stealth Code (min 4 chars)") },
+          placeholder = { Text("e.g. #9922") },
+          singleLine = true,
+          modifier = Modifier
+            .fillMaxWidth()
+            .testTag("stealth_code_input"),
+        )
+        if (normalizedPreview != null) {
+          Text(
+            text = "Search bar trigger: $normalizedPreview",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary,
+          )
+        }
+        if (error != null) {
+          Text(error!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
+      }
+    },
+    confirmButton = {
+      Button(
+        onClick = {
+          val normalized = SecurityPreferencesRepository.normalizeStealthCode(rawCode)
+          if (normalized == null) {
+            error = "Enter 4 to 32 characters (e.g. #9922)."
+          } else {
+            onConfirmCode(normalized)
+          }
+        },
+        modifier = Modifier.testTag("stealth_code_save_button"),
+      ) {
+        Text("Save Hash")
+      }
+    },
+    dismissButton = {
+      TextButton(onClick = onDismiss) { Text("Cancel") }
+    },
+  )
+}
+
 
 

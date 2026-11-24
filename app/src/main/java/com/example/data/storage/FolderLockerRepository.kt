@@ -8,7 +8,10 @@ import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
 import com.example.crypto.AesFolderCipher
+import com.example.crypto.DualKeyVaultManager
 import com.example.crypto.EncryptedFileMetadata
+import com.example.crypto.EncryptionManager
+import com.example.crypto.UriPermissionStatus
 import com.example.data.audit.AuditCategory
 import com.example.data.audit.EncryptedAuditLogRepository
 import com.example.data.local.AuditLogEntity
@@ -61,6 +64,16 @@ data class ImportFilesResult(
   val readOnlySourceCount: Int,
 )
 
+data class PickedFolderInspection(
+  val treeUri: Uri,
+  val displayName: String,
+  val permissionStatus: UriPermissionStatus,
+  val plaintextCount: Int,
+  val encryptedCount: Int,
+  val totalBytes: Long,
+  val existingFolderId: String?,
+)
+
 data class DecryptAnyFolderResult(
   val folderName: String,
   val decryptedFiles: Int,
@@ -106,11 +119,27 @@ class FolderLockerRepository(
   private val context: Context,
   private val vaultDao: VaultDao,
   private val auditLogRepo: EncryptedAuditLogRepository? = null,
+  private val dualKeyVaultManager: DualKeyVaultManager? = null,
+  private val externalTreeUriProvider: () -> String = { "" },
+  private val encryptionManager: EncryptionManager = EncryptionManager(
+    context = context,
+    dualKeyVaultManager = dualKeyVaultManager,
+    externalTreeUriProvider = externalTreeUriProvider,
+  ),
 ) {
   companion object {
     private const val INTERNAL_URI_PREFIX = "app-internal://"
     private const val NOMEDIA_FILE = ".nomedia"
+    private const val STEALTH_SANDBOX_DIR = ".beastlock_private"
+    private const val LEGACY_SANDBOX_DIR = "vaults"
+    private const val STEALTH_AUDIT_ALIAS = "Stealth Private Vault"
   }
+
+  private fun safeAuditName(folder: VaultFolderEntity): String =
+    if (folder.isStealthHidden) STEALTH_AUDIT_ALIAS else folder.name
+
+  private fun safeAuditId(folder: VaultFolderEntity): String? =
+    if (folder.isStealthHidden) null else folder.id
 
   fun observeFolders(): Flow<List<VaultFolderEntity>> = vaultDao.observeFolders()
 
@@ -183,7 +212,95 @@ class FolderLockerRepository(
     return if (wrapped.isNullOrBlank()) {
       masterDek
     } else {
-      AesFolderCipher.unwrapDekWithKey(wrapped, masterDek)
+      encryptionManager.unwrapFolderKey(wrapped, masterDek)
+    }
+  }
+
+  suspend fun resolveFolderKeyWithRecovery(folder: VaultFolderEntity, masterDek: SecretKey): SecretKey {
+    return encryptionManager.resolveFolderKey(folder, masterDek) { key, rec ->
+      val fp = rec.keyFingerprint.ifBlank { encryptionManager.computeKeyFingerprint(key) }
+      vaultDao.upsertFolder(
+        folder.copy(
+          wrappedFolderKey = rec.wrappedFolderKey,
+          keyVersion = rec.keyVersion,
+          keyFingerprint = fp,
+        ),
+      )
+      logEvent(
+        folderId = safeAuditId(folder),
+        folderName = safeAuditName(folder),
+        action = "FOLDER_KEY_RECOVERED",
+        details = "Recovered missing or damaged folder key (v${rec.keyVersion}) from Dual Key Vault",
+        category = AuditCategory.CRYPTO_OPERATION,
+      )
+    }
+  }
+
+  suspend fun inspectPickedSafFolder(treeUri: Uri): Result<PickedFolderInspection> = withContext(Dispatchers.IO) {
+    runCatching {
+      encryptionManager.takePersistableFolderPermission(treeUri)
+      val permStatus = encryptionManager.checkTreeUriPermission(treeUri, allowTransientFallback = true)
+      val docTree = resolveTreeDocumentFile(treeUri)
+        ?: error("Unable to open selected folder")
+      val displayName = docTree.name?.takeIf { it.isNotBlank() } ?: "Protected Folder"
+      val stats = inspectSafStats(docTree)
+      val existing = vaultDao.getFolderByUri(treeUri.toString())
+      PickedFolderInspection(
+        treeUri = treeUri,
+        displayName = displayName,
+        permissionStatus = permStatus,
+        plaintextCount = stats.plainCount,
+        encryptedCount = stats.encryptedCount,
+        totalBytes = stats.totalBytes,
+        existingFolderId = existing?.id,
+      )
+    }
+  }
+
+  suspend fun auditFolderPermissions(folders: List<VaultFolderEntity>): Map<String, UriPermissionStatus> =
+    withContext(Dispatchers.IO) {
+      folders.associate { folder ->
+        folder.id to encryptionManager.checkFolderUriPermission(folder)
+      }
+    }
+
+  suspend fun regrantSafFolderPermission(
+    folderId: String,
+    treeUri: Uri,
+  ): Result<VaultFolderEntity> = withContext(Dispatchers.IO) {
+    runCatching {
+      val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
+      require(!folder.isInternalVault) { "Private sandbox folders do not require SAF re-grant" }
+      encryptionManager.takePersistableFolderPermission(treeUri)
+      val permStatus = encryptionManager.checkTreeUriPermission(treeUri, allowTransientFallback = true)
+      if (!permStatus.isWritable) {
+        error("Selected folder only granted read-only or unavailable access. Please allow full folder access.")
+      }
+      val newUriString = treeUri.toString()
+      val existingConflict = vaultDao.getFolderByUri(newUriString)
+      if (existingConflict != null && existingConflict.id != folder.id) {
+        error("That folder is already registered as \"${existingConflict.name}\"")
+      }
+      val docTree = resolveTreeDocumentFile(treeUri) ?: error("Unable to open selected folder")
+      val resolvedName = if (newUriString != folder.treeUri) {
+        docTree.name?.takeIf { it.isNotBlank() } ?: folder.name
+      } else {
+        folder.name
+      }
+      val updatedBase = folder.copy(
+        name = resolvedName,
+        treeUri = newUriString,
+        lastActionTimestamp = System.currentTimeMillis(),
+      )
+      val refreshed = refreshFolderMetricsInternal(updatedBase, dek = null)
+      logEvent(
+        folderId = safeAuditId(refreshed),
+        folderName = safeAuditName(refreshed),
+        action = "PERMISSION_REGRANTED",
+        details = "Re-acquired ${permStatus.label} SAF folder access permission",
+        category = AuditCategory.ACCESS_EVENT,
+      )
+      refreshed
     }
   }
 
@@ -193,14 +310,7 @@ class FolderLockerRepository(
     requireBioDefault: Boolean = true,
   ): Result<VaultFolderEntity> = withContext(Dispatchers.IO) {
     runCatching {
-      try {
-        context.contentResolver.takePersistableUriPermission(
-          treeUri,
-          Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-        )
-      } catch (_: SecurityException) {
-        // Fallback when provider grants transient permission during tests or special providers
-      }
+      encryptionManager.takePersistableFolderPermission(treeUri)
 
       val uriString = treeUri.toString()
       val existing = vaultDao.getFolderByUri(uriString)
@@ -244,38 +354,141 @@ class FolderLockerRepository(
     folderName: String,
     obfuscateDefault: Boolean,
     requireBioDefault: Boolean = true,
+    dek: SecretKey? = null,
+    stealthHidden: Boolean = true,
   ): Result<VaultFolderEntity> = withContext(Dispatchers.IO) {
     runCatching {
       val cleanName = folderName.trim().ifBlank { "Private Vault" }
       val id = UUID.randomUUID().toString()
-      val dir = File(File(context.filesDir, "vaults"), id)
+      val sandboxRoot = File(context.filesDir, STEALTH_SANDBOX_DIR)
+      if (!sandboxRoot.exists()) sandboxRoot.mkdirs()
+      File(sandboxRoot, NOMEDIA_FILE).apply { if (!exists()) createNewFile() }
+      val dir = File(sandboxRoot, id)
       if (!dir.exists() && !dir.mkdirs()) {
         error("Could not create private vault directory")
       }
+      File(dir, NOMEDIA_FILE).apply { if (!exists()) createNewFile() }
+
+      val folderKey = if (dek != null) encryptionManager.generateFolderKey() else null
+      val wrappedKey = if (dek != null && folderKey != null) {
+        encryptionManager.wrapFolderKey(folderKey, dek)
+      } else null
+      val keyFp = if (folderKey != null) encryptionManager.computeKeyFingerprint(folderKey) else ""
+
       val now = System.currentTimeMillis()
       val entity = VaultFolderEntity(
         id = id,
         name = cleanName,
         treeUri = "$INTERNAL_URI_PREFIX$id",
         isInternalVault = true,
-        isLocked = false,
+        isLocked = true,
         fileCount = 0,
         encryptedFileCount = 0,
         totalBytes = 0L,
         lastActionTimestamp = now,
         createdAt = now,
-        obfuscateFilenames = obfuscateDefault,
-        requireBiometricPerUnlock = requireBioDefault,
+        obfuscateFilenames = if (stealthHidden) true else obfuscateDefault,
+        requireBiometricPerUnlock = if (stealthHidden) true else requireBioDefault,
+        wrappedFolderKey = wrappedKey,
+        keyVersion = 1,
+        keyFingerprint = keyFp,
+        requireAuthOnOpen = true,
+        isStealthHidden = stealthHidden,
       )
       vaultDao.upsertFolder(entity)
       logEvent(
-        folderId = entity.id,
-        folderName = entity.name,
+        folderId = safeAuditId(entity),
+        folderName = safeAuditName(entity),
         action = "FOLDER_ADDED",
-        details = "Created sandboxed private vault folder",
+        details = if (stealthHidden) {
+          "Created always-encrypted hidden stealth private folder"
+        } else {
+          "Created sandboxed private vault folder"
+        },
       )
       entity
     }
+  }
+
+  suspend fun migrateLegacyPrivateVaultStorage(dek: SecretKey? = null): Int = withContext(Dispatchers.IO) {
+    val sandboxRoot = File(context.filesDir, STEALTH_SANDBOX_DIR)
+    if (!sandboxRoot.exists()) sandboxRoot.mkdirs()
+    File(sandboxRoot, NOMEDIA_FILE).apply { if (!exists()) createNewFile() }
+
+    val legacyRoot = File(context.filesDir, LEGACY_SANDBOX_DIR)
+    if (legacyRoot.exists()) {
+      legacyRoot.listFiles().orEmpty().forEach { child ->
+        if (child.isDirectory) {
+          val dest = File(sandboxRoot, child.name)
+          if (!dest.exists()) {
+            if (!child.renameTo(dest)) {
+              child.copyRecursively(dest, overwrite = true)
+              child.deleteRecursively()
+            }
+          } else {
+            child.listFiles().orEmpty().forEach { f ->
+              val destFile = File(dest, f.name)
+              if (!destFile.exists()) {
+                if (!f.renameTo(destFile)) {
+                  f.copyTo(destFile, overwrite = true)
+                  f.delete()
+                }
+              }
+            }
+            child.deleteRecursively()
+          }
+          File(dest, NOMEDIA_FILE).apply { if (!exists()) createNewFile() }
+        }
+      }
+      if (legacyRoot.listFiles().orEmpty().isEmpty()) {
+        legacyRoot.delete()
+      }
+    }
+
+    var sealedCount = 0
+    val allFolders = vaultDao.getAllFoldersOnce()
+    for (folder in allFolders) {
+      if (folder.isInternalVault) {
+        val dir = internalFolderDir(folder.id)
+        if (!dir.exists()) dir.mkdirs()
+        File(dir, NOMEDIA_FILE).apply { if (!exists()) createNewFile() }
+
+        val upgraded = if (!folder.isStealthHidden || !folder.obfuscateFilenames || !folder.requireAuthOnOpen) {
+          folder.copy(
+            isStealthHidden = true,
+            obfuscateFilenames = true,
+            requireAuthOnOpen = true,
+          ).also { vaultDao.upsertFolder(it) }
+        } else {
+          folder
+        }
+        if (dek != null) {
+          val stats = inspectInternalStats(dir)
+          if (stats.plainCount > 0 || !upgraded.isLocked) {
+            lockFolder(upgraded.id, dek).onSuccess { sealedCount++ }
+          }
+        }
+      }
+    }
+    sealedCount
+  }
+
+  suspend fun concealAndResealPrivateFolders(dek: SecretKey?): Int = withContext(Dispatchers.IO) {
+    if (dek == null) return@withContext 0
+    var sealed = 0
+    val privateFolders = vaultDao.getAllFoldersOnce().filter { it.isStealthHidden || it.isInternalVault }
+    for (folder in privateFolders) {
+      val dir = if (folder.isInternalVault) internalFolderDir(folder.id) else null
+      val hasPlaintextOnDisk = if (dir != null && dir.exists()) {
+        inspectInternalStats(dir).plainCount > 0
+      } else {
+        folder.encryptedFileCount < folder.fileCount
+      }
+      if (!folder.isLocked || hasPlaintextOnDisk) {
+        lockFolder(folder.id, dek).onSuccess { sealed++ }
+      }
+    }
+    sealed
   }
 
   suspend fun importFilesIntoFolder(
@@ -297,7 +510,7 @@ class FolderLockerRepository(
   ): Result<ImportFilesResult> = withContext(Dispatchers.IO) {
     runCatching {
       val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
-      val folderKey = dek?.let { resolveFolderKey(folder, it) }
+      val folderKey = dek?.let { resolveFolderKeyWithRecovery(folder, it) }
       var imported = 0
       var movedCount = 0
       var readOnlyCount = 0
@@ -309,9 +522,9 @@ class FolderLockerRepository(
           if (folder.isInternalVault) {
             val dir = internalFolderDir(folder.id)
             if (!dir.exists()) dir.mkdirs()
-            if (folder.isLocked && folderKey != null) {
-              val targetName = if (folder.obfuscateFilenames) {
-                "${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}"
+            if ((folder.isLocked || folder.isStealthHidden) && folderKey != null) {
+              val targetName = if (folder.obfuscateFilenames || folder.isStealthHidden) {
+                encryptionManager.generateObfuscatedCipherName()
               } else {
                 uniqueLocalFile(dir, "$fileName${AesFolderCipher.ENCRYPTED_EXTENSION}").name
               }
@@ -321,7 +534,7 @@ class FolderLockerRepository(
                 // Direct single-pass stream into encrypted container without staging copy
                 try {
                   tempOut.outputStream().use { out ->
-                    AesFolderCipher.encryptStream(
+                    encryptionManager.encryptStream(
                       input = input,
                       output = out,
                       key = folderKey,
@@ -351,7 +564,7 @@ class FolderLockerRepository(
                   try {
                     stagingFile.inputStream().use { stagedIn ->
                       tempOut.outputStream().use { out ->
-                        AesFolderCipher.encryptStream(
+                        encryptionManager.encryptStream(
                           input = stagedIn,
                           output = out,
                           key = folderKey,
@@ -388,7 +601,7 @@ class FolderLockerRepository(
               ?: error("Folder access permission lost")
             if (folder.isLocked && folderKey != null) {
               val targetName = if (folder.obfuscateFilenames) {
-                "${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}"
+                encryptionManager.generateObfuscatedCipherName()
               } else {
                 uniqueSafName(tree, "$fileName${AesFolderCipher.ENCRYPTED_EXTENSION}")
               }
@@ -399,7 +612,7 @@ class FolderLockerRepository(
                   val outStream = context.contentResolver.openOutputStream(created.uri)
                     ?: error("Unable to open output stream for $targetName")
                   outStream.use { out ->
-                    AesFolderCipher.encryptStream(
+                    encryptionManager.encryptStream(
                       input = input,
                       output = out,
                       key = folderKey,
@@ -427,7 +640,7 @@ class FolderLockerRepository(
                       ?: error("Unable to open output stream for $targetName")
                     outStream.use { out ->
                       stagingFile.inputStream().use { stagedIn ->
-                        AesFolderCipher.encryptStream(
+                        encryptionManager.encryptStream(
                           input = stagedIn,
                           output = out,
                           key = folderKey,
@@ -483,10 +696,10 @@ class FolderLockerRepository(
           else -> ""
         }
         logEvent(
-          folderId = folder.id,
-          folderName = folder.name,
+          folderId = safeAuditId(folder),
+          folderName = safeAuditName(folder),
           action = "FILE_IMPORTED",
-          details = "Imported $imported file(s)${if (folder.isLocked) " and encrypted immediately" else ""}$moveNote",
+          details = "Imported $imported file(s)${if (folder.isLocked || folder.isStealthHidden) " and encrypted immediately" else ""}$moveNote",
         )
       }
       ImportFilesResult(
@@ -501,7 +714,7 @@ class FolderLockerRepository(
     withContext(Dispatchers.IO) {
       runCatching {
         val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
-        val folderKey = dek?.let { resolveFolderKey(folder, it) }
+        val folderKey = dek?.let { resolveFolderKeyWithRecovery(folder, it) }
         if (folder.isInternalVault) {
           val root = internalFolderDir(folder.id)
           if (!root.exists()) return@runCatching emptyList()
@@ -526,7 +739,7 @@ class FolderLockerRepository(
   ): Result<VaultFolderEntity> = withContext(Dispatchers.IO) {
     runCatching {
       val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
-      val folderKey = resolveFolderKey(folder, dek)
+      val folderKey = resolveFolderKeyWithRecovery(folder, dek)
       var processed = 0
       var processedBytes = 0L
 
@@ -557,7 +770,7 @@ class FolderLockerRepository(
           )
           val origBytes = file.length()
           val encryptedName = if (folder.obfuscateFilenames) {
-            "${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}"
+            encryptionManager.generateObfuscatedCipherName()
           } else {
             "${file.name}${AesFolderCipher.ENCRYPTED_EXTENSION}"
           }
@@ -567,7 +780,7 @@ class FolderLockerRepository(
           try {
             file.inputStream().use { input ->
               tempFile.outputStream().use { output ->
-                AesFolderCipher.encryptStream(
+                encryptionManager.encryptStream(
                   input = input,
                   output = output,
                   key = folderKey,
@@ -628,7 +841,7 @@ class FolderLockerRepository(
             ),
           )
           val targetName = if (folder.obfuscateFilenames) {
-            "${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}"
+            encryptionManager.generateObfuscatedCipherName()
           } else {
             uniqueSafName(parent, "$origName${AesFolderCipher.ENCRYPTED_EXTENSION}")
           }
@@ -643,7 +856,7 @@ class FolderLockerRepository(
               val outStream = context.contentResolver.openOutputStream(outDoc.uri)
                 ?: error("Cannot write encrypted file $targetName")
               outStream.use { output ->
-                AesFolderCipher.encryptStream(
+                encryptionManager.encryptStream(
                   input = input,
                   output = output,
                   key = folderKey,
@@ -684,8 +897,8 @@ class FolderLockerRepository(
       val remainingPlain = (updated.fileCount - updated.encryptedFileCount).coerceAtLeast(0)
       val exclusionNote = if (remainingPlain > 0) "; $remainingPlain kept unencrypted" else ""
       logEvent(
-        folderId = updated.id,
-        folderName = updated.name,
+        folderId = safeAuditId(updated),
+        folderName = safeAuditName(updated),
         action = if (folder.isLocked && selectedFileIds != null) "FILES_ENCRYPTED" else "LOCKED",
         details = "AES-256-GCM encrypted $processed file(s) (${formatSize(processedBytes)})$exclusionNote",
       )
@@ -702,7 +915,7 @@ class FolderLockerRepository(
     runCatching {
       require(fileIds.isNotEmpty()) { "Select at least one encrypted file to decrypt" }
       val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
-      val folderKey = resolveFolderKey(folder, dek)
+      val folderKey = resolveFolderKeyWithRecovery(folder, dek)
       var processed = 0
       var processedBytes = 0L
 
@@ -725,7 +938,7 @@ class FolderLockerRepository(
           try {
             encFile.inputStream().use { input ->
               tempPlain.outputStream().use { output ->
-                meta = AesFolderCipher.decryptStream(input, output, folderKey)
+                meta = encryptionManager.decryptStream(input, output, folderKey)
               }
             }
           } catch (t: Throwable) {
@@ -772,7 +985,7 @@ class FolderLockerRepository(
 
         for ((encDoc, parent) in encryptedDocs) {
           val meta = context.contentResolver.openInputStream(encDoc.uri)?.use { input ->
-            AesFolderCipher.readMetadata(input, folderKey)
+            encryptionManager.readMetadata(input, folderKey)
           } ?: error("Cannot read encrypted header")
 
           onProgress(
@@ -800,7 +1013,7 @@ class FolderLockerRepository(
               val outStream = context.contentResolver.openOutputStream(targetDoc.uri)
                 ?: error("Cannot write decrypted file $safeName")
               outStream.use { output ->
-                AesFolderCipher.decryptStream(input, output, folderKey)
+                encryptionManager.decryptStream(input, output, folderKey)
                 decryptedOk = true
               }
             }
@@ -825,8 +1038,8 @@ class FolderLockerRepository(
         .copy(lastActionTimestamp = System.currentTimeMillis())
       vaultDao.upsertFolder(updated)
       logEvent(
-        folderId = updated.id,
-        folderName = updated.name,
+        folderId = safeAuditId(updated),
+        folderName = safeAuditName(updated),
         action = "FILE_DECRYPTED",
         details = "Verified GCM tags & decrypted $processed selected file(s) (${formatSize(processedBytes)})",
       )
@@ -841,7 +1054,7 @@ class FolderLockerRepository(
   ): Result<VaultFolderEntity> = withContext(Dispatchers.IO) {
     runCatching {
       val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
-      val folderKey = resolveFolderKey(folder, dek)
+      val folderKey = resolveFolderKeyWithRecovery(folder, dek)
       var processed = 0
       var processedBytes = 0L
 
@@ -860,7 +1073,7 @@ class FolderLockerRepository(
           try {
             encFile.inputStream().use { input ->
               tempPlain.outputStream().use { output ->
-                meta = AesFolderCipher.decryptStream(input, output, folderKey)
+                meta = encryptionManager.decryptStream(input, output, folderKey)
               }
             }
           } catch (t: Throwable) {
@@ -902,7 +1115,7 @@ class FolderLockerRepository(
 
         for ((encDoc, parent) in encryptedDocs) {
           val meta = context.contentResolver.openInputStream(encDoc.uri)?.use { input ->
-            AesFolderCipher.readMetadata(input, folderKey)
+            encryptionManager.readMetadata(input, folderKey)
           } ?: error("Cannot read encrypted header")
 
           onProgress(
@@ -930,7 +1143,7 @@ class FolderLockerRepository(
               val outStream = context.contentResolver.openOutputStream(targetDoc.uri)
                 ?: error("Cannot write decrypted file $safeName")
               outStream.use { output ->
-                AesFolderCipher.decryptStream(input, output, folderKey)
+                encryptionManager.decryptStream(input, output, folderKey)
                 decryptedOk = true
               }
             }
@@ -951,8 +1164,8 @@ class FolderLockerRepository(
         .copy(isLocked = false, lastActionTimestamp = System.currentTimeMillis())
       vaultDao.upsertFolder(updated)
       logEvent(
-        folderId = updated.id,
-        folderName = updated.name,
+        folderId = safeAuditId(updated),
+        folderName = safeAuditName(updated),
         action = "UNLOCKED",
         details = "Verified GCM tags & decrypted $processed file(s)",
       )
@@ -966,17 +1179,10 @@ class FolderLockerRepository(
     onProgress: (EncryptionProgress) -> Unit = {},
   ): Result<DecryptAnyFolderResult> = withContext(Dispatchers.IO) {
     runCatching {
-      try {
-        context.contentResolver.takePersistableUriPermission(
-          treeUri,
-          Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-        )
-      } catch (_: SecurityException) {
-        // Transient provider grant fallback
-      }
+      encryptionManager.takePersistableFolderPermission(treeUri)
 
       val existing = vaultDao.getFolderByUri(treeUri.toString())
-      val folderKey = if (existing != null) resolveFolderKey(existing, dek) else dek
+      val folderKey = if (existing != null) resolveFolderKeyWithRecovery(existing, dek) else dek
       val tree = resolveTreeDocumentFile(treeUri)
         ?: error("Unable to open selected device folder")
       val displayName = existing?.name ?: tree.name?.takeIf { it.isNotBlank() } ?: "Device Folder"
@@ -992,7 +1198,7 @@ class FolderLockerRepository(
 
       for ((encDoc, parent) in encryptedDocs) {
         val meta = context.contentResolver.openInputStream(encDoc.uri)?.use { input ->
-          AesFolderCipher.readMetadata(input, folderKey)
+          encryptionManager.readMetadata(input, folderKey)
         } ?: error("Cannot read encrypted header in \"${encDoc.name ?: "file"}\" (wrong key or tampered file)")
 
         onProgress(
@@ -1020,7 +1226,7 @@ class FolderLockerRepository(
             val outStream = context.contentResolver.openOutputStream(targetDoc.uri)
               ?: error("Cannot write decrypted file $safeName")
               outStream.use { output ->
-              AesFolderCipher.decryptStream(input, output, folderKey)
+              encryptionManager.decryptStream(input, output, folderKey)
               decryptedOk = true
             }
           }
@@ -1184,10 +1390,10 @@ class FolderLockerRepository(
   ): Result<RotateFolderOutcome> = withContext(Dispatchers.IO) {
     runCatching {
       val folder = vaultDao.getFolderById(folderId) ?: error("Folder not found")
-      val oldFolderKey = resolveFolderKey(folder, masterDek)
-      val newFolderKey = AesFolderCipher.generateAes256Key()
-      val wrappedNewKey = AesFolderCipher.wrapDekWithKey(newFolderKey, masterDek)
-      val newFingerprint = AesFolderCipher.computeKeyFingerprint(newFolderKey)
+      val oldFolderKey = resolveFolderKeyWithRecovery(folder, masterDek)
+      val newFolderKey = encryptionManager.generateFolderKey()
+      val wrappedNewKey = encryptionManager.wrapFolderKey(newFolderKey, masterDek)
+      val newFingerprint = encryptionManager.computeKeyFingerprint(newFolderKey)
 
       var processed = 0
       var processedBytes = 0L
@@ -1226,7 +1432,7 @@ class FolderLockerRepository(
             try {
               val recoveredMeta = encFile.inputStream().use { input ->
                 tempPlain.outputStream().use { plainOut ->
-                  AesFolderCipher.decryptStream(input, plainOut, oldFolderKey)
+                  encryptionManager.decryptStream(input, plainOut, oldFolderKey)
                 }
               }
               onProgress(
@@ -1242,7 +1448,7 @@ class FolderLockerRepository(
               )
               tempPlain.inputStream().use { plainIn ->
                 stagedCipher.outputStream().use { cipherOut ->
-                  AesFolderCipher.encryptStream(
+                  encryptionManager.encryptStream(
                     input = plainIn,
                     output = cipherOut,
                     key = newFolderKey,
@@ -1275,13 +1481,13 @@ class FolderLockerRepository(
               ),
             )
             val targetName = if (folder.obfuscateFilenames) {
-              "${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}"
+              encryptionManager.generateObfuscatedCipherName()
             } else {
               "${plainFile.name}${AesFolderCipher.ENCRYPTED_EXTENSION}"
             }
             plainFile.inputStream().use { input ->
               stagedCipher.outputStream().use { output ->
-                AesFolderCipher.encryptStream(
+                encryptionManager.encryptStream(
                   input = input,
                   output = output,
                   key = newFolderKey,
@@ -1360,7 +1566,7 @@ class FolderLockerRepository(
             try {
               val recoveredMeta = context.contentResolver.openInputStream(encDoc.uri)?.use { input ->
                 tempPlain.outputStream().use { plainOut ->
-                  AesFolderCipher.decryptStream(input, plainOut, oldFolderKey)
+                  encryptionManager.decryptStream(input, plainOut, oldFolderKey)
                 }
               } ?: error("Cannot read encrypted SAF file")
 
@@ -1378,7 +1584,7 @@ class FolderLockerRepository(
 
               tempPlain.inputStream().use { plainIn ->
                 context.contentResolver.openOutputStream(stagedDoc.uri)?.use { cipherOut ->
-                  AesFolderCipher.encryptStream(
+                  encryptionManager.encryptStream(
                     input = plainIn,
                     output = cipherOut,
                     key = newFolderKey,
@@ -1387,7 +1593,7 @@ class FolderLockerRepository(
                 } ?: error("Cannot write staged SAF file")
               }
 
-              val desiredFinalName = encDoc.name ?: "${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}"
+              val desiredFinalName = encDoc.name ?: encryptionManager.generateObfuscatedCipherName()
               stagedSwaps.add(StagedSafSwap(encDoc, stagedDoc, desiredFinalName))
               processedBytes += encDoc.length()
               processed++
@@ -1420,7 +1626,7 @@ class FolderLockerRepository(
             try {
               context.contentResolver.openInputStream(plainDoc.uri)?.use { input ->
                 context.contentResolver.openOutputStream(stagedDoc.uri)?.use { output ->
-                  AesFolderCipher.encryptStream(
+                  encryptionManager.encryptStream(
                     input = input,
                     output = output,
                     key = newFolderKey,
@@ -1435,7 +1641,7 @@ class FolderLockerRepository(
               } ?: error("Cannot read plain SAF file")
 
               val desiredFinalName = if (folder.obfuscateFilenames) {
-                "${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}"
+                encryptionManager.generateObfuscatedCipherName()
               } else {
                 "$origName${AesFolderCipher.ENCRYPTED_EXTENSION}"
               }
@@ -1456,7 +1662,7 @@ class FolderLockerRepository(
           val oldSize = swap.oldDoc.length()
           swap.oldDoc.delete()
           if (!swap.stagedDoc.renameTo(swap.finalName)) {
-            swap.stagedDoc.renameTo("${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}")
+            swap.stagedDoc.renameTo(encryptionManager.generateObfuscatedCipherName())
           }
           if (processedBytes == 0L) processedBytes += oldSize
         }
@@ -1485,8 +1691,8 @@ class FolderLockerRepository(
       )
       vaultDao.upsertFolder(refreshed)
       logEvent(
-        folderId = refreshed.id,
-        folderName = refreshed.name,
+        folderId = safeAuditId(refreshed),
+        folderName = safeAuditName(refreshed),
         action = "FOLDER_KEY_ROTATED",
         details = "Rotated 256-bit folder key (v${folder.keyVersion} -> v$nextVersion, $newFingerprint) across $processed file(s) (${formatSize(processedBytes)})",
         category = AuditCategory.CRYPTO_OPERATION,
@@ -1580,7 +1786,7 @@ class FolderLockerRepository(
       val needsKey = targets.any { it.isEncrypted }
       val folderKey = if (needsKey) {
         val masterDek = dek ?: error("Vault must be unlocked to rename encrypted files")
-        resolveFolderKey(folder, masterDek)
+        resolveFolderKeyWithRecovery(folder, masterDek)
       } else {
         null
       }
@@ -1647,7 +1853,7 @@ class FolderLockerRepository(
               try {
                 sourceFile.inputStream().use { input ->
                   stagedFile.outputStream().use { output ->
-                    AesFolderCipher.rewriteEncryptedMetadata(input, output, key) { oldMeta ->
+                    encryptionManager.rewriteEncryptedMetadata(input, output, key) { oldMeta ->
                       val guessedMime = guessMimeType(cleanNewName)
                       val nextMime = if (guessedMime != "application/octet-stream") guessedMime else oldMeta.mimeType
                       oldMeta.copy(
@@ -1765,7 +1971,7 @@ class FolderLockerRepository(
               try {
                 context.contentResolver.openInputStream(doc.uri)?.use { input ->
                   context.contentResolver.openOutputStream(stagedDoc.uri)?.use { output ->
-                    AesFolderCipher.rewriteEncryptedMetadata(input, output, key) { oldMeta ->
+                    encryptionManager.rewriteEncryptedMetadata(input, output, key) { oldMeta ->
                       val guessedMime = guessMimeType(cleanNewName)
                       val nextMime = if (guessedMime != "application/octet-stream") guessedMime else oldMeta.mimeType
                       oldMeta.copy(
@@ -1777,13 +1983,13 @@ class FolderLockerRepository(
                 } ?: error("Cannot read encrypted SAF file")
 
                 val desiredDiskName = if (folder.obfuscateFilenames) {
-                  doc.name ?: "${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}"
+                  doc.name ?: encryptionManager.generateObfuscatedCipherName()
                 } else {
                   "$cleanNewName${AesFolderCipher.ENCRYPTED_EXTENSION}"
                 }
                 doc.delete()
                 if (!stagedDoc.renameTo(desiredDiskName)) {
-                  stagedDoc.renameTo("${UUID.randomUUID()}${AesFolderCipher.ENCRYPTED_EXTENSION}")
+                  stagedDoc.renameTo(encryptionManager.generateObfuscatedCipherName())
                 }
               } catch (t: Throwable) {
                 stagedDoc.delete()
@@ -1909,9 +2115,9 @@ class FolderLockerRepository(
             val masterKey = dek ?: error("Vault must be authenticated to peek encrypted files")
             val folderKey = item.folderId.takeIf { it.isNotBlank() }
               ?.let { vaultDao.getFolderById(it) }
-              ?.let { resolveFolderKey(it, masterKey) }
+              ?.let { resolveFolderKeyWithRecovery(it, masterKey) }
               ?: masterKey
-            val (meta, bytes) = AesFolderCipher.decryptToByteArray(stream, folderKey)
+            val (meta, bytes) = encryptionManager.decryptToByteArray(stream, folderKey)
             rawBytes = bytes
             resolvedName = meta.originalName
             resolvedMime = meta.mimeType
@@ -1965,12 +2171,14 @@ class FolderLockerRepository(
     folderId: String,
     requireBiometricPerUnlock: Boolean,
     obfuscateFilenames: Boolean,
+    requireAuthOnOpen: Boolean? = null,
   ) {
     val folder = vaultDao.getFolderById(folderId) ?: return
     vaultDao.updateFolder(
       folder.copy(
         requireBiometricPerUnlock = requireBiometricPerUnlock,
         obfuscateFilenames = obfuscateFilenames,
+        requireAuthOnOpen = requireAuthOnOpen ?: folder.requireAuthOnOpen,
       ),
     )
   }
@@ -2106,7 +2314,7 @@ class FolderLockerRepository(
     }
     logEvent(
       folderId = null,
-      folderName = folder.name,
+      folderName = safeAuditName(folder),
       action = "FOLDER_REMOVED",
       details = note,
     )
@@ -2195,7 +2403,7 @@ class FolderLockerRepository(
     val lockedState = when {
       stats.encryptedCount > 0 && stats.plainCount == 0 -> true
       stats.plainCount > 0 && stats.encryptedCount == 0 -> false
-      stats.encryptedCount == 0 && stats.plainCount == 0 -> false
+      stats.encryptedCount == 0 && stats.plainCount == 0 -> folder.isStealthHidden
       else -> folder.isLocked
     }
     val updated = folder.copy(
@@ -2210,8 +2418,14 @@ class FolderLockerRepository(
     updated
   }
 
-  private fun internalFolderDir(folderId: String): File =
-    File(File(context.filesDir, "vaults"), folderId)
+  private fun internalFolderDir(folderId: String): File {
+    val stealthDir = File(File(context.filesDir, STEALTH_SANDBOX_DIR), folderId)
+    val legacyDir = File(File(context.filesDir, LEGACY_SANDBOX_DIR), folderId)
+    if (!stealthDir.exists() && legacyDir.exists()) {
+      return legacyDir
+    }
+    return stealthDir
+  }
 
   private data class FolderStats(
     val plainCount: Int,
@@ -2298,7 +2512,7 @@ class FolderLockerRepository(
         if (isEnc && dek != null) {
           runCatching {
             child.inputStream().use { input ->
-              val meta = AesFolderCipher.readMetadata(input, dek)
+              val meta = encryptionManager.readMetadata(input, dek)
               displayName = meta.originalName
               mime = meta.mimeType
               size = meta.originalSize
@@ -2344,7 +2558,7 @@ class FolderLockerRepository(
         if (isEnc && dek != null) {
           runCatching {
             context.contentResolver.openInputStream(child.uri)?.use { input ->
-              val meta = AesFolderCipher.readMetadata(input, dek)
+              val meta = encryptionManager.readMetadata(input, dek)
               displayName = meta.originalName
               mime = meta.mimeType
               size = meta.originalSize

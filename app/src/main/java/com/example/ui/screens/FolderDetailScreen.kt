@@ -49,6 +49,7 @@ import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.NoteAdd
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -94,6 +95,8 @@ import com.example.ui.components.ConfirmRemoveFoldersDialog
 import com.example.ui.components.VaultStatusBadge
 import com.example.ui.components.formatByteSize
 import com.example.ui.components.formatTimestamp
+import com.example.ui.theme.AmberVault
+import com.example.ui.theme.AmberVaultContainer
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -118,6 +121,7 @@ fun FolderDetailScreen(
   onPeekFile: (VaultFileItem) -> Unit,
   onDismissPreview: () -> Unit,
   onRemoveFolder: (decryptLockedSafFirst: Boolean) -> Unit,
+  onPickerLaunching: (Boolean) -> Unit = {},
 ) {
   var showDeleteConfirm by remember { mutableStateOf(false) }
   var isFileSelectionMode by remember { mutableStateOf(false) }
@@ -149,12 +153,14 @@ fun FolderDetailScreen(
   val docImportLauncher = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.OpenMultipleDocuments(),
   ) { uris ->
+    onPickerLaunching(false)
     if (uris.isNotEmpty()) onImportDocuments(uris)
   }
 
   val photoPickerLauncher = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.PickMultipleVisualMedia(),
   ) { uris ->
+    onPickerLaunching(false)
     if (uris.isNotEmpty()) onImportDocuments(uris)
   }
 
@@ -236,6 +242,43 @@ fun FolderDetailScreen(
           .widthIn(max = 760.dp)
           .fillMaxSize(),
       ) {
+        if (folder.isStealthHidden) {
+          item(key = "stealth_protection_banner") {
+            Surface(
+              color = AmberVaultContainer.copy(alpha = 0.78f),
+              contentColor = AmberVault,
+              shape = MaterialTheme.shapes.medium,
+              border = BorderStroke(1.dp, AmberVault.copy(alpha = 0.45f)),
+              modifier = Modifier
+                .fillMaxWidth()
+                .testTag("folder_stealth_protection_banner"),
+            ) {
+              Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+              ) {
+                Icon(
+                  imageVector = Icons.Rounded.VisibilityOff,
+                  contentDescription = null,
+                  modifier = Modifier.size(20.dp),
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                  Text(
+                    text = "STEALTH VAULT • SCREENSHOTS BLOCKED",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                  )
+                  Text(
+                    text = "Hidden .nomedia storage • UUID obfuscation • Auto-hides & re-encrypts on exit",
+                    style = MaterialTheme.typography.bodySmall,
+                  )
+                }
+              }
+            }
+          }
+        }
+
         // Primary Lock / Unlock Status Banner
         item(key = "lock_banner") {
           Card(
@@ -320,7 +363,10 @@ fun FolderDetailScreen(
                 modifier = Modifier.fillMaxWidth(),
               ) {
                 FilledTonalButton(
-                  onClick = { docImportLauncher.launch(arrayOf("*/*")) },
+                  onClick = {
+                    onPickerLaunching(true)
+                    docImportLauncher.launch(arrayOf("*/*"))
+                  },
                   modifier = Modifier
                     .weight(1f)
                     .testTag("import_files_button"),
@@ -331,6 +377,7 @@ fun FolderDetailScreen(
                 }
                 FilledTonalButton(
                   onClick = {
+                    onPickerLaunching(true)
                     photoPickerLauncher.launch(
                       PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
                     )
@@ -368,7 +415,8 @@ fun FolderDetailScreen(
                   )
                 }
                 Switch(
-                  checked = folder.requireBiometricPerUnlock,
+                  checked = if (folder.isStealthHidden) true else folder.requireBiometricPerUnlock,
+                  enabled = !folder.isStealthHidden,
                   onCheckedChange = { onUpdateOptions(it, folder.obfuscateFilenames) },
                   modifier = Modifier.testTag("folder_require_bio_switch"),
                 )
@@ -381,13 +429,18 @@ fun FolderDetailScreen(
                 Column(modifier = Modifier.weight(1f)) {
                   Text("Obfuscate Filenames", style = MaterialTheme.typography.titleSmall)
                   Text(
-                    text = "Hide real filenames on disk as UUID.vlock",
+                    text = if (folder.isStealthHidden) {
+                      "Always enforced on Stealth Private Vault folders (UUID.vlock)"
+                    } else {
+                      "Hide real filenames on disk as UUID.vlock"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                   )
                 }
                 Switch(
-                  checked = folder.obfuscateFilenames,
+                  checked = if (folder.isStealthHidden) true else folder.obfuscateFilenames,
+                  enabled = !folder.isStealthHidden,
                   onCheckedChange = { onUpdateOptions(folder.requireBiometricPerUnlock, it) },
                   modifier = Modifier.testTag("folder_obfuscate_switch"),
                 )

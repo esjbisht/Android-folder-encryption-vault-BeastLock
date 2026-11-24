@@ -1,11 +1,16 @@
 package com.example.ui
 
+import android.app.Activity
 import android.app.Application
 import android.net.Uri
 import android.os.StatFs
+import androidx.biometric.BiometricPrompt
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.crypto.DualKeyVaultManager
+import com.example.crypto.EncryptionManager
 import com.example.crypto.KeystoreManager
+import com.example.crypto.UriPermissionStatus
 import com.example.data.audit.AuditCategory
 import com.example.data.audit.AuditExportFormat
 import com.example.data.audit.AuditExportScope
@@ -15,18 +20,28 @@ import com.example.data.backup.DriveAuthExpiredException
 import com.example.data.backup.DriveVaultBackupItem
 import com.example.data.backup.GoogleDriveAuthHelper
 import com.example.data.local.VaultDatabase
+import com.example.data.local.VaultFolderEntity
+import com.example.data.preferences.PrimaryLockType
 import com.example.data.preferences.SecurityPreferencesRepository
 import com.example.data.preferences.SecuritySettings
+import com.example.data.preferences.StealthGestureMode
 import com.example.data.storage.FolderLockerRepository
 import com.example.data.storage.MigrationExportFormat
 import com.example.data.storage.VaultFileItem
 import com.example.data.storage.VaultMaintenanceManager
+import com.example.data.telemetry.CloudTelemetryRepository
+import com.example.data.telemetry.FirebaseGoogleAuthHelper
+import com.example.data.telemetry.IssueCategory
+import com.example.data.telemetry.SystemIssueRecorder
 import com.example.security.BatteryPowerMonitor
 import com.example.security.DevicePowerState
 import com.example.security.PanicSensitivity
 import com.example.security.QuickTileCommand
 import com.example.security.VaultQuickActionBus
 import com.example.ui.theme.ThemeMode
+import com.google.firebase.Firebase
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.auth
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -64,7 +79,25 @@ class VaultViewModel private constructor(
   private val vaultDao = database.vaultDao()
   private val auditLogRepo = EncryptedAuditLogRepository(application, keystoreManager, overrideTestKey = overrideAuditKey)
   private val prefsRepo = SecurityPreferencesRepository(application, keystoreManager)
-  private val folderRepo = FolderLockerRepository(application, vaultDao, auditLogRepo)
+  private val dualKeyManager = DualKeyVaultManager(application)
+  private val encryptionManager = EncryptionManager(
+    context = application,
+    keystoreManager = keystoreManager,
+    dualKeyVaultManager = dualKeyManager,
+    externalTreeUriProvider = { _uiState.value.securitySettings.dualKeyExternalTreeUri },
+  )
+  private val issueRecorder = SystemIssueRecorder(application, vaultDao)
+  private val cloudTelemetryRepo: CloudTelemetryRepository? = runCatching {
+    CloudTelemetryRepository(application)
+  }.getOrNull()
+  private val folderRepo = FolderLockerRepository(
+    context = application,
+    vaultDao = vaultDao,
+    auditLogRepo = auditLogRepo,
+    dualKeyVaultManager = dualKeyManager,
+    externalTreeUriProvider = { _uiState.value.securitySettings.dualKeyExternalTreeUri },
+    encryptionManager = encryptionManager,
+  )
   private val cloudBackupManager = CloudBackupManager(application, vaultDao, prefsRepo, auditLogRepo)
   private val maintenanceManager = VaultMaintenanceManager(application, vaultDao, auditLogRepo)
   private val batteryMonitor = BatteryPowerMonitor(application)
@@ -75,6 +108,9 @@ class VaultViewModel private constructor(
   private var autoLockJob: Job? = null
   private var migrationJob: Job? = null
   private var integrityScanJob: Job? = null
+  private var cloudReportsJob: Job? = null
+  private var firebaseAuthListener: FirebaseAuth.AuthStateListener? = null
+  private var initialDualKeyVerifyDone: Boolean = false
   private var lastBlockingState: Boolean = false
   private val idleResetSignal = MutableSharedFlow<Long>(
     replay = 1,
@@ -100,10 +136,18 @@ class VaultViewModel private constructor(
   val driveReauthRequired: SharedFlow<Unit> = _driveReauthRequired.asSharedFlow()
 
   init {
+    SystemIssueRecorder.installUncaughtCrashHook(application)
     batteryMonitor.start()
     viewModelScope.launch {
       auditLogRepo.loadOrRefresh()
+      issueRecorder.ingestPendingCrashMarker()
     }
+    viewModelScope.launch {
+      issueRecorder.observeIssues().collect { issues ->
+        _uiState.update { it.copy(systemIssues = issues) }
+      }
+    }
+    setupFirebaseAuthObserver()
     viewModelScope.launch {
       VaultQuickActionBus.commands.collect { command ->
         when (command) {
@@ -151,6 +195,15 @@ class VaultViewModel private constructor(
           )
         }
 
+        if (settings.isVaultInitialized && !initialDualKeyVerifyDone) {
+          initialDualKeyVerifyDone = true
+          verifyDualKeyVaultInternal(settings.dualKeyExternalTreeUri)
+        }
+
+        if (isUnlocked) {
+          refreshFolderPermissions(folders)
+        }
+
         if (recoveredFromPause) {
           resumeBatteryPausedWorkIfReady(settings, powerState)
         }
@@ -183,6 +236,10 @@ class VaultViewModel private constructor(
 
   override fun onCleared() {
     batteryMonitor.stop()
+    cloudReportsJob?.cancel()
+    runCatching {
+      firebaseAuthListener?.let { Firebase.auth.removeAuthStateListener(it) }
+    }
     super.onCleared()
   }
 
@@ -193,22 +250,70 @@ class VaultViewModel private constructor(
     answer1: String,
     question2: String,
     answer2: String,
+    patternNodes: List<Int>? = null,
+  ) {
+    val resolvedType = if (pin.length == 4) PrimaryLockType.PIN_4 else PrimaryLockType.PIN_6
+    completeOnboardingWithChoice(
+      lockType = resolvedType,
+      pin = pin,
+      patternNodes = patternNodes,
+      enableBiometrics = enableBiometrics,
+      question1 = question1,
+      answer1 = answer1,
+      question2 = question2,
+      answer2 = answer2,
+      shareCustomQuestionSuggestions = false,
+    )
+  }
+
+  fun completeOnboardingWithChoice(
+    lockType: PrimaryLockType,
+    pin: String?,
+    patternNodes: List<Int>?,
+    enableBiometrics: Boolean,
+    question1: String,
+    answer1: String,
+    question2: String,
+    answer2: String,
+    shareCustomQuestionSuggestions: Boolean = true,
+    customQuestionsToQueue: List<String> = emptyList(),
+    externalDualKeyUri: Uri? = null,
   ) {
     viewModelScope.launch {
       runCatching {
-        val dek = prefsRepo.initializeVault(
+        val dek = prefsRepo.initializeVaultWithChoice(
+          lockType = lockType,
           pin = pin,
+          patternNodes = patternNodes,
           enableBiometrics = enableBiometrics,
           question1 = question1,
           answer1 = answer1,
           question2 = question2,
           answer2 = answer2,
+          shareCustomQuestionSuggestions = shareCustomQuestionSuggestions,
         )
+        if (externalDualKeyUri != null) {
+          runCatching {
+            getApplication<Application>().contentResolver.takePersistableUriPermission(
+              externalDualKeyUri,
+              android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+          }
+          prefsRepo.setDualKeyExternalTreeUri(externalDualKeyUri.toString())
+        }
+        if (shareCustomQuestionSuggestions && customQuestionsToQueue.isNotEmpty()) {
+          prefsRepo.queueCustomQuestionsForSync(customQuestionsToQueue)
+        }
         sessionDek = dek
+        folderRepo.migrateLegacyPrivateVaultStorage(dek)
+        syncDualKeyVaultInternal(dek)
+        flushQueuedCustomQuestionsIfSignedIn()
+
         auditLogRepo.recordEvent(
           action = "VAULT_CREATED",
           folderName = "BeastLock",
-          details = "Generated 256-bit AES DEK, hardware Keystore wrap & PBKDF2 recovery questions",
+          details = "Initialized 256-bit AES vault (${lockType.label}, Biometrics=${if (enableBiometrics) "ON" else "OFF"}, Dual Key Recovery active)",
           category = AuditCategory.ACCESS_EVENT,
         )
         _uiState.update {
@@ -216,11 +321,16 @@ class VaultViewModel private constructor(
             sessionState = VaultSessionState.Unlocked,
             securitySettings = it.securitySettings.copy(isVaultInitialized = true),
             authError = null,
-            statusMessage = "Vault initialized with AES-256-GCM encryption",
+            statusMessage = "Vault ready (${lockType.label}) • Dual hidden key mirror synced",
           )
         }
         resetIdleTimer()
       }.onFailure { err ->
+        issueRecorder.recordIssueAsync(
+          category = IssueCategory.CRYPTO_ERROR,
+          errorCode = "VAULT_INIT_FAILED",
+          rawSummary = err.message ?: "Vault initialization failed",
+        )
         _uiState.update { it.copy(errorMessage = err.message ?: "Vault initialization failed") }
       }
     }
@@ -272,14 +382,24 @@ class VaultViewModel private constructor(
     }
   }
 
-  fun onBiometricUnlockSuccess() {
+  suspend fun prepareBiometricKeyCryptoObject(): BiometricPrompt.CryptoObject? =
+    prefsRepo.prepareKeystoreUnwrapCipher()?.let { BiometricPrompt.CryptoObject(it) }
+
+  fun onBiometricUnlockSuccess(unlockedCryptoObject: BiometricPrompt.CryptoObject? = null) {
     viewModelScope.launch {
-      val dek = runCatching { prefsRepo.unlockWithKeystoreAfterBiometric() }.getOrNull()
+      val dek = runCatching {
+        prefsRepo.unlockWithKeystoreCipherAfterBiometric(unlockedCryptoObject?.cipher)
+      }.getOrNull()
       if (dek != null) {
+        val cryptoDetail = if (unlockedCryptoObject?.cipher != null) {
+          "Authenticated via BiometricPrompt CryptoObject & Android Keystore"
+        } else {
+          "Authenticated via BiometricPrompt & Android Keystore"
+        }
         onSessionUnlocked(
           dek,
           authAction = "AUTH_BIOMETRIC",
-          authDetails = "Authenticated via BiometricPrompt & Android Keystore",
+          authDetails = cryptoDetail,
         )
       } else {
         auditLogRepo.recordEvent(
@@ -311,11 +431,17 @@ class VaultViewModel private constructor(
   fun recordFolderAccessed(folderId: String) {
     val folder = _uiState.value.folders.find { it.id == folderId } ?: return
     viewModelScope.launch {
+      val auditName = if (folder.isStealthHidden) "Stealth Private Vault" else folder.name
+      val auditId = if (folder.isStealthHidden) null else folder.id
       auditLogRepo.recordEvent(
         action = "FOLDER_ACCESSED",
-        folderName = folder.name,
-        details = "Opened folder explorer (${folder.fileCount} files, ${if (folder.isLocked) "locked" else "unlocked"})",
-        folderId = folder.id,
+        folderName = auditName,
+        details = if (folder.isStealthHidden) {
+          "Opened encrypted stealth vault folder"
+        } else {
+          "Opened folder explorer (${folder.fileCount} files, ${if (folder.isLocked) "locked" else "unlocked"})"
+        },
+        folderId = auditId,
         category = AuditCategory.ACCESS_EVENT,
       )
     }
@@ -327,6 +453,7 @@ class VaultViewModel private constructor(
     authDetails: String,
   ) {
     sessionDek = dek
+    folderRepo.migrateLegacyPrivateVaultStorage(dek)
     val settings = _uiState.value.securitySettings
     val pendingBgMillis = settings.lastBackgroundedAtMillis
     val elapsedSec = if (pendingBgMillis > 0L) {
@@ -386,6 +513,8 @@ class VaultViewModel private constructor(
       )
     }
     resetIdleTimer()
+    syncDualKeyVaultInternal(dek)
+    flushQueuedCustomQuestionsIfSignedIn()
     if (settings.pendingBatteryPausedAutoSync && !pausedByBattery) {
       resumeBatteryPausedWorkIfReady(settings, batteryMonitor.powerState.value)
     }
@@ -397,20 +526,45 @@ class VaultViewModel private constructor(
     answer2: String,
     newPin: String,
   ) {
+    val targetType = if (newPin.length == 4) PrimaryLockType.PIN_4 else PrimaryLockType.PIN_6
+    recoverWithSecurityQuestions(
+      answer1 = answer1,
+      answer2 = answer2,
+      newPin = newPin,
+      newPatternNodes = null,
+      newLockType = targetType,
+    )
+  }
+
+  fun recoverWithSecurityQuestions(
+    answer1: String,
+    answer2: String,
+    newPin: String? = null,
+    newPatternNodes: List<Int>? = null,
+    newLockType: PrimaryLockType? = null,
+  ) {
     viewModelScope.launch {
       val dek = runCatching {
-        prefsRepo.recoverAndResetPin(answer1, answer2, newPin)
+        prefsRepo.recoverWithSecurityQuestions(
+          answer1 = answer1,
+          answer2 = answer2,
+          newPin = newPin,
+          newPatternNodes = newPatternNodes,
+          newLockType = newLockType,
+        )
       }.getOrNull()
 
       if (dek != null) {
         sessionDek = dek
+        folderRepo.migrateLegacyPrivateVaultStorage(dek)
         prefsRepo.markAutoLocked(false, "")
         prefsRepo.markPanicLocked(false, "")
         prefsRepo.recordBackgroundedAt(0L)
+        syncDualKeyVaultInternal(dek)
         auditLogRepo.recordEvent(
           action = "PIN_RECOVERED",
           folderName = "BeastLock",
-          details = "Master PIN reset using verified security questions (DEK preserved)",
+          details = "Primary vault credentials reset using verified security questions (DEK preserved & Dual Vault synced)",
           category = AuditCategory.ACCESS_EVENT,
         )
         _uiState.update {
@@ -418,7 +572,7 @@ class VaultViewModel private constructor(
             sessionState = VaultSessionState.Unlocked,
             authError = null,
             recoveryError = null,
-            statusMessage = "Master PIN reset and vault unlocked",
+            statusMessage = "Vault credentials reset and unlocked",
           )
         }
         resetIdleTimer()
@@ -438,6 +592,7 @@ class VaultViewModel private constructor(
   }
 
   fun lockVaultNow(source: String = "MANUAL") {
+    val capturedDek = sessionDek
     autoLockJob?.cancel()
     autoLockJob = null
     sessionDek = null
@@ -448,11 +603,19 @@ class VaultViewModel private constructor(
       panicExitToHome = _uiState.value.securitySettings.panicExitToDeviceHome,
       context = getApplication(),
     )
-    viewModelScope.launch {
-      val details = if (source == "QUICK_TILE") {
-        "Vault locked immediately via Android Quick Settings tile"
-      } else {
-        "Vault manually locked and session DEK cleared from memory"
+    viewModelScope.launch(NonCancellable) {
+      val sealedPrivate = folderRepo.concealAndResealPrivateFolders(capturedDek)
+      val details = buildString {
+        append(
+          if (source == "QUICK_TILE") {
+            "Vault locked immediately via Android Quick Settings tile"
+          } else {
+            "Vault manually locked and session DEK cleared from memory"
+          },
+        )
+        if (sealedPrivate > 0) {
+          append(" • Re-encrypted $sealedPrivate stealth folder(s)")
+        }
       }
       auditLogRepo.recordEvent(
         action = "VAULT_SEALED",
@@ -474,6 +637,10 @@ class VaultViewModel private constructor(
         pendingDriveRestoreItem = null,
         isSelectionMode = false,
         selectedFolderIds = emptySet(),
+        isStealthRevealed = false,
+        pendingStealthTriggerLabel = null,
+        isStealthPickerInFlight = false,
+        pendingFolderPickerPreview = null,
         authError = null,
       )
     }
@@ -511,6 +678,10 @@ class VaultViewModel private constructor(
         pendingDriveRestoreItem = null,
         isSelectionMode = false,
         selectedFolderIds = emptySet(),
+        isStealthRevealed = false,
+        pendingStealthTriggerLabel = null,
+        isStealthPickerInFlight = false,
+        pendingFolderPickerPreview = null,
         authError = null,
         recoveryError = null,
       )
@@ -522,10 +693,11 @@ class VaultViewModel private constructor(
 
     viewModelScope.launch(NonCancellable) {
       val pausedByBattery = isBatterySaverBlockingNow()
+      val sealedPrivate = folderRepo.concealAndResealPrivateFolders(capturedDek)
       val sealedCount = if (settings.panicReencryptFolders && capturedDek != null && !pausedByBattery) {
-        reencryptAllUnlockedFolders(capturedDek)
+        reencryptAllUnlockedFolders(capturedDek) + sealedPrivate
       } else {
-        0
+        sealedPrivate
       }
       if (settings.panicReencryptFolders && pausedByBattery) {
         prefsRepo.setPendingBatteryPausedReencrypt(true)
@@ -582,7 +754,17 @@ class VaultViewModel private constructor(
     isAppInForeground = false
     cancelIdleTimer()
 
-    val settings = _uiState.value.securitySettings
+    val stateNow = _uiState.value
+    val anyUnsealedPrivate = stateNow.folders.any {
+      (it.isStealthHidden || it.isInternalVault) && (!it.isLocked || it.encryptedFileCount < it.fileCount)
+    }
+    if (!stateNow.isStealthPickerInFlight &&
+      (stateNow.isStealthRevealed || stateNow.pendingStealthTriggerLabel != null || anyUnsealedPrivate)
+    ) {
+      concealPrivateVault(source = "APP_EXIT", immediateReencrypt = true)
+    }
+
+    val settings = stateNow.securitySettings
     if (!settings.autoLockEnabled || sessionDek == null) return
 
     val now = System.currentTimeMillis()
@@ -615,6 +797,9 @@ class VaultViewModel private constructor(
     }
 
     val dek = sessionDek
+    if (dek != null) {
+      refreshFolderPermissions()
+    }
     if (dek != null && bgStart > 0L && _uiState.value.sessionState == VaultSessionState.Unlocked) {
       val elapsedSec = ((System.currentTimeMillis() - bgStart) / 1000L).toInt()
       if (elapsedSec >= settings.autoLockTimeoutSeconds) {
@@ -639,10 +824,11 @@ class VaultViewModel private constructor(
       _uiState.update { it.copy(isAutoLockReencrypting = true) }
 
       val pausedByBattery = isBatterySaverBlockingNow()
+      val sealedPrivate = folderRepo.concealAndResealPrivateFolders(dek)
       val reencryptedCount = if (settings.autoLockReencryptFolders && !pausedByBattery) {
-        reencryptAllUnlockedFolders(dek)
+        reencryptAllUnlockedFolders(dek) + sealedPrivate
       } else {
-        0
+        sealedPrivate
       }
 
       if (settings.autoLockReencryptFolders && pausedByBattery) {
@@ -693,6 +879,10 @@ class VaultViewModel private constructor(
           pendingDriveRestoreItem = null,
           isSelectionMode = false,
           selectedFolderIds = emptySet(),
+          isStealthRevealed = false,
+          pendingStealthTriggerLabel = null,
+          isStealthPickerInFlight = false,
+          pendingFolderPickerPreview = null,
           authError = null,
         )
       }
@@ -704,15 +894,15 @@ class VaultViewModel private constructor(
     val settings = _uiState.value.securitySettings
     if (!isAppInForeground || !settings.idleTimeoutEnabled) return
 
-    cancelIdleTimer()
     withContext(NonCancellable) {
       _uiState.update { it.copy(isAutoLockReencrypting = true) }
 
       val pausedByBattery = isBatterySaverBlockingNow()
+      val sealedPrivate = folderRepo.concealAndResealPrivateFolders(dek)
       val reencryptedCount = if (settings.autoLockReencryptFolders && !pausedByBattery) {
-        reencryptAllUnlockedFolders(dek)
+        reencryptAllUnlockedFolders(dek) + sealedPrivate
       } else {
-        0
+        sealedPrivate
       }
 
       if (settings.autoLockReencryptFolders && pausedByBattery) {
@@ -744,6 +934,7 @@ class VaultViewModel private constructor(
 
       sessionDek = null
       driveAccessToken = null
+      cancelIdleTimer()
       VaultQuickActionBus.updateVaultState(
         unlocked = false,
         panicExitToHome = settings.panicExitToDeviceHome,
@@ -763,6 +954,10 @@ class VaultViewModel private constructor(
           pendingDriveRestoreItem = null,
           isSelectionMode = false,
           selectedFolderIds = emptySet(),
+          isStealthRevealed = false,
+          pendingStealthTriggerLabel = null,
+          isStealthPickerInFlight = false,
+          pendingFolderPickerPreview = null,
           authError = null,
         )
       }
@@ -792,19 +987,299 @@ class VaultViewModel private constructor(
 
   fun setSearchQuery(query: String) {
     _uiState.update { it.copy(searchQuery = query) }
+    val trimmed = query.trim()
+    if (sessionDek != null && trimmed.length >= 4 && trimmed.startsWith("#")) {
+      viewModelScope.launch {
+        if (prefsRepo.verifyStealthAccessCode(trimmed)) {
+          _uiState.update {
+            it.copy(
+              searchQuery = "",
+              folderFilter = FolderFilter.ALL,
+            )
+          }
+          requestRevealStealthVault(source = "SEARCH_CODE")
+        }
+      }
+    }
+  }
+
+  fun requestRevealStealthVault(source: String = "GESTURE") {
+    if (sessionDek == null) return
+    _uiState.update { it.copy(pendingStealthTriggerLabel = source) }
+  }
+
+  fun dismissStealthAuthChallenge() {
+    _uiState.update { it.copy(pendingStealthTriggerLabel = null) }
+  }
+
+  fun onStealthAuthVerified() {
+    _uiState.update {
+      it.copy(
+        isStealthRevealed = true,
+        pendingStealthTriggerLabel = null,
+      )
+    }
+    viewModelScope.launch {
+      auditLogRepo.recordEvent(
+        action = "STEALTH_VAULT_ACCESSED",
+        folderName = "Stealth Private Vault",
+        details = "Authenticated access to hidden Stealth Private Vault drawer",
+        category = AuditCategory.ACCESS_EVENT,
+      )
+    }
+  }
+
+  fun markStealthPickerInFlight(inFlight: Boolean) {
+    _uiState.update { it.copy(isStealthPickerInFlight = inFlight) }
+  }
+
+  fun concealPrivateVault(
+    source: String = "EXIT",
+    immediateReencrypt: Boolean = true,
+  ) {
+    val dek = sessionDek
+    _uiState.update { current ->
+      val hasStealthActiveFiles = current.activeFolderFiles.any { item ->
+        current.folders.any { f -> f.id == item.folderId && f.isStealthHidden }
+      }
+      current.copy(
+        isStealthRevealed = false,
+        pendingStealthTriggerLabel = null,
+        isStealthPickerInFlight = false,
+        securePreview = if (current.isStealthRevealed || hasStealthActiveFiles) null else current.securePreview,
+        activeFolderFiles = if (hasStealthActiveFiles) emptyList() else current.activeFolderFiles,
+      )
+    }
+    if (immediateReencrypt && dek != null) {
+      viewModelScope.launch(NonCancellable) {
+        val sealedCount = folderRepo.concealAndResealPrivateFolders(dek)
+        if (sealedCount > 0) {
+          auditLogRepo.recordEvent(
+            action = "STEALTH_VAULT_CONCEALED",
+            folderName = "Stealth Private Vault",
+            details = "Concealed drawer and re-encrypted $sealedCount private folder(s) ($source)",
+            category = AuditCategory.CRYPTO_OPERATION,
+          )
+        }
+      }
+    }
+  }
+
+  private fun refreshFolderPermissions(folders: List<VaultFolderEntity> = _uiState.value.folders) {
+    viewModelScope.launch {
+      val statuses = folderRepo.auditFolderPermissions(folders)
+      _uiState.update { it.copy(folderPermissionStatuses = statuses) }
+    }
+  }
+
+  fun previewPickedDeviceFolder(treeUri: Uri) {
+    val defaultObfuscate = _uiState.value.securitySettings.obfuscateFilenamesDefault
+    viewModelScope.launch {
+      _uiState.update {
+        it.copy(
+          pendingFolderPickerPreview = PendingFolderPickerPreview(
+            treeUri = treeUri,
+            displayName = "Scanning folder...",
+            permissionStatus = UriPermissionStatus.TRANSIENT,
+            plaintextFileCount = 0,
+            encryptedFileCount = 0,
+            totalBytes = 0L,
+            obfuscateFilenames = defaultObfuscate,
+            requireAuthOnOpen = true,
+            isScanning = true,
+          ),
+        )
+      }
+      folderRepo.inspectPickedSafFolder(treeUri)
+        .onSuccess { inspection ->
+          _uiState.update { current ->
+            val existingPreview = current.pendingFolderPickerPreview
+            current.copy(
+              pendingFolderPickerPreview = PendingFolderPickerPreview(
+                treeUri = inspection.treeUri,
+                displayName = inspection.displayName,
+                permissionStatus = inspection.permissionStatus,
+                plaintextFileCount = inspection.plaintextCount,
+                encryptedFileCount = inspection.encryptedCount,
+                totalBytes = inspection.totalBytes,
+                existingFolderId = inspection.existingFolderId,
+                obfuscateFilenames = existingPreview?.obfuscateFilenames ?: defaultObfuscate,
+                requireAuthOnOpen = existingPreview?.requireAuthOnOpen ?: true,
+                isScanning = false,
+              ),
+            )
+          }
+        }
+        .onFailure { err ->
+          issueRecorder.recordIssueAsync(
+            category = IssueCategory.SAF_STORAGE,
+            errorCode = "INSPECT_PICKED_FOLDER_FAILED",
+            rawSummary = err.message ?: "Failed to inspect picked folder",
+          )
+          _uiState.update {
+            it.copy(
+              pendingFolderPickerPreview = null,
+              errorMessage = err.message ?: "Unable to read selected folder",
+            )
+          }
+        }
+    }
+  }
+
+  fun updateFolderPickerPreviewOptions(
+    obfuscateFilenames: Boolean,
+    requireAuthOnOpen: Boolean,
+  ) {
+    _uiState.update { current ->
+      val preview = current.pendingFolderPickerPreview ?: return@update current
+      current.copy(
+        pendingFolderPickerPreview = preview.copy(
+          obfuscateFilenames = obfuscateFilenames,
+          requireAuthOnOpen = requireAuthOnOpen,
+        ),
+      )
+    }
+  }
+
+  fun dismissFolderPickerPreview() {
+    _uiState.update { it.copy(pendingFolderPickerPreview = null) }
+  }
+
+  fun confirmFolderPickerPreview(encryptNow: Boolean) {
+    val preview = _uiState.value.pendingFolderPickerPreview ?: return
+    if (preview.isScanning) return
+    _uiState.update { it.copy(pendingFolderPickerPreview = null) }
+    viewModelScope.launch {
+      folderRepo.registerSafFolder(
+        treeUri = preview.treeUri,
+        obfuscateDefault = preview.obfuscateFilenames,
+        requireBioDefault = preview.requireAuthOnOpen,
+      ).onSuccess { registered ->
+        folderRepo.updateFolderSecurityOptions(
+          folderId = registered.id,
+          requireBiometricPerUnlock = preview.requireAuthOnOpen,
+          obfuscateFilenames = preview.obfuscateFilenames,
+          requireAuthOnOpen = preview.requireAuthOnOpen,
+        )
+        val dek = sessionDek
+        if (encryptNow && dek != null && registered.fileCount > registered.encryptedFileCount) {
+          folderRepo.lockFolder(registered.id, dek) { progress ->
+            _uiState.update { it.copy(encryptionProgress = progress) }
+          }.onSuccess { lockedFolder ->
+            syncDualKeyVaultInternal(dek)
+            refreshFolderPermissions()
+            _uiState.update {
+              it.copy(
+                encryptionProgress = null,
+                statusMessage = "Encrypted & locked \"${lockedFolder.name}\" (${lockedFolder.encryptedFileCount} files secured • ${preview.permissionStatus.label})",
+              )
+            }
+          }.onFailure { err ->
+            issueRecorder.recordIssueAsync(
+              category = IssueCategory.CRYPTO_ERROR,
+              errorCode = "PICKER_LOCK_FAILED",
+              rawSummary = err.message ?: "Encryption after folder selection failed",
+            )
+            _uiState.update {
+              it.copy(
+                encryptionProgress = null,
+                errorMessage = err.message ?: "Registered folder, but encryption failed",
+              )
+            }
+          }
+        } else {
+          syncDualKeyVaultInternal(dek)
+          refreshFolderPermissions()
+          val actionLabel = when {
+            preview.existingFolderId != null ->
+              "Updated \"${registered.name}\" (${preview.permissionStatus.label})"
+            encryptNow && registered.encryptedFileCount > 0 ->
+              "Registered \"${registered.name}\" (${registered.encryptedFileCount} encrypted file(s) detected)"
+            else ->
+              "Registered \"${registered.name}\" (${preview.permissionStatus.label})"
+          }
+          _uiState.update { it.copy(statusMessage = actionLabel) }
+        }
+      }.onFailure { err ->
+        issueRecorder.recordIssueAsync(
+          category = IssueCategory.SAF_STORAGE,
+          errorCode = "CONFIRM_PICKED_FOLDER_FAILED",
+          rawSummary = err.message ?: "Failed to register selected folder",
+        )
+        _uiState.update {
+          it.copy(errorMessage = err.message ?: "Failed to register selected folder")
+        }
+      }
+    }
+  }
+
+  fun regrantDeviceFolderPermission(folderId: String, treeUri: Uri) {
+    viewModelScope.launch {
+      folderRepo.regrantSafFolderPermission(folderId, treeUri)
+        .onSuccess { updated ->
+          refreshFolderPermissions()
+          _uiState.update {
+            it.copy(statusMessage = "Restored persistent access to \"${updated.name}\"")
+          }
+        }
+        .onFailure { err ->
+          issueRecorder.recordIssueAsync(
+            category = IssueCategory.SAF_STORAGE,
+            errorCode = "REGRANT_PERMISSION_FAILED",
+            rawSummary = err.message ?: "Failed to restore folder permission",
+          )
+          _uiState.update {
+            it.copy(errorMessage = err.message ?: "Could not restore folder access")
+          }
+        }
+    }
   }
 
   fun addDeviceFolder(treeUri: Uri) {
     viewModelScope.launch {
       val obfuscate = _uiState.value.securitySettings.obfuscateFilenamesDefault
-      folderRepo.registerSafFolder(treeUri, obfuscateDefault = obfuscate)
+      folderRepo.registerSafFolder(treeUri, obfuscateDefault = obfuscate, requireBioDefault = true)
         .onSuccess { folder ->
-          _uiState.update { it.copy(statusMessage = "Added \"${folder.name}\" to BeastLock") }
-          if (folder.fileCount > 0 && !folder.isLocked) {
-            requestLockFolderWithSelection(folder.id, reloadDetail = false)
+          val dek = sessionDek
+          if (dek != null && folder.fileCount > 0 && !folder.isLocked) {
+            folderRepo.lockFolder(folder.id, dek) { progress ->
+              _uiState.update { it.copy(encryptionProgress = progress) }
+            }.onSuccess { lockedFolder ->
+              syncDualKeyVaultInternal(dek)
+              refreshFolderPermissions()
+              _uiState.update {
+                it.copy(
+                  encryptionProgress = null,
+                  statusMessage = "Added & auto-locked \"${lockedFolder.name}\" (${lockedFolder.encryptedFileCount} files secured)",
+                )
+              }
+            }.onFailure { err ->
+              issueRecorder.recordIssueAsync(
+                category = IssueCategory.CRYPTO_ERROR,
+                errorCode = "AUTO_LOCK_ON_ADD_FAILED",
+                rawSummary = err.message ?: "Auto-lock after adding device folder failed",
+              )
+              _uiState.update {
+                it.copy(
+                  encryptionProgress = null,
+                  errorMessage = err.message ?: "Added folder, but auto-lock encryption failed",
+                )
+              }
+            }
+          } else {
+            syncDualKeyVaultInternal(dek)
+            refreshFolderPermissions()
+            _uiState.update {
+              it.copy(statusMessage = "Protected \"${folder.name}\" (Authentication required on open)")
+            }
           }
         }
         .onFailure { err ->
+          issueRecorder.recordIssueAsync(
+            category = IssueCategory.SAF_STORAGE,
+            errorCode = "ADD_DEVICE_FOLDER_FAILED",
+            rawSummary = err.message ?: "Failed to register SAF device folder",
+          )
           _uiState.update { it.copy(errorMessage = err.message ?: "Failed to register folder") }
         }
     }
@@ -813,11 +1288,28 @@ class VaultViewModel private constructor(
   fun createPrivateFolder(name: String) {
     viewModelScope.launch {
       val obfuscate = _uiState.value.securitySettings.obfuscateFilenamesDefault
-      folderRepo.createInternalVaultFolder(name, obfuscateDefault = obfuscate)
-        .onSuccess { folder ->
-          _uiState.update { it.copy(statusMessage = "Created private folder \"${folder.name}\"") }
+      folderRepo.createInternalVaultFolder(
+        folderName = name,
+        obfuscateDefault = obfuscate,
+        requireBioDefault = true,
+        dek = sessionDek,
+        stealthHidden = true,
+      )
+        .onSuccess {
+          syncDualKeyVaultInternal(sessionDek)
+          _uiState.update {
+            it.copy(
+              isStealthRevealed = true,
+              statusMessage = "Created always-encrypted hidden folder",
+            )
+          }
         }
         .onFailure { err ->
+          issueRecorder.recordIssueAsync(
+            category = IssueCategory.SAF_STORAGE,
+            errorCode = "CREATE_PRIVATE_FOLDER_FAILED",
+            rawSummary = err.message ?: "Failed to create private folder",
+          )
           _uiState.update { it.copy(errorMessage = err.message ?: "Failed to create folder") }
         }
     }
@@ -951,10 +1443,16 @@ class VaultViewModel private constructor(
           )
         }
         if (reloadDetail) loadFolderFiles(folderId)
+        syncDualKeyVaultInternal(dek)
         if (updated.autoCloudBackupSync) {
           maybeRunAutoCloudSync(dek)
         }
       }.onFailure { err ->
+        issueRecorder.recordIssueAsync(
+          category = IssueCategory.CRYPTO_ERROR,
+          errorCode = "LOCK_FOLDER_FAILED",
+          rawSummary = err.message ?: "Encryption failed",
+        )
         _uiState.update {
           it.copy(
             encryptionProgress = null,
@@ -979,6 +1477,11 @@ class VaultViewModel private constructor(
         }
         if (reloadDetail) loadFolderFiles(folderId)
       }.onFailure { err ->
+        issueRecorder.recordIssueAsync(
+          category = IssueCategory.CRYPTO_ERROR,
+          errorCode = "UNLOCK_FOLDER_FAILED",
+          rawSummary = err.message ?: "Decryption failed — key or tag mismatch",
+        )
         _uiState.update {
           it.copy(
             encryptionProgress = null,
@@ -1013,6 +1516,11 @@ class VaultViewModel private constructor(
         }
         if (reloadDetail) loadFolderFiles(folderId)
       }.onFailure { err ->
+        issueRecorder.recordIssueAsync(
+          category = IssueCategory.CRYPTO_ERROR,
+          errorCode = "DECRYPT_FILE_FAILED",
+          rawSummary = err.message ?: "File decryption failed — key or tag mismatch",
+        )
         _uiState.update {
           it.copy(
             encryptionProgress = null,
@@ -1041,6 +1549,11 @@ class VaultViewModel private constructor(
           )
         }
       }.onFailure { err ->
+        issueRecorder.recordIssueAsync(
+          category = IssueCategory.CRYPTO_ERROR,
+          errorCode = "DECRYPT_ANY_FOLDER_FAILED",
+          rawSummary = err.message ?: "Could not decrypt device folder",
+        )
         _uiState.update {
           it.copy(
             encryptionProgress = null,
@@ -1178,20 +1691,48 @@ class VaultViewModel private constructor(
     }
   }
 
-  fun verifyMasterPinForReencrypt(pin: String, onResult: (Boolean) -> Unit) {
+  fun verifyMasterPinForAction(
+    pin: String,
+    actionLabel: String = "Sensitive Vault Action",
+    onResult: (Boolean) -> Unit,
+  ) {
     viewModelScope.launch {
       val ok = runCatching { prefsRepo.unlockWithPin(pin) != null }.getOrDefault(false)
       if (!ok) {
         auditLogRepo.recordEvent(
-          action = "REENCRYPT_AUTH_FAILED",
-          folderName = "Batch Key Rotation",
-          details = "Incorrect Master PIN entered before Re-encrypt All key rotation",
+          action = "SECONDARY_AUTH_FAILED",
+          folderName = actionLabel,
+          details = "Incorrect Master PIN entered for $actionLabel",
           category = AuditCategory.FAILED_ATTEMPT,
           isWarning = true,
         )
       }
       onResult(ok)
     }
+  }
+
+  fun verifyPatternForAction(
+    patternNodes: List<Int>,
+    actionLabel: String = "Sensitive Vault Action",
+    onResult: (Boolean) -> Unit,
+  ) {
+    viewModelScope.launch {
+      val ok = runCatching { prefsRepo.unlockWithPattern(patternNodes) != null }.getOrDefault(false)
+      if (!ok) {
+        auditLogRepo.recordEvent(
+          action = "SECONDARY_AUTH_FAILED",
+          folderName = actionLabel,
+          details = "Incorrect 3x3 Unlock Pattern entered for $actionLabel",
+          category = AuditCategory.FAILED_ATTEMPT,
+          isWarning = true,
+        )
+      }
+      onResult(ok)
+    }
+  }
+
+  fun verifyMasterPinForReencrypt(pin: String, onResult: (Boolean) -> Unit) {
+    verifyMasterPinForAction(pin, actionLabel = "Batch Key Rotation", onResult = onResult)
   }
 
   fun reencryptSelectedFolders(encryptUnlockedFolders: Boolean = true) {
@@ -1227,6 +1768,7 @@ class VaultViewModel private constructor(
         )
       }
       if (result.succeededCount > 0) {
+        syncDualKeyVaultInternal(dek)
         maybeRunAutoCloudSync(dek)
       }
     }
@@ -1584,9 +2126,10 @@ class VaultViewModel private constructor(
     folderId: String,
     requireBio: Boolean,
     obfuscateFilenames: Boolean,
+    requireAuthOnOpen: Boolean? = null,
   ) {
     viewModelScope.launch {
-      folderRepo.updateFolderSecurityOptions(folderId, requireBio, obfuscateFilenames)
+      folderRepo.updateFolderSecurityOptions(folderId, requireBio, obfuscateFilenames, requireAuthOnOpen)
     }
   }
 
@@ -1653,9 +2196,10 @@ class VaultViewModel private constructor(
       _uiState.update { it.copy(isPreviewLoading = true) }
       folderRepo.peekFile(item, sessionDek)
         .onSuccess { preview ->
+          val parentIsStealth = _uiState.value.folders.any { it.id == item.folderId && it.isStealthHidden }
           auditLogRepo.recordEvent(
             action = "FILE_PEEKED",
-            folderName = item.displayName,
+            folderName = if (parentIsStealth) "Stealth Private Vault" else item.displayName,
             details = if (item.isEncrypted) {
               "Decrypted secure in-memory preview (${item.mimeType})"
             } else {
@@ -2078,15 +2622,22 @@ class VaultViewModel private constructor(
 
   fun changePin(currentPin: String, newPin: String, onDone: (Boolean) -> Unit) {
     viewModelScope.launch {
-      val ok = prefsRepo.changePin(currentPin, newPin)
+      val settings = _uiState.value.securitySettings
+      val dek = sessionDek
+      val ok = if (!settings.hasPinCredential && dek != null) {
+        prefsRepo.setOrUpdatePin(dek = dek, newPin = newPin, makePrimaryIfPin = false)
+      } else {
+        prefsRepo.changePin(currentPin, newPin)
+      }
       if (ok) {
+        syncDualKeyVaultInternal(sessionDek)
         auditLogRepo.recordEvent(
           action = "PIN_CHANGED",
           folderName = "BeastLock",
-          details = "Re-wrapped 256-bit DEK with updated Master PIN",
+          details = "Re-wrapped 256-bit DEK with updated ${newPin.length}-digit Master PIN & synced Dual Key Vault",
           category = AuditCategory.CRYPTO_OPERATION,
         )
-        _uiState.update { it.copy(statusMessage = "Master PIN updated") }
+        _uiState.update { it.copy(statusMessage = "${newPin.length}-digit Master PIN saved & key mirrors synced") }
       } else {
         auditLogRepo.recordEvent(
           action = "PIN_CHANGE_FAILED",
@@ -2098,6 +2649,29 @@ class VaultViewModel private constructor(
         _uiState.update { it.copy(errorMessage = "Current PIN is incorrect") }
       }
       onDone(ok)
+    }
+  }
+
+  fun setPrimaryLockType(lockType: PrimaryLockType) {
+    viewModelScope.launch {
+      val settings = _uiState.value.securitySettings
+      if (lockType == PrimaryLockType.PATTERN && !settings.hasPatternLock) {
+        _uiState.update { it.copy(errorMessage = "Set up a 3×3 Pattern first before selecting Pattern as primary lock.") }
+        return@launch
+      }
+      if ((lockType == PrimaryLockType.PIN_4 || lockType == PrimaryLockType.PIN_6) && !settings.hasPinCredential) {
+        _uiState.update { it.copy(errorMessage = "Set up a ${if (lockType == PrimaryLockType.PIN_4) "4" else "6"}-digit PIN first.") }
+        return@launch
+      }
+      prefsRepo.setPrimaryLockType(lockType)
+      syncDualKeyVaultInternal(sessionDek)
+      auditLogRepo.recordEvent(
+        action = "POLICY_UPDATED",
+        folderName = "BeastLock",
+        details = "Primary lock method switched to ${lockType.label}",
+        category = AuditCategory.CRYPTO_OPERATION,
+      )
+      _uiState.update { it.copy(statusMessage = "Primary lock set to ${lockType.label}") }
     }
   }
 
@@ -2115,14 +2689,15 @@ class VaultViewModel private constructor(
         prefsRepo.setUnlockPattern(dek, patternNodes, makeDefaultFallback)
       }.getOrDefault(false)
       if (ok) {
+        syncDualKeyVaultInternal(dek)
         auditLogRepo.recordEvent(
           action = "PATTERN_UPDATED",
           folderName = "BeastLock",
-          details = "Wrapped 256-bit DEK with PBKDF2 3x3 Unlock Pattern fallback",
+          details = "Wrapped 256-bit DEK with PBKDF2 3x3 Unlock Pattern & synced Dual Key Vault",
           category = AuditCategory.CRYPTO_OPERATION,
         )
         _uiState.update {
-          it.copy(statusMessage = "Unlock Pattern fallback saved alongside Master PIN")
+          it.copy(statusMessage = "Unlock Pattern saved & Dual Key Vault synced")
         }
       }
       onDone(ok)
@@ -2130,16 +2705,28 @@ class VaultViewModel private constructor(
   }
 
   fun removeUnlockPattern() {
+    val settings = _uiState.value.securitySettings
+    if (!settings.hasPinCredential) {
+      _uiState.update {
+        it.copy(errorMessage = "Set a 4- or 6-digit Master PIN before removing your 3×3 Pattern lock.")
+      }
+      return
+    }
     viewModelScope.launch {
       prefsRepo.removeUnlockPattern()
+      if (settings.primaryLockType == PrimaryLockType.PATTERN) {
+        val fallbackType = if (settings.pinLength == 4) PrimaryLockType.PIN_4 else PrimaryLockType.PIN_6
+        prefsRepo.setPrimaryLockType(fallbackType)
+      }
+      syncDualKeyVaultInternal(sessionDek)
       auditLogRepo.recordEvent(
         action = "PATTERN_REMOVED",
         folderName = "BeastLock",
-        details = "Removed 3x3 Unlock Pattern fallback; Master PIN remains active",
+        details = "Removed 3x3 Unlock Pattern; Master PIN remains active",
         category = AuditCategory.CRYPTO_OPERATION,
       )
       _uiState.update {
-        it.copy(statusMessage = "Unlock Pattern removed; 6-digit Master PIN remains active")
+        it.copy(statusMessage = "Unlock Pattern removed; ${settings.pinLength}-digit Master PIN remains active")
       }
     }
   }
@@ -2150,6 +2737,12 @@ class VaultViewModel private constructor(
     }
   }
 
+  fun setPatternStealthMode(enabled: Boolean) {
+    viewModelScope.launch {
+      prefsRepo.setPatternStealthMode(enabled)
+    }
+  }
+
   fun updateSecurityQuestions(
     q1: String,
     a1: String,
@@ -2157,16 +2750,42 @@ class VaultViewModel private constructor(
     a2: String,
     onDone: () -> Unit,
   ) {
+    updateSecurityQuestions(
+      q1 = q1,
+      a1 = a1,
+      q2 = q2,
+      a2 = a2,
+      customQuestionsToShare = emptyList(),
+      shareCustomSuggestions = _uiState.value.securitySettings.shareCustomQuestionSuggestions,
+      onDone = onDone,
+    )
+  }
+
+  fun updateSecurityQuestions(
+    q1: String,
+    a1: String,
+    q2: String,
+    a2: String,
+    customQuestionsToShare: List<String>,
+    shareCustomSuggestions: Boolean,
+    onDone: () -> Unit,
+  ) {
     val dek = sessionDek ?: return
     viewModelScope.launch {
       prefsRepo.updateSecurityQuestions(dek, q1, a1, q2, a2)
+      prefsRepo.setShareCustomQuestionSuggestions(shareCustomSuggestions)
+      if (shareCustomSuggestions && customQuestionsToShare.isNotEmpty()) {
+        prefsRepo.queueCustomQuestionsForSync(customQuestionsToShare)
+        flushQueuedCustomQuestionsIfSignedIn()
+      }
+      syncDualKeyVaultInternal(dek)
       auditLogRepo.recordEvent(
         action = "RECOVERY_UPDATED",
         folderName = "BeastLock",
-        details = "Updated PBKDF2 recovery questions",
+        details = "Updated PBKDF2 recovery questions & synced Dual Key Vault",
         category = AuditCategory.CRYPTO_OPERATION,
       )
-      _uiState.update { it.copy(statusMessage = "Recovery questions updated") }
+      _uiState.update { it.copy(statusMessage = "Recovery questions updated & key mirrors synced") }
       onDone()
     }
   }
@@ -2205,17 +2824,17 @@ class VaultViewModel private constructor(
       _uiState.update {
         it.copy(securitySettings = it.securitySettings.copy(idleTimeoutEnabled = enabled))
       }
+      if (enabled) {
+        resetIdleTimer()
+      } else {
+        cancelIdleTimer()
+      }
       auditLogRepo.recordEvent(
         action = "POLICY_UPDATED",
         folderName = "Idle Timeout",
         details = if (enabled) "Foreground inactivity timeout enabled" else "Foreground inactivity timeout disabled",
         category = AuditCategory.ACCESS_EVENT,
       )
-      if (enabled) {
-        resetIdleTimer()
-      } else {
-        cancelIdleTimer()
-      }
     }
   }
 
@@ -2226,13 +2845,13 @@ class VaultViewModel private constructor(
       _uiState.update {
         it.copy(securitySettings = it.securitySettings.copy(idleTimeoutSeconds = clamped))
       }
+      resetIdleTimer()
       auditLogRepo.recordEvent(
         action = "POLICY_UPDATED",
         folderName = "Idle Timeout",
         details = "Foreground inactivity timeout set to ${formatDurationLabel(clamped)}",
         category = AuditCategory.ACCESS_EVENT,
       )
-      resetIdleTimer()
     }
   }
 
@@ -2278,6 +2897,52 @@ class VaultViewModel private constructor(
 
   fun setDynamicColor(enabled: Boolean) {
     viewModelScope.launch { prefsRepo.setDynamicColor(enabled) }
+  }
+
+  fun setStealthGestureMode(mode: StealthGestureMode) {
+    viewModelScope.launch {
+      prefsRepo.setStealthGestureMode(mode)
+      auditLogRepo.recordEvent(
+        action = "POLICY_UPDATED",
+        folderName = "Stealth Private Vault",
+        details = "Stealth reveal gesture set to ${mode.label}",
+        category = AuditCategory.ACCESS_EVENT,
+      )
+    }
+  }
+
+  fun setAlwaysBlockScreenshots(enabled: Boolean) {
+    viewModelScope.launch {
+      prefsRepo.setAlwaysBlockScreenshots(enabled)
+      auditLogRepo.recordEvent(
+        action = "POLICY_UPDATED",
+        folderName = "Screen Security",
+        details = if (enabled) {
+          "Enabled app-wide screenshot and Recent Apps thumbnail blocking (FLAG_SECURE)"
+        } else {
+          "FLAG_SECURE restricted to Stealth Vault & Secure Previews"
+        },
+        category = AuditCategory.ACCESS_EVENT,
+      )
+    }
+  }
+
+  fun setStealthAccessCode(rawCode: String, onDone: (Boolean) -> Unit) {
+    viewModelScope.launch {
+      val ok = prefsRepo.setStealthAccessCode(rawCode)
+      if (ok) {
+        auditLogRepo.recordEvent(
+          action = "STEALTH_CODE_UPDATED",
+          folderName = "Stealth Private Vault",
+          details = "Updated salted PBKDF2 stealth search access code",
+          category = AuditCategory.CRYPTO_OPERATION,
+        )
+        _uiState.update { it.copy(statusMessage = "Stealth search access code updated") }
+      } else {
+        _uiState.update { it.copy(errorMessage = "Enter 4 to 32 characters for your stealth code") }
+      }
+      onDone(ok)
+    }
   }
 
   fun scanOrphanedFiles(showCleanMessage: Boolean = false) {
@@ -2433,19 +3098,7 @@ class VaultViewModel private constructor(
   }
 
   fun verifyMasterPinForMigration(pin: String, onResult: (Boolean) -> Unit) {
-    viewModelScope.launch {
-      val ok = runCatching { prefsRepo.unlockWithPin(pin) != null }.getOrDefault(false)
-      if (!ok) {
-        auditLogRepo.recordEvent(
-          action = "MIGRATION_AUTH_FAILED",
-          folderName = "Exit Migration",
-          details = "Incorrect Master PIN entered before decrypt & migrate export",
-          category = AuditCategory.FAILED_ATTEMPT,
-          isWarning = true,
-        )
-      }
-      onResult(ok)
-    }
+    verifyMasterPinForAction(pin, actionLabel = "Exit Migration", onResult = onResult)
   }
 
   fun exportDecryptedMigration(
@@ -2513,6 +3166,311 @@ class VaultViewModel private constructor(
 
   fun dismissMigrationResult() {
     _uiState.update { it.copy(migrationResult = null) }
+  }
+
+  fun linkExternalDualKeyFolder(treeUri: Uri) {
+    viewModelScope.launch {
+      runCatching {
+        getApplication<Application>().contentResolver.takePersistableUriPermission(
+          treeUri,
+          android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+            android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+        )
+      }
+      prefsRepo.setDualKeyExternalTreeUri(treeUri.toString())
+      val status = syncDualKeyVaultInternal(sessionDek)
+      auditLogRepo.recordEvent(
+        action = "DUAL_KEY_EXTERNAL_LINKED",
+        folderName = ".BeastLock_Keys",
+        details = "Linked hidden external key recovery vault with SHA-256 verification",
+        category = AuditCategory.CRYPTO_OPERATION,
+      )
+      _uiState.update {
+        it.copy(
+          statusMessage = if (status?.externalHealthy == true) {
+            "Dual internal & external .BeastLock_Keys vault synced (${status.bundleFolderCount} folder keys)"
+          } else {
+            "External key folder linked; internal read-only key vault updated"
+          },
+        )
+      }
+    }
+  }
+
+  fun verifyDualKeyVaultNow() {
+    viewModelScope.launch {
+      val externalUri = _uiState.value.securitySettings.dualKeyExternalTreeUri
+      val verified = verifyDualKeyVaultInternal(externalUri)
+      val syncAfter = if (sessionDek != null) syncDualKeyVaultInternal(sessionDek) else verified
+      val finalStatus = syncAfter ?: verified
+      _uiState.update {
+        it.copy(
+          statusMessage = when {
+            finalStatus?.autoRepairedMirror != null ->
+              "Key vault mismatch repaired automatically (${finalStatus.autoRepairedMirror})"
+            finalStatus?.checksumValid == true ->
+              "Dual Key Vault verified cleanly (SHA-256 valid, ${finalStatus.bundleFolderCount} folder keys)"
+            else ->
+              finalStatus?.tamperAlert ?: "Key vault verification completed"
+          },
+        )
+      }
+    }
+  }
+
+  private suspend fun syncDualKeyVaultInternal(dek: SecretKey?): com.example.crypto.DualKeyMirrorStatus? {
+    val snapshot = prefsRepo.getKeyWrapSnapshot() ?: return null
+    val folders = vaultDao.getAllFoldersOnce()
+    val externalUri = _uiState.value.securitySettings.dualKeyExternalTreeUri
+    val status = runCatching {
+      dualKeyManager.syncDualVault(
+        credentials = snapshot,
+        folders = folders,
+        masterDek = dek,
+        externalTreeUri = externalUri,
+      )
+    }.getOrElse { err ->
+      issueRecorder.recordIssueAsync(
+        category = IssueCategory.KEY_RECOVERY,
+        errorCode = "DUAL_KEY_SYNC_FAILED",
+        rawSummary = err.message ?: "Dual Key Vault sync failed",
+      )
+      return null
+    }
+    prefsRepo.recordDualKeySyncStatus(
+      syncedAtMillis = status.syncedAtMillis,
+      checksumValid = status.checksumValid,
+      tamperAlert = status.tamperAlert,
+    )
+    _uiState.update { it.copy(dualKeyStatus = status) }
+    return status
+  }
+
+  private suspend fun verifyDualKeyVaultInternal(externalTreeUri: String): com.example.crypto.DualKeyMirrorStatus? {
+    val status = runCatching {
+      dualKeyManager.verifyAndAutoHeal(externalTreeUri)
+    }.getOrElse { err ->
+      issueRecorder.recordIssueAsync(
+        category = IssueCategory.KEY_RECOVERY,
+        errorCode = "DUAL_KEY_VERIFY_FAILED",
+        rawSummary = err.message ?: "Dual Key Vault verification failed",
+      )
+      return null
+    }
+    if (!status.tamperAlert.isNullOrBlank()) {
+      issueRecorder.recordIssueAsync(
+        category = IssueCategory.KEY_RECOVERY,
+        errorCode = "DUAL_KEY_TAMPER_OR_REPAIR",
+        rawSummary = status.tamperAlert + (status.autoRepairedMirror?.let { " -> $it" } ?: ""),
+      )
+      auditLogRepo.recordEvent(
+        action = "KEY_VAULT_VERIFIED",
+        folderName = "Dual Key Vault",
+        details = status.tamperAlert + (status.autoRepairedMirror?.let { " (auto-repaired: $it)" } ?: ""),
+        category = AuditCategory.CRYPTO_OPERATION,
+        isWarning = !status.checksumValid,
+      )
+    }
+    prefsRepo.recordDualKeySyncStatus(
+      syncedAtMillis = status.syncedAtMillis,
+      checksumValid = status.checksumValid,
+      tamperAlert = status.tamperAlert,
+    )
+    _uiState.update { it.copy(dualKeyStatus = status) }
+    return status
+  }
+
+  private fun setupFirebaseAuthObserver() {
+    val auth = runCatching { Firebase.auth }.getOrNull() ?: return
+    val listener = FirebaseAuth.AuthStateListener { firebaseAuth ->
+      val user = firebaseAuth.currentUser
+      _uiState.update {
+        it.copy(
+          firebaseUserUid = user?.uid,
+          firebaseUserEmail = user?.email,
+        )
+      }
+      cloudReportsJob?.cancel()
+      if (user != null && cloudTelemetryRepo != null) {
+        cloudReportsJob = viewModelScope.launch {
+          runCatching {
+            cloudTelemetryRepo.observeSubmittedReports(user.uid).collect { reports ->
+              _uiState.update { it.copy(cloudSubmittedReports = reports) }
+            }
+          }
+        }
+        viewModelScope.launch {
+          flushQueuedCustomQuestionsIfSignedIn()
+        }
+      } else {
+        _uiState.update { it.copy(cloudSubmittedReports = emptyList()) }
+      }
+    }
+    firebaseAuthListener = listener
+    auth.addAuthStateListener(listener)
+    viewModelScope.launch {
+      FirebaseGoogleAuthHelper.attemptSilentSignIn(getApplication())
+    }
+  }
+
+  fun signInFirebaseWithGoogle(activity: Activity) {
+    viewModelScope.launch {
+      _uiState.update { it.copy(isSigningInFirebase = true) }
+      FirebaseGoogleAuthHelper.signInInteractively(activity)
+        .onSuccess { user ->
+          _uiState.update {
+            it.copy(
+              isSigningInFirebase = false,
+              firebaseUserUid = user.uid,
+              firebaseUserEmail = user.email,
+              statusMessage = "Signed in as ${user.email ?: "Google user"}",
+            )
+          }
+          flushQueuedCustomQuestionsIfSignedIn()
+        }
+        .onFailure { err ->
+          _uiState.update {
+            it.copy(
+              isSigningInFirebase = false,
+              errorMessage = err.message ?: "Google Sign-In cancelled or failed",
+            )
+          }
+        }
+    }
+  }
+
+  fun signOutFirebase() {
+    viewModelScope.launch {
+      FirebaseGoogleAuthHelper.signOut(getApplication())
+      _uiState.update {
+        it.copy(
+          firebaseUserUid = null,
+          firebaseUserEmail = null,
+          cloudSubmittedReports = emptyList(),
+          statusMessage = "Signed out of Diagnostics & Cloud Database account",
+        )
+      }
+    }
+  }
+
+  private suspend fun flushQueuedCustomQuestionsIfSignedIn() {
+    val repo = cloudTelemetryRepo ?: return
+    if (FirebaseGoogleAuthHelper.currentUser() == null) return
+    val settings = _uiState.value.securitySettings
+    if (!settings.shareCustomQuestionSuggestions) return
+    val pending = settings.pendingCustomQuestionsToSync
+      .split('\n')
+      .map { it.trim() }
+      .filter { it.length >= 5 }
+    if (pending.isEmpty()) return
+
+    var allOk = true
+    for (q in pending) {
+      val res = repo.submitCustomSecurityQuestion(q)
+      if (res.isFailure) {
+        allOk = false
+      }
+    }
+    if (allOk) {
+      prefsRepo.clearQueuedCustomQuestions()
+    }
+  }
+
+  fun sendDiagnosticReport(
+    userFeedback: String,
+    selectedIssueIds: Set<String>,
+  ) {
+    val repo = cloudTelemetryRepo
+    if (repo == null) {
+      _uiState.update { it.copy(errorMessage = "Cloud database is unavailable in this environment.") }
+      return
+    }
+    if (FirebaseGoogleAuthHelper.currentUser() == null) {
+      _uiState.update { it.copy(errorMessage = "Sign in with Google first to send reports to the BeastLock database.") }
+      return
+    }
+    viewModelScope.launch {
+      _uiState.update { it.copy(isSendingDiagnosticReport = true) }
+      val allIssues = _uiState.value.systemIssues
+      val targets = allIssues.filter { it.id in selectedIssueIds && it.syncStatus == "PENDING" }
+      val stateNow = _uiState.value
+      val snapshotSummary = buildString {
+        append("folders=${stateNow.folders.size};locked=${stateNow.lockedFoldersCount};")
+        append("lockType=${stateNow.securitySettings.primaryLockType.name};")
+        append("bio=${stateNow.securitySettings.biometricEnabled};")
+        append("dualChecksum=${stateNow.securitySettings.dualKeyChecksumValid}")
+      }
+
+      var sentCount = 0
+      var firstErr: String? = null
+
+      if (targets.isNotEmpty()) {
+        for (issue in targets) {
+          repo.submitLocalIssueEntity(issue, userFeedback)
+            .onSuccess { cloudId ->
+              issueRecorder.markSent(issue.id, cloudId, userFeedback)
+              sentCount++
+            }
+            .onFailure { err ->
+              if (firstErr == null) firstErr = err.message ?: "Failed to upload diagnostic report"
+            }
+        }
+      } else {
+        val cleanFeedback = userFeedback.trim()
+        if (cleanFeedback.isBlank()) {
+          _uiState.update {
+            it.copy(
+              isSendingDiagnosticReport = false,
+              errorMessage = "Write your feedback or select a recorded system issue to send.",
+            )
+          }
+          return@launch
+        }
+        val localEntry = issueRecorder.recordIssue(
+          category = IssueCategory.USER_FEEDBACK,
+          errorCode = "USER_EXPRESSED_FEEDBACK",
+          rawSummary = cleanFeedback.take(300),
+          healthSnapshot = snapshotSummary,
+          userFeedback = cleanFeedback,
+        )
+        repo.submitDiagnosticReport(
+          category = IssueCategory.USER_FEEDBACK,
+          errorCode = "USER_EXPRESSED_FEEDBACK",
+          sanitizedSummary = cleanFeedback.take(300),
+          userFeedback = cleanFeedback,
+          healthSnapshot = snapshotSummary,
+          occurredAtMillis = localEntry.occurredAtMillis,
+        ).onSuccess { cloudId ->
+          issueRecorder.markSent(localEntry.id, cloudId, cleanFeedback)
+          sentCount = 1
+        }.onFailure { err ->
+          firstErr = err.message ?: "Failed to upload feedback"
+        }
+      }
+
+      if (stateNow.securitySettings.shareCustomQuestionSuggestions &&
+        stateNow.securitySettings.pendingCustomQuestionsToSync.isNotBlank()
+      ) {
+        flushQueuedCustomQuestionsIfSignedIn()
+      }
+
+      _uiState.update {
+        it.copy(
+          isSendingDiagnosticReport = false,
+          statusMessage = if (firstErr == null) {
+            "Sent $sentCount diagnostic report(s) to BeastLock database. Thank you!"
+          } else null,
+          errorMessage = firstErr,
+        )
+      }
+    }
+  }
+
+  fun clearSentDiagnosticHistory() {
+    viewModelScope.launch {
+      issueRecorder.clearSentHistory()
+      _uiState.update { it.copy(statusMessage = "Cleared locally archived sent reports") }
+    }
   }
 
   fun setBatterySaverModeEnabled(enabled: Boolean) {

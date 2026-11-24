@@ -1,0 +1,139 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidTimestamp(ts) {
+      return ts is timestamp && ts <= request.time;
+    }
+
+    function isValidCustomQuestion(data) {
+      return data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.questionText is string &&
+             data.questionText.size() >= 5 &&
+             data.questionText.size() <= 160 &&
+             data.locale is string &&
+             data.locale.size() >= 2 &&
+             data.locale.size() <= 16 &&
+             data.appVersion is string &&
+             data.appVersion.size() >= 1 &&
+             data.appVersion.size() <= 32 &&
+             isValidTimestamp(data.createdAt) &&
+             isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidDiagnosticCategory(cat) {
+      return cat in [
+        'CRYPTO_ERROR',
+        'KEY_RECOVERY',
+        'DRIVE_SYNC',
+        'SAF_STORAGE',
+        'APP_CRASH',
+        'USER_FEEDBACK'
+      ];
+    }
+
+    function isValidDiagnosticReport(data) {
+      return data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.category is string &&
+             isValidDiagnosticCategory(data.category) &&
+             data.errorCode is string &&
+             data.errorCode.size() >= 1 &&
+             data.errorCode.size() <= 64 &&
+             data.sanitizedSummary is string &&
+             data.sanitizedSummary.size() >= 1 &&
+             data.sanitizedSummary.size() <= 1200 &&
+             data.userFeedback is string &&
+             data.userFeedback.size() <= 2000 &&
+             data.healthSnapshot is string &&
+             data.healthSnapshot.size() <= 800 &&
+             data.appVersion is string &&
+             data.appVersion.size() >= 1 &&
+             data.appVersion.size() <= 32 &&
+             data.androidSdk is int &&
+             data.androidSdk >= 24 &&
+             data.androidSdk <= 50 &&
+             data.deviceModel is string &&
+             data.deviceModel.size() >= 1 &&
+             data.deviceModel.size() <= 80 &&
+             data.occurredAtMillis is int &&
+             data.occurredAtMillis > 0 &&
+             isValidTimestamp(data.createdAt) &&
+             isValidTimestamp(data.updatedAt);
+    }
+
+    match /custom_security_questions/{questionId} {
+      allow get: if isSignedIn() &&
+                    isValidId(questionId) &&
+                    existing().userId == request.auth.uid;
+
+      allow list: if isSignedIn() &&
+                     resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+                       isValidId(questionId) &&
+                       incoming().keys().hasAll(['userId', 'questionText', 'locale', 'appVersion', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'questionText', 'locale', 'appVersion', 'createdAt', 'updatedAt']) &&
+                       isValidCustomQuestion(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidId(questionId) &&
+                       isValidCustomQuestion(incoming()) &&
+                       existing().userId == request.auth.uid &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['questionText', 'locale', 'appVersion', 'updatedAt']);
+
+      allow delete: if isSignedIn() &&
+                       isValidId(questionId) &&
+                       existing().userId == request.auth.uid;
+    }
+
+    match /diagnostic_reports/{reportId} {
+      allow get: if isSignedIn() &&
+                    isValidId(reportId) &&
+                    existing().userId == request.auth.uid;
+
+      allow list: if isSignedIn() &&
+                     resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+                       isValidId(reportId) &&
+                       incoming().keys().hasAll(['userId', 'category', 'errorCode', 'sanitizedSummary', 'userFeedback', 'healthSnapshot', 'appVersion', 'androidSdk', 'deviceModel', 'occurredAtMillis', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'category', 'errorCode', 'sanitizedSummary', 'userFeedback', 'healthSnapshot', 'appVersion', 'androidSdk', 'deviceModel', 'occurredAtMillis', 'createdAt', 'updatedAt']) &&
+                       isValidDiagnosticReport(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidId(reportId) &&
+                       isValidDiagnosticReport(incoming()) &&
+                       existing().userId == request.auth.uid &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['userFeedback', 'updatedAt']);
+
+      allow delete: if isSignedIn() &&
+                       isValidId(reportId) &&
+                       existing().userId == request.auth.uid;
+    }
+  }
+}

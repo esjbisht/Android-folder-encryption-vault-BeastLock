@@ -47,4 +47,19 @@ interface VaultDao {
 
   @Insert(onConflict = OnConflictStrategy.REPLACE)
   suspend fun insertBackupRecord(record: BackupRecordEntity)
+
+  @Query("SELECT * FROM system_issue_reports ORDER BY occurredAtMillis DESC LIMIT 100")
+  fun observeSystemIssues(): Flow<List<SystemIssueReportEntity>>
+
+  @Query("SELECT * FROM system_issue_reports WHERE syncStatus = 'PENDING' ORDER BY occurredAtMillis DESC")
+  suspend fun getPendingSystemIssuesOnce(): List<SystemIssueReportEntity>
+
+  @Insert(onConflict = OnConflictStrategy.REPLACE)
+  suspend fun upsertSystemIssue(report: SystemIssueReportEntity)
+
+  @Query("UPDATE system_issue_reports SET syncStatus = :status, cloudDocumentId = :cloudDocId, userFeedback = :userFeedback WHERE id = :id")
+  suspend fun markSystemIssueSent(id: String, status: String, cloudDocId: String?, userFeedback: String)
+
+  @Query("DELETE FROM system_issue_reports WHERE syncStatus = 'SENT'")
+  suspend fun clearSentSystemIssues()
 }

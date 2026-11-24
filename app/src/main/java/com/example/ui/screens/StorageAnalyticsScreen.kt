@@ -106,8 +106,9 @@ fun StorageAnalyticsScreen(
     unencryptedBytes.toFloat() / totalVaultBytes.toFloat()
   } else 0f
 
-  val sortedFolders = remember(state.folders) {
-    state.folders.sortedByDescending { it.totalBytes }
+  val visibleFolders = state.analyticsVisibleFolders
+  val sortedFolders = remember(visibleFolders) {
+    visibleFolders.sortedByDescending { it.totalBytes }
   }
   val maxFolderBytes = remember(sortedFolders) {
     sortedFolders.maxOfOrNull { it.totalBytes }?.coerceAtLeast(1L) ?: 1L
@@ -128,7 +129,7 @@ fun StorageAnalyticsScreen(
         Column {
           Text("Vault Storage Analytics", style = MaterialTheme.typography.headlineMedium)
           Text(
-            text = "Encrypted vs. unencrypted space across ${state.folders.size} protected folder(s)",
+            text = "Encrypted vs. unencrypted space across ${visibleFolders.size} protected folder(s)",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
           )
@@ -142,7 +143,7 @@ fun StorageAnalyticsScreen(
           isScanning = state.isScanningOrphans,
           isScanningIntegrity = state.isScanningIntegrity,
           integrityReport = state.integrityDiagnosticReport,
-          hasFolders = state.folders.isNotEmpty(),
+          hasFolders = visibleFolders.isNotEmpty(),
           onScanOrphans = onScanOrphans,
           onOpenOrphanCleanup = onOpenOrphanCleanup,
           onOpenMigrateOut = onOpenMigrateOut,
@@ -150,7 +151,7 @@ fun StorageAnalyticsScreen(
         )
       }
 
-      if (state.folders.isEmpty()) {
+      if (visibleFolders.isEmpty()) {
         item(key = "analytics_empty") {
           Card(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
@@ -751,8 +752,9 @@ private fun FolderStorageBarCard(
 private fun PostureBreakdownCard(state: VaultUiState) {
   val totalFiles = (state.totalEncryptedFiles + state.totalUnencryptedFiles).coerceAtLeast(1)
   val encFileFrac = state.totalEncryptedFiles.toFloat() / totalFiles.toFloat()
-  val internalCount = state.folders.count { it.isInternalVault }
-  val safCount = state.folders.count { !it.isInternalVault }
+  val visibleFolders = state.analyticsVisibleFolders
+  val internalCount = visibleFolders.count { it.isInternalVault }
+  val safCount = visibleFolders.count { !it.isInternalVault }
 
   val primaryColor = MaterialTheme.colorScheme.primary
   val secondaryColor = MaterialTheme.colorScheme.secondary

@@ -8,6 +8,7 @@ import android.content.Intent
 import android.graphics.drawable.Icon as AndroidIcon
 import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -33,35 +34,26 @@ import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.PieChart
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -83,8 +75,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
-import com.example.crypto.BiometricAuthHelper
 import com.example.crypto.BiometricAuthResult
+import com.example.crypto.BiometricHelper
 import com.example.data.backup.DriveAuthOutcome
 import com.example.data.backup.GoogleDriveAuthHelper
 import com.example.data.storage.MigrationExportFormat
@@ -94,6 +86,7 @@ import com.example.security.PanicShakeMonitor
 import com.example.ui.AuditLogRoute
 import com.example.ui.CloudBackupRoute
 import com.example.ui.DashboardRoute
+import com.example.ui.DiagnosticsSupportRoute
 import com.example.ui.FolderDetailRoute
 import com.example.ui.SecuritySettingsRoute
 import com.example.ui.StorageAnalyticsRoute
@@ -106,9 +99,12 @@ import com.example.ui.components.MigrationProgressDialog
 import com.example.ui.components.MigrationResultDialog
 import com.example.ui.components.MigrationWizardDialog
 import com.example.ui.components.OrphanCleanupDialog
+import com.example.ui.components.SecondaryAuthChallengeDialog
 import com.example.ui.components.SelectiveLockFilesDialog
+import com.example.ui.components.StealthVaultDrawerSheet
 import com.example.ui.screens.AuditLogScreen
 import com.example.ui.screens.CloudBackupScreen
+import com.example.ui.screens.DiagnosticsSupportScreen
 import com.example.ui.screens.FolderDetailScreen
 import com.example.ui.screens.OnboardingLockSetupScreen
 import com.example.ui.screens.SecuritySettingsScreen
@@ -145,6 +141,8 @@ class MainActivity : FragmentActivity() {
       val context = LocalContext.current
       val hapticFeedback = LocalHapticFeedback.current
       val lifecycleOwner = LocalLifecycleOwner.current
+      val biometricHelper = remember(this@MainActivity) { BiometricHelper(this@MainActivity) }
+      val rootCoroutineScope = rememberCoroutineScope()
 
       val latestPanicAction by rememberUpdatedState {
         viewModel.triggerPanicLock(source = "SHAKE_GESTURE")
@@ -198,50 +196,111 @@ class MainActivity : FragmentActivity() {
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+          biometricHelper.cancelAuthentication()
           panicMonitor.stop()
           lifecycleOwner.lifecycle.removeObserver(observer)
         }
       }
 
+      var biometricFallbackTrigger by remember { mutableIntStateOf(0) }
+      var biometricFallbackReason by remember { mutableStateOf<String?>(null) }
+
+      val negativeButtonLabel = when {
+        state.securitySettings.hasPatternLock &&
+          (!state.securitySettings.hasPinCredential || state.securitySettings.preferPatternFallback) ->
+          getString(R.string.biometric_negative_use_pattern)
+        state.securitySettings.hasPatternLock ->
+          getString(R.string.biometric_negative_use_pattern_or_pin)
+        else -> getString(R.string.biometric_negative_use_pin)
+      }
+
       val triggerUnlockBiometric: () -> Unit = {
-        BiometricAuthHelper.authenticate(
-          activity = this@MainActivity,
-          title = getString(R.string.biometric_prompt_title),
-          subtitle = getString(R.string.biometric_prompt_subtitle),
-          negativeButtonText = getString(R.string.biometric_negative_use_pin),
-          onAuthAttemptFailed = { reason ->
-            viewModel.recordFailedBiometricAttempt(reason, "BeastLock Gate")
-          },
-        ) { result ->
-          if (result is BiometricAuthResult.Success) {
-            viewModel.onBiometricUnlockSuccess()
+        rootCoroutineScope.launch {
+          val keyCryptoObject = viewModel.prepareBiometricKeyCryptoObject()
+          biometricHelper.authenticateBeforeKeyAccess(
+            title = getString(R.string.biometric_prompt_title),
+            subtitle = getString(R.string.biometric_prompt_subtitle),
+            negativeButtonText = negativeButtonLabel,
+            prepareCryptoObject = { keyCryptoObject },
+            onAuthAttemptFailed = { reason ->
+              viewModel.recordFailedBiometricAttempt(reason, "BeastLock Gate")
+            },
+          ) { result ->
+            when (result) {
+              is BiometricAuthResult.Success -> {
+                biometricFallbackReason = null
+                viewModel.onBiometricUnlockSuccess(result.cryptoObject)
+              }
+              BiometricAuthResult.FallbackToPin -> {
+                biometricFallbackReason = if (state.securitySettings.hasPatternLock) {
+                  "Biometric prompt switched to secondary auth — draw your 3×3 Pattern or enter PIN."
+                } else {
+                  null
+                }
+                biometricFallbackTrigger++
+              }
+              is BiometricAuthResult.Error -> {
+                biometricFallbackReason = if (state.securitySettings.hasPatternLock) {
+                  "Biometrics unavailable (${result.message}). Draw your 3×3 Pattern or enter PIN."
+                } else {
+                  result.message
+                }
+                biometricFallbackTrigger++
+              }
+              BiometricAuthResult.Cancelled -> Unit
+            }
           }
         }
       }
 
-      val authorizeActionBiometric: (fallbackToPin: () -> Unit, onAuthorized: () -> Unit) -> Unit =
-        { fallbackToPin, onAuthorized ->
-          if (state.securitySettings.biometricEnabled && state.biometricAvailability.canAuthenticate) {
-            BiometricAuthHelper.authenticate(
-              activity = this@MainActivity,
-              title = getString(R.string.biometric_action_title),
-              subtitle = getString(R.string.biometric_action_subtitle),
-              negativeButtonText = getString(R.string.biometric_negative_use_pin),
-              allowDeviceCredential = true,
+      val authorizeActionBiometric: (
+        folderName: String?,
+        isUnlocking: Boolean,
+        title: String?,
+        subtitle: String?,
+        fallbackToSecondary: () -> Unit,
+        onCancelled: () -> Unit,
+        onAuthorized: () -> Unit,
+      ) -> Unit = { folderName, isUnlocking, title, subtitle, fallbackToSecondary, onCancelled, onAuthorized ->
+        if (state.securitySettings.biometricEnabled && state.biometricAvailability.canAuthenticate) {
+          rootCoroutineScope.launch {
+            val keyCryptoObject = viewModel.prepareBiometricKeyCryptoObject()
+            biometricHelper.authenticateForFolderAccess(
+              folderName = folderName,
+              isUnlocking = isUnlocking,
+              title = title,
+              subtitle = subtitle,
+              negativeButtonText = negativeButtonLabel,
+              prepareCryptoObject = { keyCryptoObject },
               onAuthAttemptFailed = { reason ->
-                viewModel.recordFailedBiometricAttempt(reason, "Vault Security Action")
+                viewModel.recordFailedBiometricAttempt(
+                  reason,
+                  folderName ?: "Vault Security Action",
+                )
               },
             ) { result ->
               when (result) {
-                BiometricAuthResult.Success -> onAuthorized()
-                BiometricAuthResult.FallbackToPin -> fallbackToPin()
-                else -> Unit
+                is BiometricAuthResult.Success -> onAuthorized()
+                BiometricAuthResult.FallbackToPin,
+                is BiometricAuthResult.Error -> fallbackToSecondary()
+                BiometricAuthResult.Cancelled -> onCancelled()
               }
             }
+          }
+        } else {
+          fallbackToSecondary()
+        }
+      }
+
+      if (state.sessionState != VaultSessionState.Unlocked) {
+        LaunchedEffect(state.securitySettings.alwaysBlockScreenshots) {
+          if (state.securitySettings.alwaysBlockScreenshots) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
           } else {
-            fallbackToPin()
+            window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
           }
         }
+      }
 
       BeastLockTheme(
         themeMode = state.securitySettings.themeMode,
@@ -258,8 +317,20 @@ class MainActivity : FragmentActivity() {
               biometricAvailability = state.biometricAvailability,
               themeMode = state.securitySettings.themeMode,
               onSelectThemeMode = viewModel::setThemeMode,
-              onCompleteSetup = { pin, enableBio, q1, a1, q2, a2 ->
-                viewModel.completeOnboarding(pin, enableBio, q1, a1, q2, a2)
+              onCompleteSetup = { lockType, pin, patternNodes, enableBio, q1, a1, q2, a2, shareCustom, customPrompts, externalUri ->
+                viewModel.completeOnboardingWithChoice(
+                  lockType = lockType,
+                  pin = pin,
+                  patternNodes = patternNodes,
+                  enableBiometrics = enableBio,
+                  question1 = q1,
+                  answer1 = a1,
+                  question2 = q2,
+                  answer2 = a2,
+                  shareCustomQuestionSuggestions = shareCustom,
+                  customQuestionsToQueue = customPrompts,
+                  externalDualKeyUri = externalUri,
+                )
               },
             )
           }
@@ -269,12 +340,25 @@ class MainActivity : FragmentActivity() {
               biometricAvailability = state.biometricAvailability,
               authError = state.authError,
               recoveryError = state.recoveryError,
+              biometricFallbackTrigger = biometricFallbackTrigger,
+              biometricFallbackReason = biometricFallbackReason,
               onPinSubmitted = viewModel::unlockWithPin,
               onPatternSubmitted = viewModel::unlockWithPattern,
               onRequestBiometricPrompt = triggerUnlockBiometric,
-              onRecoverPin = viewModel::recoverPinWithSecurityQuestions,
+              onRecoverCredentials = { a1, a2, newPin, newPattern, targetType ->
+                viewModel.recoverWithSecurityQuestions(
+                  answer1 = a1,
+                  answer2 = a2,
+                  newPin = newPin,
+                  newPatternNodes = newPattern,
+                  newLockType = targetType,
+                )
+              },
               onSelectThemeMode = viewModel::setThemeMode,
-              onClearErrors = viewModel::clearMessages,
+              onClearErrors = {
+                biometricFallbackReason = null
+                viewModel.clearMessages()
+              },
             )
           }
           VaultSessionState.Unlocked -> {
@@ -282,7 +366,7 @@ class MainActivity : FragmentActivity() {
               activity = this@MainActivity,
               viewModel = viewModel,
               hasAccelerometer = panicMonitor.hasAccelerometer,
-              authorizeActionBiometric = authorizeActionBiometric,
+              onAuthorizeBiometric = authorizeActionBiometric,
             )
           }
         }
@@ -316,13 +400,39 @@ private data class PendingMigrationRequest(
   val removeOriginalsAfterSuccess: Boolean,
 )
 
+private data class PendingSecondaryAuthAction(
+  val title: String,
+  val description: String,
+  val actionLabel: String,
+  val onAuthorized: () -> Unit,
+  val onDismiss: () -> Unit = {},
+)
+
 @Composable
 private fun VaultUnlockedAppShell(
   activity: FragmentActivity,
   viewModel: VaultViewModel,
   hasAccelerometer: Boolean,
-  authorizeActionBiometric: (fallbackToPin: () -> Unit, onAuthorized: () -> Unit) -> Unit,
+  onAuthorizeBiometric: (
+    folderName: String?,
+    isUnlocking: Boolean,
+    title: String?,
+    subtitle: String?,
+    fallbackToSecondary: () -> Unit,
+    onCancelled: () -> Unit,
+    onAuthorized: () -> Unit,
+  ) -> Unit,
 ) {
+  val authorizeActionBiometric: (
+    folderName: String?,
+    isUnlocking: Boolean,
+    title: String?,
+    subtitle: String?,
+    fallbackToSecondary: () -> Unit,
+    onAuthorized: () -> Unit,
+  ) -> Unit = { folderName, isUnlocking, title, subtitle, fallbackToSecondary, onAuthorized ->
+    onAuthorizeBiometric(folderName, isUnlocking, title, subtitle, fallbackToSecondary, {}, onAuthorized)
+  }
   val state by viewModel.uiState.collectAsStateWithLifecycle()
   val navController = rememberNavController()
   val navBackStackEntry by navController.currentBackStackEntryAsState()
@@ -330,12 +440,77 @@ private fun VaultUnlockedAppShell(
   val snackbarHostState = remember { SnackbarHostState() }
   val context = LocalContext.current
   val coroutineScope = rememberCoroutineScope()
-  var pendingReencryptIncludeUnlocked by remember { mutableStateOf<Boolean?>(null) }
+  var pendingSecondaryAuthAction by remember { mutableStateOf<PendingSecondaryAuthAction?>(null) }
   var showOrphanCleanupDialog by remember { mutableStateOf(false) }
   var showIntegrityDiagnosticDialog by remember { mutableStateOf(false) }
   var showMigrationWizard by remember { mutableStateOf(false) }
   var activeMigrationRequest by remember { mutableStateOf<PendingMigrationRequest?>(null) }
-  var pendingMigrationPinRequest by remember { mutableStateOf<PendingMigrationRequest?>(null) }
+
+  val activeDetailFolderId = remember(navBackStackEntry) {
+    if (navBackStackEntry?.destination?.hasRoute<FolderDetailRoute>() == true) {
+      runCatching { navBackStackEntry?.toRoute<FolderDetailRoute>()?.folderId }.getOrNull()
+    } else {
+      null
+    }
+  }
+  val isViewingStealthFolder = activeDetailFolderId != null &&
+    state.folders.any { it.id == activeDetailFolderId && it.isStealthHidden }
+
+  val shouldBlockScreenshots = state.securitySettings.alwaysBlockScreenshots ||
+    state.isStealthRevealed ||
+    isViewingStealthFolder ||
+    state.securePreview != null
+  LaunchedEffect(activity, shouldBlockScreenshots) {
+    if (shouldBlockScreenshots) {
+      activity.window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    } else {
+      activity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    }
+  }
+  DisposableEffect(activity) {
+    onDispose {
+      activity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    }
+  }
+
+  LaunchedEffect(state.isStealthRevealed, isViewingStealthFolder) {
+    if (!state.isStealthRevealed && isViewingStealthFolder) {
+      navController.popBackStack<DashboardRoute>(inclusive = false)
+    }
+  }
+
+  LaunchedEffect(state.pendingStealthTriggerLabel) {
+    val trigger = state.pendingStealthTriggerLabel ?: return@LaunchedEffect
+    val authHint = when {
+      state.securitySettings.hasPatternLock && state.securitySettings.hasPinCredential ->
+        "Draw your 3×3 Pattern or enter your ${state.securitySettings.pinLength}-digit Master PIN"
+      state.securitySettings.hasPatternLock ->
+        "Draw your 3×3 Pattern"
+      else ->
+        "Enter your ${state.securitySettings.pinLength}-digit Master PIN"
+    }
+    onAuthorizeBiometric(
+      "Stealth Private Vault",
+      false,
+      "Unlock Stealth Private Vault",
+      "Verify with fingerprint or facial recognition to reveal hidden Private Vault folders",
+      {
+        pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+          title = "Unlock Stealth Private Vault",
+          description = "$authHint to reveal hidden Private Vault folders.",
+          actionLabel = "Stealth Private Vault ($trigger)",
+          onAuthorized = { viewModel.onStealthAuthVerified() },
+          onDismiss = { viewModel.dismissStealthAuthChallenge() },
+        )
+      },
+      {
+        viewModel.dismissStealthAuthChallenge()
+      },
+      {
+        viewModel.onStealthAuthVerified()
+      },
+    )
+  }
 
   val driveAuthLauncher = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.StartIntentSenderForResult(),
@@ -555,6 +730,37 @@ private fun VaultUnlockedAppShell(
           }
         }
 
+        val openFolderWithAuthGate: (String) -> Unit = { folderId ->
+          val targetFolder = state.folders.find { it.id == folderId }
+          if (targetFolder != null && (targetFolder.requireAuthOnOpen || targetFolder.isLocked || targetFolder.encryptedFileCount > 0)) {
+            authorizeActionBiometric(
+              targetFolder.name,
+              false,
+              null,
+              null,
+              {
+                val authHint = when {
+                  state.securitySettings.hasPatternLock && state.securitySettings.hasPinCredential ->
+                    "Draw your 3×3 Pattern or enter your ${state.securitySettings.pinLength}-digit Master PIN"
+                  state.securitySettings.hasPatternLock ->
+                    "Draw your 3×3 Pattern"
+                  else ->
+                    "Enter your ${state.securitySettings.pinLength}-digit Master PIN"
+                }
+                pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                  title = "Authenticate Folder Access",
+                  description = "$authHint to open \"${targetFolder.name}\".",
+                  actionLabel = targetFolder.name,
+                  onAuthorized = { navController.navigate(FolderDetailRoute(folderId)) },
+                )
+              },
+              { navController.navigate(FolderDetailRoute(folderId)) },
+            )
+          } else {
+            navController.navigate(FolderDetailRoute(folderId))
+          }
+        }
+
         NavHost(
           navController = navController,
           startDestination = DashboardRoute,
@@ -566,16 +772,46 @@ private fun VaultUnlockedAppShell(
               onSelectFilter = viewModel::setFilter,
               onSearchQueryChange = viewModel::setSearchQuery,
               onPickDeviceFolder = viewModel::addDeviceFolder,
-              onDecryptAnyDeviceFolder = viewModel::decryptAnyDeviceFolder,
-              onCreatePrivateFolder = viewModel::createPrivateFolder,
-              onOpenFolder = { folderId ->
-                navController.navigate(FolderDetailRoute(folderId))
+              onPreviewPickedFolder = viewModel::previewPickedDeviceFolder,
+              onUpdateFolderPickerOptions = viewModel::updateFolderPickerPreviewOptions,
+              onConfirmFolderPickerPreview = viewModel::confirmFolderPickerPreview,
+              onDismissFolderPickerPreview = viewModel::dismissFolderPickerPreview,
+              onRegrantFolderPermission = viewModel::regrantDeviceFolderPermission,
+              onDecryptAnyDeviceFolder = { uri ->
+                authorizeActionBiometric(
+                  null,
+                  true,
+                  "Authorize Folder Decryption",
+                  "Verify with fingerprint or facial recognition to decrypt files in the selected device folder",
+                  {
+                    pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                      title = "Authorize Folder Decryption",
+                      description = "Draw your 3×3 Pattern or enter Master PIN to decrypt files in the selected device folder.",
+                      actionLabel = "Decrypt Any Device Folder",
+                      onAuthorized = { viewModel.decryptAnyDeviceFolder(uri) },
+                    )
+                  },
+                  { viewModel.decryptAnyDeviceFolder(uri) },
+                )
               },
+              onCreatePrivateFolder = viewModel::createPrivateFolder,
+              onOpenFolder = openFolderWithAuthGate,
               onToggleLockFolder = { folder ->
                 if (folder.isLocked) {
                   if (folder.requireBiometricPerUnlock) {
                     authorizeActionBiometric(
-                      { viewModel.unlockFolder(folder.id) },
+                      folder.name,
+                      true,
+                      null,
+                      null,
+                      {
+                        pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                          title = "Authorize Folder Unlock",
+                          description = "Draw your 3×3 Pattern or enter Master PIN to decrypt \"${folder.name}\".",
+                          actionLabel = folder.name,
+                          onAuthorized = { viewModel.unlockFolder(folder.id) },
+                        )
+                      },
                       { viewModel.unlockFolder(folder.id) },
                     )
                   } else {
@@ -599,7 +835,18 @@ private fun VaultUnlockedAppShell(
                 }
                 if (selectedLocked.any { it.requireBiometricPerUnlock }) {
                   authorizeActionBiometric(
-                    { viewModel.decryptSelectedFolders() },
+                    null,
+                    true,
+                    "Unlock ${selectedLocked.size} Encrypted Folder(s)",
+                    "Verify with fingerprint or facial recognition to decrypt selected folders",
+                    {
+                      pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                        title = "Authorize Batch Unlock",
+                        description = "Draw your 3×3 Pattern or enter Master PIN to decrypt ${selectedLocked.size} selected folder(s).",
+                        actionLabel = "Batch Folder Unlock",
+                        onAuthorized = { viewModel.decryptSelectedFolders() },
+                      )
+                    },
                     { viewModel.decryptSelectedFolders() },
                   )
                 } else {
@@ -608,7 +855,18 @@ private fun VaultUnlockedAppShell(
               },
               onReencryptSelectedFolders = { includeUnlocked ->
                 authorizeActionBiometric(
-                  { pendingReencryptIncludeUnlocked = includeUnlocked },
+                  null,
+                  false,
+                  "Authorize Key Rotation",
+                  "Verify with fingerprint or facial recognition to rotate folder encryption keys",
+                  {
+                    pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                      title = "Authorize Key Rotation",
+                      description = "Draw your 3×3 Pattern or enter your Master Vault PIN to authorize key rotation and re-encryption.",
+                      actionLabel = "Batch Key Rotation",
+                      onAuthorized = { viewModel.reencryptSelectedFolders(includeUnlocked) },
+                    )
+                  },
                   { viewModel.reencryptSelectedFolders(includeUnlocked) },
                 )
               },
@@ -619,6 +877,8 @@ private fun VaultUnlockedAppShell(
               onSetSelectedAutoCloudSync = viewModel::setSelectedFoldersAutoCloudBackupSync,
               onBatchRenameFolders = viewModel::batchRenameFolders,
               onOpenStorageCharts = { navigateTop(StorageAnalyticsRoute) },
+              onOpenDiagnostics = { navController.navigate(DiagnosticsSupportRoute) },
+              onTriggerStealthGesture = { viewModel.requestRevealStealthVault("SHIELD_GESTURE") },
               onLockVaultNow = { viewModel.lockVaultNow() },
               onSelectThemeMode = viewModel::setThemeMode,
               modifier = Modifier.statusBarsPadding(),
@@ -628,9 +888,7 @@ private fun VaultUnlockedAppShell(
           composable<StorageAnalyticsRoute> {
             StorageAnalyticsScreen(
               state = state,
-              onOpenFolder = { folderId ->
-                navController.navigate(FolderDetailRoute(folderId))
-              },
+              onOpenFolder = openFolderWithAuthGate,
               onLockFolder = { folderId ->
                 viewModel.lockFolder(folderId)
               },
@@ -675,7 +933,18 @@ private fun VaultUnlockedAppShell(
               onUnlockFolder = {
                 if (folder?.requireBiometricPerUnlock == true) {
                   authorizeActionBiometric(
-                    { viewModel.unlockFolder(route.folderId, reloadDetail = true) },
+                    folder.name,
+                    true,
+                    null,
+                    null,
+                    {
+                      pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                        title = "Authorize Folder Unlock",
+                        description = "Draw your 3×3 Pattern or enter Master PIN to decrypt \"${folder.name}\".",
+                        actionLabel = folder.name,
+                        onAuthorized = { viewModel.unlockFolder(route.folderId, reloadDetail = true) },
+                      )
+                    },
                     { viewModel.unlockFolder(route.folderId, reloadDetail = true) },
                   )
                 } else {
@@ -688,7 +957,20 @@ private fun VaultUnlockedAppShell(
               onDecryptFiles = { fileIds ->
                 if (folder?.requireBiometricPerUnlock == true) {
                   authorizeActionBiometric(
-                    { viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true) },
+                    folder.name,
+                    true,
+                    "Decrypt File(s) in \"${folder.name}\"",
+                    "Verify with fingerprint or facial recognition to decrypt ${fileIds.size} selected file(s)",
+                    {
+                      pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                        title = "Authorize File Decryption",
+                        description = "Draw your 3×3 Pattern or enter Master PIN to decrypt ${fileIds.size} selected file(s) in \"${folder.name}\".",
+                        actionLabel = folder.name,
+                        onAuthorized = {
+                          viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true)
+                        },
+                      )
+                    },
                     { viewModel.decryptFilesInFolder(route.folderId, fileIds, reloadDetail = true) },
                   )
                 } else {
@@ -707,17 +989,38 @@ private fun VaultUnlockedAppShell(
               onBatchRenameFiles = { renameMap ->
                 viewModel.batchRenameFiles(route.folderId, renameMap)
               },
-              onPeekFile = viewModel::peekFile,
+              onPeekFile = { item ->
+                if (item.isEncrypted && folder?.requireBiometricPerUnlock == true && !folder.requireAuthOnOpen) {
+                  authorizeActionBiometric(
+                    folder.name,
+                    false,
+                    "Preview \"${item.displayName}\"",
+                    "Verify with fingerprint or facial recognition to inspect encrypted file contents",
+                    {
+                      pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                        title = "Authorize Encrypted Preview",
+                        description = "Draw your 3×3 Pattern or enter Master PIN to preview \"${item.displayName}\".",
+                        actionLabel = item.displayName,
+                        onAuthorized = { viewModel.peekFile(item) },
+                      )
+                    },
+                    { viewModel.peekFile(item) },
+                  )
+                } else {
+                  viewModel.peekFile(item)
+                }
+              },
               onDismissPreview = viewModel::dismissPreview,
               onRemoveFolder = { decryptLockedSafFirst ->
-                viewModel.removeFolder(route.folderId, decryptLockedSafFirst = decryptLockedSafFirst)
+                viewModel.removeFolder(folderId = route.folderId, decryptLockedSafFirst = decryptLockedSafFirst)
               },
+              onPickerLaunching = viewModel::markStealthPickerInFlight,
             )
           }
 
           composable<CloudBackupRoute> {
             CloudBackupScreen(
-              folders = state.folders,
+              folders = state.analyticsVisibleFolders,
               backupRecords = state.backupRecords,
               driveBackups = state.driveBackups,
               isDriveSyncBusy = state.isDriveSyncBusy,
@@ -777,7 +1080,10 @@ private fun VaultUnlockedAppShell(
               isScanningOrphans = state.isScanningOrphans,
               isScanningIntegrity = state.isScanningIntegrity,
               lastIntegrityCorruptedCount = state.integrityDiagnosticReport?.corruptedFiles?.size,
+              dualKeyStatus = state.dualKeyStatus,
+              pendingIssuesCount = state.pendingIssuesCount,
               onToggleBiometric = viewModel::setBiometricEnabled,
+              onSelectPrimaryLockType = viewModel::setPrimaryLockType,
               onToggleAutoLockEnabled = viewModel::setAutoLockEnabled,
               onSelectAutoLockSeconds = viewModel::setAutoLockTimeout,
               onToggleAutoLockReencrypt = viewModel::setAutoLockReencryptFolders,
@@ -819,9 +1125,13 @@ private fun VaultUnlockedAppShell(
               },
               onRemovePattern = viewModel::removeUnlockPattern,
               onTogglePreferPatternFallback = viewModel::setPreferPatternFallback,
-              onUpdateRecoveryQuestions = { q1, a1, q2, a2, done ->
-                viewModel.updateSecurityQuestions(q1, a1, q2, a2, done)
+              onTogglePatternStealthMode = viewModel::setPatternStealthMode,
+              onUpdateRecoveryQuestions = { q1, a1, q2, a2, customPrompts, shareSuggestions, done ->
+                viewModel.updateSecurityQuestions(q1, a1, q2, a2, customPrompts, shareSuggestions, done)
               },
+              onLinkExternalDualKeyFolder = viewModel::linkExternalDualKeyFolder,
+              onVerifyDualKeyVault = viewModel::verifyDualKeyVaultNow,
+              onOpenDiagnostics = { navController.navigate(DiagnosticsSupportRoute) },
               onOpenOrphanCleanup = {
                 viewModel.scanOrphanedFiles()
                 showOrphanCleanupDialog = true
@@ -833,6 +1143,26 @@ private fun VaultUnlockedAppShell(
                 }
               },
               onOpenMigrateOut = { showMigrationWizard = true },
+              onSelectStealthGestureMode = viewModel::setStealthGestureMode,
+              onToggleAlwaysBlockScreenshots = viewModel::setAlwaysBlockScreenshots,
+              onChangeStealthCode = viewModel::setStealthAccessCode,
+              onOpenStealthVault = { viewModel.requestRevealStealthVault("SETTINGS") },
+              modifier = Modifier.statusBarsPadding(),
+            )
+          }
+
+          composable<DiagnosticsSupportRoute> {
+            DiagnosticsSupportScreen(
+              state = state,
+              onBack = {
+                if (navController.currentBackStackEntry?.destination?.hasRoute<DiagnosticsSupportRoute>() == true) {
+                  navController.popBackStack()
+                }
+              },
+              onSignInWithGoogle = { viewModel.signInFirebaseWithGoogle(activity) },
+              onSignOut = viewModel::signOutFirebase,
+              onSendReport = viewModel::sendDiagnosticReport,
+              onClearSentHistory = viewModel::clearSentDiagnosticHistory,
               modifier = Modifier.statusBarsPadding(),
             )
           }
@@ -840,31 +1170,37 @@ private fun VaultUnlockedAppShell(
       }
     }
 
-    pendingReencryptIncludeUnlocked?.let { includeUnlocked ->
-      ReencryptPinVerificationDialog(
-        description = "Enter your Master Vault PIN to authorize key rotation and re-encryption.",
-        onDismiss = { pendingReencryptIncludeUnlocked = null },
-        onVerifyPin = { pin, onChecked ->
-          viewModel.verifyMasterPinForReencrypt(pin) { ok ->
+    pendingSecondaryAuthAction?.let { pending ->
+      SecondaryAuthChallengeDialog(
+        title = pending.title,
+        description = pending.description,
+        hasPatternLock = state.securitySettings.hasPatternLock,
+        hasPinCredential = state.securitySettings.hasPinCredential,
+        expectedPinLength = state.securitySettings.pinLength,
+        preferPatternDefault = state.securitySettings.preferPatternFallback ||
+          !state.securitySettings.hasPinCredential,
+        stealthMode = state.securitySettings.patternStealthMode,
+        onDismiss = {
+          val dismissCallback = pending.onDismiss
+          pendingSecondaryAuthAction = null
+          dismissCallback()
+        },
+        onVerifyPattern = { nodes, onChecked ->
+          viewModel.verifyPatternForAction(nodes, actionLabel = pending.actionLabel) { ok ->
             if (ok) {
-              pendingReencryptIncludeUnlocked = null
-              viewModel.reencryptSelectedFolders(includeUnlocked)
+              val authorizedAction = pending.onAuthorized
+              pendingSecondaryAuthAction = null
+              authorizedAction()
             }
             onChecked(ok)
           }
         },
-      )
-    }
-
-    pendingMigrationPinRequest?.let { req ->
-      ReencryptPinVerificationDialog(
-        description = "Enter your Master Vault PIN to decrypt and export BeastLock content out of the vault.",
-        onDismiss = { pendingMigrationPinRequest = null },
         onVerifyPin = { pin, onChecked ->
-          viewModel.verifyMasterPinForMigration(pin) { ok ->
+          viewModel.verifyMasterPinForAction(pin, actionLabel = pending.actionLabel) { ok ->
             if (ok) {
-              pendingMigrationPinRequest = null
-              launchDestinationPicker(req)
+              val authorizedAction = pending.onAuthorized
+              pendingSecondaryAuthAction = null
+              authorizedAction()
             }
             onChecked(ok)
           }
@@ -917,7 +1253,7 @@ private fun VaultUnlockedAppShell(
 
     if (showMigrationWizard) {
       MigrationWizardDialog(
-        folders = state.folders,
+        folders = state.analyticsVisibleFolders,
         onDismiss = { showMigrationWizard = false },
         onConfirmExport = { folderIds, format, removeOriginals ->
           showMigrationWizard = false
@@ -927,7 +1263,18 @@ private fun VaultUnlockedAppShell(
             removeOriginalsAfterSuccess = removeOriginals,
           )
           authorizeActionBiometric(
-            { pendingMigrationPinRequest = req },
+            null,
+            true,
+            "Authorize Exit Migration",
+            "Verify with fingerprint or facial recognition to decrypt and export vault folders",
+            {
+              pendingSecondaryAuthAction = PendingSecondaryAuthAction(
+                title = "Authorize Exit Migration",
+                description = "Draw your 3×3 Pattern or enter your Master Vault PIN to decrypt and export BeastLock content out of the vault.",
+                actionLabel = "Exit Migration",
+                onAuthorized = { launchDestinationPicker(req) },
+              )
+            },
             { launchDestinationPicker(req) },
           )
         },
@@ -947,84 +1294,23 @@ private fun VaultUnlockedAppShell(
         onDismiss = viewModel::dismissMigrationResult,
       )
     }
-  }
-}
 
-@Composable
-private fun ReencryptPinVerificationDialog(
-  description: String = "Enter your Master Vault PIN to authorize key rotation and re-encryption.",
-  onDismiss: () -> Unit,
-  onVerifyPin: (pin: String, onChecked: (Boolean) -> Unit) -> Unit,
-) {
-  var pin by remember { mutableStateOf("") }
-  var error by remember { mutableStateOf<String?>(null) }
-  var isVerifying by remember { mutableStateOf(false) }
-
-  AlertDialog(
-    onDismissRequest = { if (!isVerifying) onDismiss() },
-    title = { Text("Verify Master PIN") },
-    text = {
-      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-          text = description,
-          style = MaterialTheme.typography.bodySmall,
-          color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        OutlinedTextField(
-          value = pin,
-          onValueChange = {
-            pin = it.filter { ch -> ch.isDigit() }.take(12)
-            error = null
-          },
-          label = { Text("Master PIN") },
-          visualTransformation = PasswordVisualTransformation(),
-          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-          singleLine = true,
-          isError = error != null,
-          modifier = Modifier
-            .fillMaxWidth()
-            .testTag("reencrypt_pin_input"),
-        )
-        if (error != null) {
-          Text(
-            text = error!!,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.error,
-          )
-        }
-      }
-    },
-    confirmButton = {
-      Button(
-        onClick = {
-          if (pin.length < 4) {
-            error = "Enter your Master PIN"
-          } else {
-            isVerifying = true
-            onVerifyPin(pin) { ok ->
-              isVerifying = false
-              if (!ok) {
-                error = "Incorrect Master PIN"
-              }
-            }
-          }
+    if (state.isStealthRevealed && !isViewingStealthFolder) {
+      StealthVaultDrawerSheet(
+        stealthFolders = state.stealthFolders,
+        onOpenFolder = { folderId ->
+          navController.navigate(FolderDetailRoute(folderId))
         },
-        enabled = !isVerifying,
-        modifier = Modifier.testTag("reencrypt_pin_confirm_button"),
-      ) {
-        Text(if (isVerifying) "Verifying..." else "Authorize")
-      }
-    },
-    dismissButton = {
-      TextButton(
-        onClick = onDismiss,
-        enabled = !isVerifying,
-      ) {
-        Text("Cancel")
-      }
-    },
-    modifier = Modifier.testTag("reencrypt_pin_dialog"),
-  )
+        onCreateStealthFolder = viewModel::createPrivateFolder,
+        onRemoveFolder = { folderId ->
+          viewModel.removeFolder(folderId, decryptLockedSafFirst = true)
+        },
+        onConcealVault = {
+          viewModel.concealPrivateVault(source = "DRAWER_DISMISSED")
+        },
+      )
+    }
+  }
 }
 
 private fun requestAddQuickTile(

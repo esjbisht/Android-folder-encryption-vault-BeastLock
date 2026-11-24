@@ -2,10 +2,13 @@ package com.example.ui
 
 import android.net.Uri
 import com.example.crypto.BiometricAvailability
+import com.example.crypto.DualKeyMirrorStatus
+import com.example.crypto.UriPermissionStatus
 import com.example.data.audit.AuditLogSnapshot
 import com.example.data.backup.CloudBackupProgress
 import com.example.data.backup.DriveVaultBackupItem
 import com.example.data.local.BackupRecordEntity
+import com.example.data.local.SystemIssueReportEntity
 import com.example.data.local.VaultFolderEntity
 import com.example.data.preferences.SecuritySettings
 import com.example.data.storage.EncryptionProgress
@@ -17,6 +20,7 @@ import com.example.data.storage.OrphanCleanupResult
 import com.example.data.storage.OrphanedFileCandidate
 import com.example.data.storage.SecurePreviewContent
 import com.example.data.storage.VaultFileItem
+import com.example.data.telemetry.CloudDiagnosticReport
 import com.example.security.DevicePowerState
 import kotlinx.serialization.Serializable
 
@@ -37,6 +41,9 @@ data object AuditLogRoute
 
 @Serializable
 data object SecuritySettingsRoute
+
+@Serializable
+data object DiagnosticsSupportRoute
 
 sealed interface VaultSessionState {
   data object Loading : VaultSessionState
@@ -62,6 +69,19 @@ data class SelectiveLockPromptState(
   val alreadyEncryptedCount: Int = 0,
   val isLoading: Boolean = true,
   val reloadDetailAfterLock: Boolean = false,
+)
+
+data class PendingFolderPickerPreview(
+  val treeUri: Uri,
+  val displayName: String,
+  val permissionStatus: UriPermissionStatus,
+  val plaintextFileCount: Int,
+  val encryptedFileCount: Int,
+  val totalBytes: Long,
+  val existingFolderId: String? = null,
+  val obfuscateFilenames: Boolean = true,
+  val requireAuthOnOpen: Boolean = true,
+  val isScanning: Boolean = false,
 )
 
 fun matchesFolderSearchQuery(folder: VaultFolderEntity, rawQuery: String): Boolean {
@@ -126,13 +146,36 @@ data class VaultUiState(
   val isPreviewLoading: Boolean = false,
   val selectiveLockPrompt: SelectiveLockPromptState? = null,
   val pendingRestoreUriRequiringPin: Uri? = null,
+  val systemIssues: List<SystemIssueReportEntity> = emptyList(),
+  val cloudSubmittedReports: List<CloudDiagnosticReport> = emptyList(),
+  val firebaseUserUid: String? = null,
+  val firebaseUserEmail: String? = null,
+  val isSigningInFirebase: Boolean = false,
+  val isSendingDiagnosticReport: Boolean = false,
+  val dualKeyStatus: DualKeyMirrorStatus? = null,
+  val isStealthRevealed: Boolean = false,
+  val pendingStealthTriggerLabel: String? = null,
+  val isStealthPickerInFlight: Boolean = false,
+  val pendingFolderPickerPreview: PendingFolderPickerPreview? = null,
+  val folderPermissionStatuses: Map<String, UriPermissionStatus> = emptyMap(),
   val authError: String? = null,
   val recoveryError: String? = null,
   val statusMessage: String? = null,
   val errorMessage: String? = null,
 ) {
+  val pendingIssuesCount: Int get() = systemIssues.count { it.syncStatus == "PENDING" }
+
+  val publicFolders: List<VaultFolderEntity>
+    get() = folders.filter { !it.isStealthHidden }
+
+  val stealthFolders: List<VaultFolderEntity>
+    get() = if (isStealthRevealed) folders.filter { it.isStealthHidden } else emptyList()
+
+  val analyticsVisibleFolders: List<VaultFolderEntity>
+    get() = if (isStealthRevealed) folders else publicFolders
+
   val filteredFolders: List<VaultFolderEntity>
-    get() = folders.filter { folder ->
+    get() = publicFolders.filter { folder ->
       val matchesFilter = when (folderFilter) {
         FolderFilter.ALL -> true
         FolderFilter.LOCKED -> folder.isLocked
@@ -141,11 +184,11 @@ data class VaultUiState(
       matchesFilter && matchesFolderSearchQuery(folder, searchQuery)
     }
 
-  val lockedFoldersCount: Int get() = folders.count { it.isLocked }
-  val unlockedFoldersCount: Int get() = folders.count { !it.isLocked }
-  val totalEncryptedFiles: Int get() = folders.sumOf { it.encryptedFileCount }
-  val totalUnencryptedFiles: Int get() = folders.sumOf { (it.fileCount - it.encryptedFileCount).coerceAtLeast(0) }
-  val totalProtectedBytes: Long get() = folders.sumOf { it.totalBytes }
+  val lockedFoldersCount: Int get() = publicFolders.count { it.isLocked }
+  val unlockedFoldersCount: Int get() = publicFolders.count { !it.isLocked }
+  val totalEncryptedFiles: Int get() = publicFolders.sumOf { it.encryptedFileCount }
+  val totalUnencryptedFiles: Int get() = publicFolders.sumOf { (it.fileCount - it.encryptedFileCount).coerceAtLeast(0) }
+  val totalProtectedBytes: Long get() = publicFolders.sumOf { it.totalBytes }
   val totalOrphanBytes: Long get() = orphanCandidates.sumOf { it.sizeBytes }
   val selectedOrphanBytes: Long
     get() = orphanCandidates.filter { it.id in selectedOrphanIds }.sumOf { it.sizeBytes }
@@ -153,7 +196,7 @@ data class VaultUiState(
     get() = securitySettings.batterySaverModeEnabled && devicePowerState.isBatterySaverPaused
 
   val totalEncryptedBytes: Long
-    get() = folders.sumOf { folder ->
+    get() = analyticsVisibleFolders.sumOf { folder ->
       when {
         folder.encryptedBytes > 0L || folder.unencryptedBytes > 0L -> folder.encryptedBytes
         folder.isLocked -> folder.totalBytes
@@ -162,7 +205,7 @@ data class VaultUiState(
     }
 
   val totalUnencryptedBytes: Long
-    get() = folders.sumOf { folder ->
+    get() = analyticsVisibleFolders.sumOf { folder ->
       when {
         folder.encryptedBytes > 0L || folder.unencryptedBytes > 0L -> folder.unencryptedBytes
         !folder.isLocked -> folder.totalBytes

@@ -392,7 +392,9 @@ class CloudBackupManager(
       for (folder in selectedFolders) {
         val sources = mutableListOf<BackupSourceFile>()
         if (folder.isInternalVault) {
-          val dir = File(File(context.filesDir, "vaults"), folder.id)
+          val stealthDir = File(File(context.filesDir, ".beastlock_private"), folder.id)
+          val legacyDir = File(File(context.filesDir, "vaults"), folder.id)
+          val dir = if (!stealthDir.exists() && legacyDir.exists()) legacyDir else stealthDir
           if (dir.exists()) {
             dir.walkTopDown()
               .filter { it.isFile && it.name != ".nomedia" && !it.name.startsWith(".tmp_") }
@@ -611,7 +613,10 @@ class CloudBackupManager(
       for (folderEntry in resolvedManifest.folders) {
         val newId = UUID.randomUUID().toString()
         localFolderMap[folderEntry.id] = newId
-        val dir = File(File(context.filesDir, "vaults"), newId)
+        val rootDir = File(context.filesDir, ".beastlock_private")
+        if (!rootDir.exists()) rootDir.mkdirs()
+        File(rootDir, ".nomedia").apply { if (!exists()) createNewFile() }
+        val dir = File(rootDir, newId)
         dir.mkdirs()
         File(dir, ".nomedia").createNewFile()
 
@@ -658,7 +663,7 @@ class CloudBackupManager(
                       totalFiles = totalFiles,
                     ),
                   )
-                  val targetDir = File(File(context.filesDir, "vaults"), newFolderId)
+                  val targetDir = File(File(context.filesDir, ".beastlock_private"), newFolderId)
                   val targetFile = File(targetDir, fileName)
 
                   if (backupDek == currentDek) {
@@ -706,6 +711,7 @@ class CloudBackupManager(
           treeUri = "app-internal://$newId",
           isInternalVault = true,
           isLocked = count > 0,
+          isStealthHidden = true,
           fileCount = count,
           encryptedFileCount = count,
           totalBytes = bytes,

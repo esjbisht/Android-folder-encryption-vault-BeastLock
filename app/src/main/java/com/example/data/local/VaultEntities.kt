@@ -25,6 +25,8 @@ data class VaultFolderEntity(
   val keyFingerprint: String = "",
   val lastKeyRotatedAt: Long = 0L,
   val autoCloudBackupSync: Boolean = true,
+  val requireAuthOnOpen: Boolean = true,
+  val isStealthHidden: Boolean = false,
 )
 
 @Entity(tableName = "audit_logs")
@@ -49,4 +51,20 @@ data class BackupRecordEntity(
   val totalBytes: Long,
   val sha256Checksum: String,
   val createdAt: Long = System.currentTimeMillis(),
+)
+
+@Entity(tableName = "system_issue_reports")
+data class SystemIssueReportEntity(
+  @PrimaryKey val id: String,
+  val occurredAtMillis: Long,
+  val category: String,
+  val errorCode: String,
+  val sanitizedSummary: String,
+  val healthSnapshot: String,
+  val userFeedback: String = "",
+  val appVersion: String,
+  val androidSdk: Int,
+  val deviceModel: String,
+  val syncStatus: String = "PENDING",
+  val cloudDocumentId: String? = null,
 )

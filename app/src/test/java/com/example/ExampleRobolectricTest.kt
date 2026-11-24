@@ -113,7 +113,7 @@ class ExampleRobolectricTest {
       val dek = AesFolderCipher.generateAes256Key()
       val folder = repo.createInternalVaultFolder("AutoLockTest", obfuscateDefault = true).getOrThrow()
 
-      val vaultDir = java.io.File(java.io.File(context.filesDir, "vaults"), folder.id)
+      val vaultDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), folder.id)
       val plainFile = java.io.File(vaultDir, "notes.txt")
       plainFile.writeText("Sensitive auto-lock payload")
 
@@ -299,8 +299,8 @@ class ExampleRobolectricTest {
 
       val f1 = repo.createInternalVaultFolder("Passports", obfuscateDefault = true).getOrThrow()
       val f2 = repo.createInternalVaultFolder("Contracts", obfuscateDefault = false).getOrThrow()
-      val file1 = java.io.File(java.io.File(java.io.File(context.filesDir, "vaults"), f1.id), "passport.txt")
-      val file2 = java.io.File(java.io.File(java.io.File(context.filesDir, "vaults"), f2.id), "contract.txt")
+      val file1 = java.io.File(java.io.File(java.io.File(context.filesDir, ".beastlock_private"), f1.id), "passport.txt")
+      val file2 = java.io.File(java.io.File(java.io.File(context.filesDir, ".beastlock_private"), f2.id), "contract.txt")
       file1.writeText("Passport #12345")
       file2.writeText("NDA Agreement")
 
@@ -334,12 +334,12 @@ class ExampleRobolectricTest {
       val masterDek = AesFolderCipher.generateAes256Key()
 
       val lockedFolder = repo.createInternalVaultFolder("RotatedLocked", obfuscateDefault = true).getOrThrow()
-      val unlockedFolder = repo.createInternalVaultFolder("RotatedUnlocked", obfuscateDefault = false).getOrThrow()
-      val untouchedFolder = repo.createInternalVaultFolder("Untouched", obfuscateDefault = false).getOrThrow()
+      val unlockedFolder = repo.createInternalVaultFolder("RotatedUnlocked", obfuscateDefault = false, stealthHidden = false).getOrThrow()
+      val untouchedFolder = repo.createInternalVaultFolder("Untouched", obfuscateDefault = false, stealthHidden = false).getOrThrow()
 
-      val lockedDir = java.io.File(java.io.File(context.filesDir, "vaults"), lockedFolder.id)
-      val unlockedDir = java.io.File(java.io.File(context.filesDir, "vaults"), unlockedFolder.id)
-      val untouchedDir = java.io.File(java.io.File(context.filesDir, "vaults"), untouchedFolder.id)
+      val lockedDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), lockedFolder.id)
+      val unlockedDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), unlockedFolder.id)
+      val untouchedDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), untouchedFolder.id)
 
       val fLocked = java.io.File(lockedDir, "secret_tax.txt").apply { writeText("2026 Tax Return") }
       val fUnlocked = java.io.File(unlockedDir, "draft_memo.txt").apply { writeText("Board Memo Draft") }
@@ -442,7 +442,7 @@ class ExampleRobolectricTest {
       )
 
       val folder = repo.createInternalVaultFolder("BackupRotated", obfuscateDefault = true).getOrThrow()
-      val vaultDir = java.io.File(java.io.File(context.filesDir, "vaults"), folder.id)
+      val vaultDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), folder.id)
       java.io.File(vaultDir, "keys.txt").writeText("Rotated Cloud Backup Secret")
       repo.lockFolder(folder.id, originalMasterDek).getOrThrow()
       repo.reencryptFoldersBatch(listOf(folder.id), originalMasterDek, encryptUnlockedFolders = true)
@@ -477,7 +477,7 @@ class ExampleRobolectricTest {
       assertEquals(true, !restoredFolder.wrappedFolderKey.isNullOrBlank())
 
       repo.unlockFolder(restoredFolder.id, newVaultMasterDek).getOrThrow()
-      val restoredFile = java.io.File(java.io.File(java.io.File(context.filesDir, "vaults"), restoredFolder.id), "keys.txt")
+      val restoredFile = java.io.File(java.io.File(java.io.File(context.filesDir, ".beastlock_private"), restoredFolder.id), "keys.txt")
       assertEquals("Rotated Cloud Backup Secret", restoredFile.readText())
     } finally {
       db.close()
@@ -529,8 +529,8 @@ class ExampleRobolectricTest {
       assertEquals(1, changed) // only thirdFolder changed from true -> false
       assertEquals(false, db.vaultDao().getFolderById(thirdFolder.id)!!.autoCloudBackupSync)
 
-      val syncedDir = java.io.File(java.io.File(context.filesDir, "vaults"), syncedFolder.id)
-      val localOnlyDir = java.io.File(java.io.File(context.filesDir, "vaults"), localOnlyFolder.id)
+      val syncedDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), syncedFolder.id)
+      val localOnlyDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), localOnlyFolder.id)
       java.io.File(syncedDir, "cloud_doc.txt").writeText("Sync to Cloud")
       java.io.File(localOnlyDir, "device_secret.txt").writeText("Stay Local Only")
 
@@ -600,7 +600,7 @@ class ExampleRobolectricTest {
 
       val masterDek = AesFolderCipher.generateAes256Key()
       val activeFolder = repo.createInternalVaultFolder("ActiveVault", obfuscateDefault = true).getOrThrow()
-      val activeDir = java.io.File(java.io.File(context.filesDir, "vaults"), activeFolder.id)
+      val activeDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), activeFolder.id)
       java.io.File(activeDir, "keep.txt").writeText("Active Protected Content")
       repo.lockFolder(activeFolder.id, masterDek).getOrThrow()
 
@@ -620,7 +620,7 @@ class ExampleRobolectricTest {
         com.example.data.backup.CloudBackupManager.AUTO_SYNC_ARCHIVE_NAME,
       ).apply { createNewFile() }
 
-      val orphanGhostDir = java.io.File(java.io.File(context.filesDir, "vaults"), "ghost-orphan-dir").apply {
+      val orphanGhostDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), "ghost-orphan-dir").apply {
         mkdirs()
       }
       java.io.File(orphanGhostDir, "stale.bin").writeText("leftover")
@@ -681,14 +681,14 @@ class ExampleRobolectricTest {
       val masterDek = AesFolderCipher.generateAes256Key()
 
       val rotatedFolder = repo.createInternalVaultFolder("Finance", obfuscateDefault = true).getOrThrow()
-      val rotatedDir = java.io.File(java.io.File(context.filesDir, "vaults"), rotatedFolder.id)
+      val rotatedDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), rotatedFolder.id)
       val subDir = java.io.File(rotatedDir, "2026").apply { mkdirs() }
       java.io.File(subDir, "taxes.txt").writeText("Decrypted Tax Summary")
       repo.lockFolder(rotatedFolder.id, masterDek).getOrThrow()
       repo.reencryptFoldersBatch(listOf(rotatedFolder.id), masterDek, encryptUnlockedFolders = true)
 
       val plainFolder = repo.createInternalVaultFolder("Notes", obfuscateDefault = false).getOrThrow()
-      val plainDir = java.io.File(java.io.File(context.filesDir, "vaults"), plainFolder.id)
+      val plainDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), plainFolder.id)
       java.io.File(plainDir, "todo.txt").writeText("Plaintext Checklist")
 
       // 1. Export as Folder Tree keeping originals in BeastLock
@@ -1120,10 +1120,10 @@ class ExampleRobolectricTest {
 
       // 1. Obfuscated locked folder + 2. Non-obfuscated locked folder
       val obfFolder = repo.createInternalVaultFolder("Raw??Docs 2026", obfuscateDefault = true).getOrThrow()
-      val plainNameFolder = repo.createInternalVaultFolder("Temp  Photos", obfuscateDefault = false).getOrThrow()
+      val plainNameFolder = repo.createInternalVaultFolder("Temp  Photos", obfuscateDefault = false, stealthHidden = false).getOrThrow()
 
-      val obfDir = java.io.File(java.io.File(context.filesDir, "vaults"), obfFolder.id)
-      val plainNameDir = java.io.File(java.io.File(context.filesDir, "vaults"), plainNameFolder.id)
+      val obfDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), obfFolder.id)
+      val plainNameDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), plainNameFolder.id)
 
       java.io.File(obfDir, "my draft notes.txt").writeText("Encrypted Draft Body")
       java.io.File(obfDir, "invoice 01.txt").writeText("Encrypted Invoice Body")
@@ -1433,7 +1433,7 @@ class ExampleRobolectricTest {
 
       // 2. Create encrypted folder and sync to Drive API
       val folder = repo.createInternalVaultFolder("DriveSynced", obfuscateDefault = true).getOrThrow()
-      val folderDir = java.io.File(java.io.File(context.filesDir, "vaults"), folder.id)
+      val folderDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), folder.id)
       java.io.File(folderDir, "drive_secret.txt").writeText("Top Secret Drive Payload")
       repo.lockFolder(folder.id, originalMasterDek).getOrThrow()
 
@@ -1490,7 +1490,7 @@ class ExampleRobolectricTest {
 
       val restoredFolder = db.vaultDao().getAllFoldersOnce().first { it.name.contains("(Restored)") }
       repo.unlockFolder(restoredFolder.id, secondDeviceDek).getOrThrow()
-      val restoredFile = java.io.File(java.io.File(java.io.File(context.filesDir, "vaults"), restoredFolder.id), "drive_secret.txt")
+      val restoredFile = java.io.File(java.io.File(java.io.File(context.filesDir, ".beastlock_private"), restoredFolder.id), "drive_secret.txt")
       assertEquals("Top Secret Drive Payload", restoredFile.readText())
 
       // 6. Delete remote snapshot from Drive appDataFolder
@@ -1698,16 +1698,16 @@ class ExampleRobolectricTest {
       val maintenance = com.example.data.storage.VaultMaintenanceManager(context, db.vaultDao(), auditRepo)
 
       // Folder 1: standard master DEK
-      val f1 = folderRepo.createInternalVaultFolder("Finance", obfuscateDefault = false).getOrThrow()
-      val dir1 = java.io.File(java.io.File(context.filesDir, "vaults"), f1.id)
+      val f1 = folderRepo.createInternalVaultFolder("Finance", obfuscateDefault = false, stealthHidden = false).getOrThrow()
+      val dir1 = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), f1.id)
       dir1.mkdirs()
       java.io.File(dir1, "tax_2025.txt").writeText("Healthy financial ledger content")
       java.io.File(dir1, "payroll_corrupted.csv").writeText("User,Salary\nAlice,120000\n".repeat(40))
       folderRepo.lockFolder(f1.id, masterDek).getOrThrow()
 
       // Folder 2: key-rotated + obfuscated UUID filenames
-      val f2 = folderRepo.createInternalVaultFolder("Passport Scans", obfuscateDefault = true).getOrThrow()
-      val dir2 = java.io.File(java.io.File(context.filesDir, "vaults"), f2.id)
+      val f2 = folderRepo.createInternalVaultFolder("Passport Scans", obfuscateDefault = true, stealthHidden = false).getOrThrow()
+      val dir2 = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), f2.id)
       dir2.mkdirs()
       java.io.File(dir2, "passport_front.jpg").writeBytes(ByteArray(3_000) { 0x5A })
       java.io.File(dir2, "visa_truncated.pdf").writeBytes(ByteArray(2_000) { 0x33 })
@@ -1847,7 +1847,7 @@ class ExampleRobolectricTest {
       val dek = AesFolderCipher.generateAes256Key()
 
       val folder = folderRepo.createInternalVaultFolder("SelectiveVault", obfuscateDefault = true).getOrThrow()
-      val dir = java.io.File(java.io.File(context.filesDir, "vaults"), folder.id)
+      val dir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), folder.id)
       dir.mkdirs()
 
       val f1 = java.io.File(dir, "contract.pdf").apply { writeText("Confidential Contract Bytes") }
@@ -1910,8 +1910,8 @@ class ExampleRobolectricTest {
       val folderRepo = com.example.data.storage.FolderLockerRepository(context, db.vaultDao(), auditRepo)
       val dek = AesFolderCipher.generateAes256Key()
 
-      val folder = folderRepo.createInternalVaultFolder("PartialDecryptVault", obfuscateDefault = true).getOrThrow()
-      val dir = java.io.File(java.io.File(context.filesDir, "vaults"), folder.id)
+      val folder = folderRepo.createInternalVaultFolder("PartialDecryptVault", obfuscateDefault = true, stealthHidden = false).getOrThrow()
+      val dir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), folder.id)
       dir.mkdirs()
 
       java.io.File(dir, "alpha.txt").writeText("Alpha Secret")
@@ -1991,7 +1991,7 @@ class ExampleRobolectricTest {
       pumpUntil { viewModel.uiState.value.folders.any { it.name == "WorkFolder" } }
       val folder = viewModel.uiState.value.folders.first { it.name == "WorkFolder" }
 
-      val dir = java.io.File(java.io.File(app.filesDir, "vaults"), folder.id)
+      val dir = java.io.File(java.io.File(app.filesDir, ".beastlock_private"), folder.id)
       dir.mkdirs()
       val keepPlain = java.io.File(dir, "notes_open.txt").apply { writeText("Open Notes") }
       val encryptTarget = java.io.File(dir, "salary.csv").apply { writeText("Base,Bonus") }
@@ -2175,8 +2175,8 @@ class ExampleRobolectricTest {
       val dek = AesFolderCipher.generateAes256Key()
 
       // Private vault folder: test selective file removal
-      val privFolder = repo.createInternalVaultFolder("PrivDrop", obfuscateDefault = false).getOrThrow()
-      val privDir = java.io.File(java.io.File(context.filesDir, "vaults"), privFolder.id)
+      val privFolder = repo.createInternalVaultFolder("PrivDrop", obfuscateDefault = false, stealthHidden = false).getOrThrow()
+      val privDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), privFolder.id)
       val f1 = java.io.File(privDir, "one.txt").apply { writeText("111") }
       val f2 = java.io.File(privDir, "two.txt").apply { writeText("222") }
       repo.lockFolder(privFolder.id, dek).getOrThrow()
@@ -2228,6 +2228,655 @@ class ExampleRobolectricTest {
       safDirA.deleteRecursively()
       safDirB.deleteRecursively()
       db.close()
+    }
+  }
+
+  @OptIn(ExperimentalCoroutinesApi::class)
+  @Test
+  fun `VaultViewModel configures 3x3 Pattern during onboarding, supports stealth mode, and verifies secondary actions`() = kotlinx.coroutines.test.runTest {
+    val testDispatcher = StandardTestDispatcher(testScheduler)
+    Dispatchers.setMain(testDispatcher)
+    val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+    val store = androidx.lifecycle.ViewModelStore()
+
+    try {
+      val testKey = AesFolderCipher.generateAes256Key()
+      val viewModel = com.example.ui.VaultViewModel.createForTest(app, testKey)
+      store.put("pattern_secondary_test", viewModel)
+
+      fun pumpUntil(timeoutMs: Long = 3_000L, predicate: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!predicate() && System.currentTimeMillis() < deadline) {
+          testScheduler.runCurrent()
+          if (predicate()) break
+          Thread.sleep(15)
+        }
+        testScheduler.runCurrent()
+      }
+
+      val initialPattern = listOf(0, 1, 2, 4, 6)
+      viewModel.completeOnboarding(
+        pin = "246810",
+        enableBiometrics = true,
+        question1 = "City?",
+        answer1 = "Tokyo",
+        question2 = "Pet?",
+        answer2 = "Momo",
+        patternNodes = initialPattern,
+      )
+      pumpUntil {
+        viewModel.uiState.value.sessionState == com.example.ui.VaultSessionState.Unlocked &&
+          viewModel.uiState.value.securitySettings.hasPatternLock
+      }
+
+      assertEquals(true, viewModel.uiState.value.securitySettings.preferPatternFallback)
+      assertEquals(false, viewModel.uiState.value.securitySettings.patternStealthMode)
+
+      // Toggle stealth mode
+      viewModel.setPatternStealthMode(true)
+      pumpUntil { viewModel.uiState.value.securitySettings.patternStealthMode }
+
+      // Secondary action pattern verification rejects wrong pattern and accepts right pattern
+      var wrongResult: Boolean? = null
+      viewModel.verifyPatternForAction(listOf(0, 3, 6, 7, 8), actionLabel = "Batch Key Rotation") {
+        wrongResult = it
+      }
+      pumpUntil { wrongResult != null }
+      assertEquals(false, wrongResult)
+
+      var rightResult: Boolean? = null
+      viewModel.verifyPatternForAction(initialPattern, actionLabel = "Batch Key Rotation") {
+        rightResult = it
+      }
+      pumpUntil { rightResult != null }
+      assertEquals(true, rightResult)
+
+      // Lock and re-unlock with the 3x3 Pattern
+      viewModel.lockVaultNow()
+      pumpUntil { viewModel.uiState.value.sessionState == com.example.ui.VaultSessionState.Locked }
+
+      viewModel.unlockWithPattern(listOf(0, 1, 2, 4, 7))
+      pumpUntil { viewModel.uiState.value.authError != null }
+      assertEquals(com.example.ui.VaultSessionState.Locked, viewModel.uiState.value.sessionState)
+
+      viewModel.unlockWithPattern(initialPattern)
+      pumpUntil { viewModel.uiState.value.sessionState == com.example.ui.VaultSessionState.Unlocked }
+
+      // Audit logs captured both secondary failure and pattern unlock
+      pumpUntil {
+        val entries = viewModel.uiState.value.auditLogSnapshot.entries
+        entries.any { it.action == "SECONDARY_AUTH_FAILED" } &&
+          entries.any { it.action == "AUTH_PATTERN" }
+      }
+      val events = viewModel.uiState.value.auditLogSnapshot.entries
+      assertEquals(true, events.any { it.action == "SECONDARY_AUTH_FAILED" })
+      assertEquals(true, events.any { it.action == "AUTH_PATTERN" })
+
+      // Removing pattern resets preferPatternFallback and patternStealthMode
+      viewModel.removeUnlockPattern()
+      pumpUntil { !viewModel.uiState.value.securitySettings.hasPatternLock }
+      assertEquals(false, viewModel.uiState.value.securitySettings.preferPatternFallback)
+      assertEquals(false, viewModel.uiState.value.securitySettings.patternStealthMode)
+    } finally {
+      store.clear()
+      Dispatchers.resetMain()
+    }
+  }
+
+  @Test
+  fun `SecurityPreferencesRepository supports Pattern-only, 4-digit PIN, custom security questions, and biometric default ON`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val testKey = AesFolderCipher.generateAes256Key()
+    val keystoreMgr = com.example.crypto.KeystoreManager(context, overrideTestMasterKey = testKey)
+    val prefsRepo = com.example.data.preferences.SecurityPreferencesRepository(context, keystoreMgr)
+
+    // Pattern primary without numeric PIN, biometrics ON by default, custom questions
+    val pattern = listOf(0, 1, 2, 5, 8)
+    val dek = prefsRepo.initializeVaultWithChoice(
+      lockType = com.example.data.preferences.PrimaryLockType.PATTERN,
+      pin = null,
+      patternNodes = pattern,
+      enableBiometrics = true,
+      question1 = "What was the brand of my very first bicycle?",
+      answer1 = "Schwinn",
+      question2 = "Which mountain trail did I hike first?",
+      answer2 = "Eagle Peak",
+      shareCustomQuestionSuggestions = true,
+    )
+
+    val settingsAfterPattern = prefsRepo.securitySettings.first()
+    assertEquals(true, settingsAfterPattern.isVaultInitialized)
+    assertEquals(com.example.data.preferences.PrimaryLockType.PATTERN, settingsAfterPattern.primaryLockType)
+    assertEquals(false, settingsAfterPattern.hasPinCredential)
+    assertEquals(true, settingsAfterPattern.hasPatternLock)
+    assertEquals(true, settingsAfterPattern.biometricEnabled)
+    assertEquals("What was the brand of my very first bicycle?", settingsAfterPattern.securityQuestion1)
+
+    val unlockedDek = prefsRepo.unlockWithPattern(pattern)
+    assertEquals(AesFolderCipher.computeKeyFingerprint(dek), AesFolderCipher.computeKeyFingerprint(unlockedDek!!))
+
+    // Recover using custom security questions into a 4-Digit PIN primary lock
+    val recoveredDek = prefsRepo.recoverWithSecurityQuestions(
+      answer1 = "  schwinn ",
+      answer2 = "eagle  peak",
+      newPin = "4829",
+      newPatternNodes = null,
+      newLockType = com.example.data.preferences.PrimaryLockType.PIN_4,
+    )
+    assertEquals(AesFolderCipher.computeKeyFingerprint(dek), AesFolderCipher.computeKeyFingerprint(recoveredDek!!))
+
+    val settingsAfterPin4 = prefsRepo.securitySettings.first()
+    assertEquals(com.example.data.preferences.PrimaryLockType.PIN_4, settingsAfterPin4.primaryLockType)
+    assertEquals(4, settingsAfterPin4.pinLength)
+    assertEquals(true, settingsAfterPin4.hasPinCredential)
+    assertEquals(true, settingsAfterPin4.biometricEnabled)
+
+    val pin4Dek = prefsRepo.unlockWithPin("4829")
+    assertEquals(AesFolderCipher.computeKeyFingerprint(dek), AesFolderCipher.computeKeyFingerprint(pin4Dek!!))
+  }
+
+  @Test
+  fun `DualKeyVaultManager mirrors hidden read-only keys, detects tampering, auto-heals, and recovers folder key`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val extRoot = java.io.File(context.cacheDir, "dual_key_ext_${System.nanoTime()}").apply { mkdirs() }
+    val internalKeyDir = java.io.File(context.filesDir, ".beastlock_keystore")
+    try {
+      val testMaster = AesFolderCipher.generateAes256Key()
+      val keystoreMgr = com.example.crypto.KeystoreManager(context, overrideTestMasterKey = testMaster)
+      val prefsRepo = com.example.data.preferences.SecurityPreferencesRepository(context, keystoreMgr)
+      val dek = prefsRepo.initializeVaultWithChoice(
+        lockType = com.example.data.preferences.PrimaryLockType.PIN_4,
+        pin = "1357",
+        patternNodes = listOf(0, 4, 8, 7),
+        enableBiometrics = true,
+        question1 = "Custom Q1?",
+        answer1 = "Alpha",
+        question2 = "Custom Q2?",
+        answer2 = "Beta",
+      )
+      val snapshot = prefsRepo.getKeyWrapSnapshot()!!
+      val folderKey = AesFolderCipher.generateAes256Key()
+      val wrappedFolderKey = AesFolderCipher.wrapDekWithKey(folderKey, dek)
+      val folderFp = AesFolderCipher.computeKeyFingerprint(folderKey)
+      val folder = com.example.data.local.VaultFolderEntity(
+        id = "folder-dual-1",
+        name = "Docs",
+        treeUri = "file:///tmp/docs",
+        isInternalVault = false,
+        isLocked = true,
+        obfuscateFilenames = true,
+        requireBiometricPerUnlock = true,
+        requireAuthOnOpen = true,
+        fileCount = 3,
+        encryptedFileCount = 3,
+        totalBytes = 1024L,
+        lastActionTimestamp = System.currentTimeMillis(),
+        createdAt = System.currentTimeMillis(),
+        wrappedFolderKey = wrappedFolderKey,
+        keyVersion = 2,
+        keyFingerprint = folderFp,
+      )
+
+      val manager = com.example.crypto.DualKeyVaultManager(context)
+      val extUri = android.net.Uri.fromFile(extRoot).toString()
+      val status = manager.syncDualVault(snapshot, listOf(folder), dek, extUri)
+      assertEquals(true, status.internalHealthy)
+      assertEquals(true, status.internalReadOnlyLocked)
+      assertEquals(true, status.externalHealthy)
+      assertEquals(true, status.checksumValid)
+      assertEquals(1, status.bundleFolderCount)
+
+      // Verify hidden .nomedia + read-only files in both mirrors
+      val internalBundle = java.io.File(internalKeyDir, "beastlock_keys.vkey")
+      assertEquals(true, java.io.File(internalKeyDir, ".nomedia").exists())
+      assertEquals(false, internalBundle.canWrite())
+      val extKeyDir = java.io.File(extRoot, ".BeastLock_Keys")
+      assertEquals(true, java.io.File(extKeyDir, ".nomedia").exists())
+      assertEquals(true, java.io.File(extKeyDir, ".beastlock_readonly.lock").exists())
+
+      // Tamper with external bundle -> verifyAndAutoHeal detects mismatch and auto-repairs from internal
+      val extBundle = java.io.File(extKeyDir, "beastlock_keys.vkey")
+      extBundle.writeText("{\"tampered\":true}")
+      val healStatus = manager.verifyAndAutoHeal(extUri)
+      assertEquals(true, healStatus.checksumValid)
+      assertEquals("EXTERNAL_REPAIRED", healStatus.autoRepairedMirror)
+      assertEquals(true, !healStatus.tamperAlert.isNullOrBlank())
+
+      // Recover folder key using DEK from healed dual vault
+      val recovered = manager.recoverFolderKey(folder.id, folderFp, dek, extUri)
+      assertEquals(folderFp, AesFolderCipher.computeKeyFingerprint(recovered!!.first))
+    } finally {
+      extRoot.deleteRecursively()
+      internalKeyDir.walkBottomUp().forEach {
+        it.setWritable(true)
+        it.delete()
+      }
+    }
+  }
+
+  @Test
+  fun `SystemIssueRecorder redacts sensitive paths and ingests crash markers cleanly`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = androidx.room.Room.inMemoryDatabaseBuilder(
+      context,
+      com.example.data.local.VaultDatabase::class.java,
+    ).allowMainThreadQueries().build()
+
+    try {
+      val sanitized = com.example.data.telemetry.SystemIssueRecorder.sanitizeDiagnosticText(
+        "Failed reading content://com.android.externalstorage/tree/123 at /storage/emulated/0/SecretDocs/8d60c329-4f7a-4b23-89ac-1234567890ab.vlock for alice@example.com with AIzaSyDummyKey1234567890abcd",
+      )
+      assertEquals(false, sanitized.contains("content://"))
+      assertEquals(false, sanitized.contains("/storage/"))
+      assertEquals(false, sanitized.contains("8d60c329"))
+      assertEquals(false, sanitized.contains("alice@example.com"))
+      assertEquals(false, sanitized.contains("AIza"))
+
+      val markerFile = java.io.File(context.filesDir, ".pending_crash_report.json")
+      markerFile.writeText(
+        """{"occurredAtMillis":1700000000000,"errorCode":"IllegalStateException","sanitizedSummary":"Sample crash on main","appVersion":"1.0","androidSdk":36,"deviceModel":"Pixel"}""",
+      )
+      val recorder = com.example.data.telemetry.SystemIssueRecorder(context, db.vaultDao())
+      recorder.ingestPendingCrashMarker()
+      assertEquals(false, markerFile.exists())
+
+      val issues = recorder.getPendingIssues()
+      assertEquals(1, issues.size)
+      assertEquals("APP_CRASH", issues.first().category)
+      assertEquals("IllegalStateException", issues.first().errorCode)
+    } finally {
+      db.close()
+    }
+  }
+
+  @OptIn(ExperimentalCoroutinesApi::class)
+  @Test
+  fun `VaultViewModel addDeviceFolder auto-locks folder with requireAuthOnOpen enabled`() = kotlinx.coroutines.test.runTest {
+    val testDispatcher = StandardTestDispatcher(testScheduler)
+    Dispatchers.setMain(testDispatcher)
+    val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+    val store = androidx.lifecycle.ViewModelStore()
+    val folderDir = java.io.File(app.cacheDir, "auto_lock_dev_${System.nanoTime()}").apply { mkdirs() }
+
+    try {
+      val testKey = AesFolderCipher.generateAes256Key()
+      val viewModel = com.example.ui.VaultViewModel.createForTest(app, testKey)
+      store.put("autolock_add_test", viewModel)
+
+      fun pumpUntil(timeoutMs: Long = 4_000L, predicate: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!predicate() && System.currentTimeMillis() < deadline) {
+          testScheduler.runCurrent()
+          if (predicate()) break
+          Thread.sleep(15)
+        }
+        testScheduler.runCurrent()
+      }
+
+      viewModel.completeOnboardingWithChoice(
+        lockType = com.example.data.preferences.PrimaryLockType.PIN_4,
+        pin = "4321",
+        patternNodes = null,
+        enableBiometrics = true,
+        question1 = "School?",
+        answer1 = "Oakwood",
+        question2 = "Pet?",
+        answer2 = "Buddy",
+      )
+      pumpUntil { viewModel.uiState.value.sessionState == com.example.ui.VaultSessionState.Unlocked }
+
+      java.io.File(folderDir, "note.txt").writeText("Sensitive content")
+      viewModel.addDeviceFolder(android.net.Uri.fromFile(folderDir))
+      pumpUntil {
+        viewModel.uiState.value.folders.any { it.name == folderDir.name && it.isLocked }
+      }
+
+      val added = viewModel.uiState.value.folders.first { it.name == folderDir.name }
+      assertEquals(true, added.isLocked)
+      assertEquals(true, added.requireAuthOnOpen)
+      assertEquals(1, added.encryptedFileCount)
+    } finally {
+      folderDir.deleteRecursively()
+      store.clear()
+      Dispatchers.resetMain()
+    }
+  }
+
+  @Test
+  fun `stealth code verification, legacy vaults migration, and immediate re-encryption seal private folders`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = androidx.room.Room.inMemoryDatabaseBuilder(
+      context,
+      com.example.data.local.VaultDatabase::class.java,
+    ).allowMainThreadQueries().build()
+
+    try {
+      val testMasterKey = AesFolderCipher.generateAes256Key()
+      val keystore = com.example.crypto.KeystoreManager(context, overrideTestMasterKey = testMasterKey)
+      val prefs = com.example.data.preferences.SecurityPreferencesRepository(context, keystore)
+      val auditRepo = com.example.data.audit.EncryptedAuditLogRepository(context, keystore, overrideTestKey = testMasterKey)
+      val folderRepo = com.example.data.storage.FolderLockerRepository(context, db.vaultDao(), auditRepo)
+
+      val dek = prefs.initializeVault(
+        pin = "246810",
+        enableBiometrics = false,
+        question1 = "Q1",
+        answer1 = "A1",
+        question2 = "Q2",
+        answer2 = "A2",
+      )
+
+      // Default stealth code #7788 and custom code updates verify cleanly via PBKDF2 hash
+      assertEquals(true, prefs.verifyStealthAccessCode("#7788"))
+      assertEquals(true, prefs.verifyStealthAccessCode("7788"))
+      assertEquals(false, prefs.verifyStealthAccessCode("#9999"))
+      assertEquals(true, prefs.setStealthAccessCode("4242"))
+      assertEquals(true, prefs.verifyStealthAccessCode("#4242"))
+      assertEquals(false, prefs.verifyStealthAccessCode("#7788"))
+
+      // Legacy folder in filesDir/vaults/<id> migrates to .beastlock_private/<id> and re-seals on conceal
+      val legacyId = "legacy-private-id-1"
+      val legacyDir = java.io.File(java.io.File(context.filesDir, "vaults"), legacyId).apply { mkdirs() }
+      java.io.File(legacyDir, "passport_scan.txt").writeText("Confidential Passport Data")
+      db.vaultDao().upsertFolder(
+        com.example.data.local.VaultFolderEntity(
+          id = legacyId,
+          name = "Hidden Passports",
+          treeUri = "internal://$legacyId",
+          isInternalVault = true,
+          isLocked = false,
+          fileCount = 1,
+          encryptedFileCount = 0,
+          totalBytes = 26L,
+          lastActionTimestamp = 1L,
+          createdAt = 1L,
+          obfuscateFilenames = false,
+          requireAuthOnOpen = false,
+          isStealthHidden = false,
+        ),
+      )
+
+      val migratedCount = folderRepo.migrateLegacyPrivateVaultStorage(dek)
+      assertEquals(1, migratedCount)
+
+      val migratedDir = java.io.File(java.io.File(context.filesDir, ".beastlock_private"), legacyId)
+      assertEquals(false, legacyDir.exists())
+      assertEquals(true, migratedDir.exists())
+      assertEquals(true, java.io.File(java.io.File(context.filesDir, ".beastlock_private"), ".nomedia").exists())
+      assertEquals(true, java.io.File(migratedDir, ".nomedia").exists())
+
+      val upgraded = db.vaultDao().getFolderById(legacyId)!!
+      assertEquals(true, upgraded.isStealthHidden)
+      assertEquals(true, upgraded.obfuscateFilenames)
+      assertEquals(true, upgraded.requireAuthOnOpen)
+
+      // Immediate conceal re-encrypts any unsealed plaintext files with UUID obfuscation & redacts audit logs
+      val sealedCount = folderRepo.concealAndResealPrivateFolders(dek)
+      assertEquals(1, sealedCount)
+      assertEquals(false, java.io.File(migratedDir, "passport_scan.txt").exists())
+      val encFiles = migratedDir.listFiles().orEmpty().filter { it.name.endsWith(AesFolderCipher.ENCRYPTED_EXTENSION) }
+      assertEquals(1, encFiles.size)
+      assertEquals(false, encFiles.first().name.contains("passport_scan"))
+      assertEquals(false, auditRepo.snapshot.value.entries.any { it.folderName == "Hidden Passports" })
+    } finally {
+      db.close()
+    }
+  }
+
+  @OptIn(ExperimentalCoroutinesApi::class)
+  @Test
+  fun `VaultViewModel conceals stealth folders from dashboard, triggers on stealth code, and auto-hides on exit`() = kotlinx.coroutines.test.runTest {
+    val testDispatcher = StandardTestDispatcher(testScheduler)
+    Dispatchers.setMain(testDispatcher)
+    val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+    val store = androidx.lifecycle.ViewModelStore()
+
+    try {
+      val testKey = AesFolderCipher.generateAes256Key()
+      val viewModel = com.example.ui.VaultViewModel.createForTest(app, testKey)
+      store.put("stealth_vm_test", viewModel)
+
+      fun pumpUntil(timeoutMs: Long = 3_000L, predicate: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!predicate() && System.currentTimeMillis() < deadline) {
+          testScheduler.runCurrent()
+          if (predicate()) break
+          Thread.sleep(15)
+        }
+        testScheduler.runCurrent()
+      }
+
+      viewModel.completeOnboarding(
+        pin = "654321",
+        enableBiometrics = false,
+        question1 = "Q1",
+        answer1 = "A1",
+        question2 = "Q2",
+        answer2 = "A2",
+      )
+      pumpUntil { viewModel.uiState.value.sessionState == com.example.ui.VaultSessionState.Unlocked }
+
+      viewModel.createPrivateFolder("GhostLocker")
+      pumpUntil { viewModel.uiState.value.folders.any { it.name == "GhostLocker" } }
+
+      // Concealed from public dashboard, analytics, and stealthFolders until authenticated
+      val initialState = viewModel.uiState.value
+      assertEquals(0, initialState.publicFolders.size)
+      assertEquals(0, initialState.stealthFolders.size)
+      assertEquals(0, initialState.analyticsVisibleFolders.size)
+      assertEquals(false, initialState.isStealthRevealed)
+
+      // Typing default stealth code #7788 in search clears searchQuery & requests stealth auth
+      viewModel.setSearchQuery("#7788")
+      pumpUntil { viewModel.uiState.value.pendingStealthTriggerLabel == "SEARCH_CODE" }
+      assertEquals("", viewModel.uiState.value.searchQuery)
+
+      viewModel.onStealthAuthVerified()
+      pumpUntil { viewModel.uiState.value.isStealthRevealed }
+      assertEquals(1, viewModel.uiState.value.stealthFolders.size)
+      assertEquals("GhostLocker", viewModel.uiState.value.stealthFolders.first().name)
+      assertEquals(0, viewModel.uiState.value.publicFolders.size)
+
+      // In-flight picker prevents accidental concealment on backgrounding
+      viewModel.markStealthPickerInFlight(true)
+      viewModel.onAppBackgrounded()
+      testScheduler.runCurrent()
+      assertEquals(true, viewModel.uiState.value.isStealthRevealed)
+
+      // Normal backgrounding (exiting app) immediately conceals Private Vault
+      viewModel.markStealthPickerInFlight(false)
+      viewModel.onAppBackgrounded()
+      pumpUntil { !viewModel.uiState.value.isStealthRevealed }
+      assertEquals(0, viewModel.uiState.value.stealthFolders.size)
+    } finally {
+      store.clear()
+      Dispatchers.resetMain()
+    }
+  }
+
+  @Test
+  fun `KeystoreManager and SecurityPreferencesRepository unwrap DEK cleanly using prepared CryptoObject cipher`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val testMasterKey = AesFolderCipher.generateAes256Key()
+    val keystore = com.example.crypto.KeystoreManager(context, overrideTestMasterKey = testMasterKey)
+    val prefs = com.example.data.preferences.SecurityPreferencesRepository(context, keystore)
+
+    val originalDek = prefs.initializeVault(
+      pin = "112233",
+      enableBiometrics = true,
+      question1 = "Q1",
+      answer1 = "A1",
+      question2 = "Q2",
+      answer2 = "A2",
+    )
+
+    val preparedCipher = prefs.prepareKeystoreUnwrapCipher()
+    assertEquals(true, preparedCipher != null)
+    val cryptoObject = androidx.biometric.BiometricPrompt.CryptoObject(preparedCipher!!)
+
+    val unlockedDek = prefs.unlockWithKeystoreCipherAfterBiometric(cryptoObject.cipher)
+    assertEquals(true, unlockedDek != null)
+    assertEquals(
+      AesFolderCipher.computeKeyFingerprint(originalDek),
+      AesFolderCipher.computeKeyFingerprint(unlockedDek!!),
+    )
+  }
+
+  @Test
+  fun `EncryptionManager wraps keys via Keystore, encrypts local files with AES-256-GCM, and audits URI permissions`() = kotlinx.coroutines.test.runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = androidx.room.Room.inMemoryDatabaseBuilder(
+      context,
+      com.example.data.local.VaultDatabase::class.java,
+    ).allowMainThreadQueries().build()
+    val workDir = java.io.File(context.cacheDir, "enc_mgr_test_${System.nanoTime()}").apply { mkdirs() }
+    val pickedDir = java.io.File(workDir, "picked_docs").apply { mkdirs() }
+
+    try {
+      val testMasterKey = AesFolderCipher.generateAes256Key()
+      val keystore = com.example.crypto.KeystoreManager(context, overrideTestMasterKey = testMasterKey)
+      val auditRepo = com.example.data.audit.EncryptedAuditLogRepository(context, keystore, overrideTestKey = testMasterKey)
+      val encManager = com.example.crypto.EncryptionManager(context, keystoreManager = keystore)
+      val repo = com.example.data.storage.FolderLockerRepository(
+        context = context,
+        vaultDao = db.vaultDao(),
+        auditLogRepo = auditRepo,
+        encryptionManager = encManager,
+      )
+
+      // 1. Keystore DEK wrap/unwrap roundtrip + folder key wrap/unwrap
+      val masterDek = encManager.generateFolderKey()
+      val wrappedMaster = encManager.wrapMasterKey(masterDek)
+      val unwrappedMaster = encManager.unwrapMasterKey(wrappedMaster)
+      assertEquals(encManager.computeKeyFingerprint(masterDek), encManager.computeKeyFingerprint(unwrappedMaster))
+
+      val folderKey = encManager.generateFolderKey()
+      val wrappedFolderKey = encManager.wrapFolderKey(folderKey, unwrappedMaster)
+      assertArrayEquals(folderKey.encoded, encManager.unwrapFolderKey(wrappedFolderKey, unwrappedMaster).encoded)
+
+      // 2. Local AES-256-GCM file encryption + decryption roundtrip
+      val plainSrc = java.io.File(workDir, "contract.txt").apply { writeText("BeastLock AES-256-GCM Payload") }
+      val cipherOut = java.io.File(workDir, encManager.generateObfuscatedCipherName())
+      val restoredOut = java.io.File(workDir, "contract_restored.txt")
+
+      val encMeta = encManager.encryptLocalFile(plainSrc, cipherOut, folderKey, "text/plain")
+      assertEquals("contract.txt", encMeta.originalName)
+      assertEquals(false, cipherOut.readText().contains("BeastLock AES-256-GCM Payload"))
+
+      val decMeta = encManager.decryptLocalFile(cipherOut, restoredOut, folderKey)
+      assertEquals("contract.txt", decMeta.originalName)
+      assertEquals("BeastLock AES-256-GCM Payload", restoredOut.readText())
+
+      // 3. URI permission auditing across sandbox, accessible dir, and ungranted content:// URI
+      java.io.File(pickedDir, "sheet.csv").writeText("a,b,c")
+      val inspection = repo.inspectPickedSafFolder(android.net.Uri.fromFile(pickedDir)).getOrThrow()
+      assertEquals(pickedDir.name, inspection.displayName)
+      assertEquals(1, inspection.plaintextCount)
+      assertEquals(0, inspection.encryptedCount)
+      assertEquals(com.example.crypto.UriPermissionStatus.PERSISTED_READ_WRITE, inspection.permissionStatus)
+
+      val revokedFolder = com.example.data.local.VaultFolderEntity(
+        id = "revoked-saf-1",
+        name = "LostGrant",
+        treeUri = "content://com.android.externalstorage.documents/tree/primary%3ALostGrant",
+        isInternalVault = false,
+        isLocked = true,
+        fileCount = 2,
+        encryptedFileCount = 2,
+        totalBytes = 100L,
+        lastActionTimestamp = 1L,
+        createdAt = 1L,
+      )
+      db.vaultDao().upsertFolder(revokedFolder)
+
+      val sandboxFolder = repo.createInternalVaultFolder("SandboxPrivate", obfuscateDefault = true, dek = masterDek).getOrThrow()
+      val permMap = repo.auditFolderPermissions(listOf(revokedFolder, sandboxFolder))
+      assertEquals(com.example.crypto.UriPermissionStatus.REVOKED, permMap[revokedFolder.id])
+      assertEquals(com.example.crypto.UriPermissionStatus.INTERNAL_SANDBOX, permMap[sandboxFolder.id])
+
+      // Re-granting updates URI in Room and records PERMISSION_REGRANTED audit entry
+      val regranted = repo.regrantSafFolderPermission(revokedFolder.id, android.net.Uri.fromFile(pickedDir)).getOrThrow()
+      assertEquals(android.net.Uri.fromFile(pickedDir).toString(), regranted.treeUri)
+      assertEquals(1, regranted.fileCount)
+      assertEquals(true, auditRepo.loadOrRefresh().entries.any { it.action == "PERMISSION_REGRANTED" })
+    } finally {
+      workDir.deleteRecursively()
+      db.close()
+    }
+  }
+
+  @OptIn(ExperimentalCoroutinesApi::class)
+  @Test
+  fun `VaultViewModel previewPickedDeviceFolder inspects non-destructively then encrypts on confirmation`() = kotlinx.coroutines.test.runTest {
+    val testDispatcher = StandardTestDispatcher(testScheduler)
+    Dispatchers.setMain(testDispatcher)
+    val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+    val store = androidx.lifecycle.ViewModelStore()
+    val pickedDir = java.io.File(app.cacheDir, "picker_preview_${System.nanoTime()}").apply { mkdirs() }
+
+    try {
+      val testKey = AesFolderCipher.generateAes256Key()
+      val viewModel = com.example.ui.VaultViewModel.createForTest(app, testKey)
+      store.put("picker_preview_test", viewModel)
+
+      fun pumpUntil(timeoutMs: Long = 4_000L, predicate: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!predicate() && System.currentTimeMillis() < deadline) {
+          testScheduler.runCurrent()
+          if (predicate()) break
+          Thread.sleep(15)
+        }
+        testScheduler.runCurrent()
+      }
+
+      viewModel.completeOnboarding(
+        pin = "654321",
+        enableBiometrics = false,
+        question1 = "Q1",
+        answer1 = "A1",
+        question2 = "Q2",
+        answer2 = "A2",
+      )
+      pumpUntil { viewModel.uiState.value.sessionState == com.example.ui.VaultSessionState.Unlocked }
+
+      val plainFile = java.io.File(pickedDir, "budget_2026.txt").apply { writeText("Quarter 1 Secret") }
+      val treeUri = android.net.Uri.fromFile(pickedDir)
+
+      // Step 1: Preview inspects folder without encrypting files yet
+      viewModel.previewPickedDeviceFolder(treeUri)
+      pumpUntil {
+        val p = viewModel.uiState.value.pendingFolderPickerPreview
+        p != null && !p.isScanning
+      }
+      val preview = viewModel.uiState.value.pendingFolderPickerPreview!!
+      assertEquals(pickedDir.name, preview.displayName)
+      assertEquals(1, preview.plaintextFileCount)
+      assertEquals(0, preview.encryptedFileCount)
+      assertEquals(com.example.crypto.UriPermissionStatus.PERSISTED_READ_WRITE, preview.permissionStatus)
+      assertEquals(true, plainFile.exists())
+
+      // Step 2: Customize options & confirm Encrypt & Lock Folder
+      viewModel.updateFolderPickerPreviewOptions(obfuscateFilenames = true, requireAuthOnOpen = true)
+      viewModel.confirmFolderPickerPreview(encryptNow = true)
+      pumpUntil {
+        viewModel.uiState.value.folders.any { it.name == pickedDir.name && it.isLocked }
+      }
+
+      val registered = viewModel.uiState.value.folders.first { it.name == pickedDir.name }
+      assertEquals(true, registered.isLocked)
+      assertEquals(true, registered.obfuscateFilenames)
+      assertEquals(true, registered.requireAuthOnOpen)
+      assertEquals(1, registered.encryptedFileCount)
+      assertEquals(false, plainFile.exists())
+      assertEquals(null, viewModel.uiState.value.pendingFolderPickerPreview)
+      assertEquals(
+        com.example.crypto.UriPermissionStatus.PERSISTED_READ_WRITE,
+        viewModel.uiState.value.folderPermissionStatuses[registered.id],
+      )
+    } finally {
+      pickedDir.deleteRecursively()
+      store.clear()
+      Dispatchers.resetMain()
     }
   }
 }

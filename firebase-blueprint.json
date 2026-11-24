@@ -1,0 +1,138 @@
+{
+  "entities": {
+    "CustomSecurityQuestion": {
+      "title": "CustomSecurityQuestion",
+      "description": "User-authored custom security question prompt text (never answers or keys) collected to improve preset question options in future releases.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Authenticated Firebase UID of the user who created the custom question."
+        },
+        "questionText": {
+          "type": "string",
+          "description": "Normalized custom question prompt text (5..160 characters). Must never include secret answers."
+        },
+        "locale": {
+          "type": "string",
+          "description": "Device language/locale tag (2..16 characters)."
+        },
+        "appVersion": {
+          "type": "string",
+          "description": "BeastLock app version string (1..32 characters)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp written with FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp written with FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "userId",
+        "questionText",
+        "locale",
+        "appVersion",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DiagnosticReport": {
+      "title": "DiagnosticReport",
+      "description": "Sanitized diagnostic report, system failure log, and voluntary user feedback submitted by the user to the developer database.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Authenticated Firebase UID of the reporting user."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "CRYPTO_ERROR",
+            "KEY_RECOVERY",
+            "DRIVE_SYNC",
+            "SAF_STORAGE",
+            "APP_CRASH",
+            "USER_FEEDBACK"
+          ],
+          "description": "Recorded issue or diagnostic report category."
+        },
+        "errorCode": {
+          "type": "string",
+          "description": "Sanitized error code identifier (1..64 characters)."
+        },
+        "sanitizedSummary": {
+          "type": "string",
+          "description": "Sanitized system failure/diagnostic summary without filenames, URIs, or keys (1..1200 characters)."
+        },
+        "userFeedback": {
+          "type": "string",
+          "description": "User-authored description of the problem or improvement request (0..2000 characters)."
+        },
+        "healthSnapshot": {
+          "type": "string",
+          "description": "Compact vault and key-mirror health telemetry snapshot (0..800 characters)."
+        },
+        "appVersion": {
+          "type": "string",
+          "description": "BeastLock app version string (1..32 characters)."
+        },
+        "androidSdk": {
+          "type": "integer",
+          "description": "Android SDK integer level."
+        },
+        "deviceModel": {
+          "type": "string",
+          "description": "Sanitized device manufacturer and model (1..80 characters)."
+        },
+        "occurredAtMillis": {
+          "type": "integer",
+          "description": "Epoch timestamp in milliseconds when the issue or report occurred."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp written with FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp written with FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "userId",
+        "category",
+        "errorCode",
+        "sanitizedSummary",
+        "userFeedback",
+        "healthSnapshot",
+        "appVersion",
+        "androidSdk",
+        "deviceModel",
+        "occurredAtMillis",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/custom_security_questions/{questionId}": {
+      "schema": {
+        "$ref": "#/entities/CustomSecurityQuestion"
+      },
+      "description": "User-submitted custom security question prompts (without secret answers) scoped by userId."
+    },
+    "/diagnostic_reports/{reportId}": {
+      "schema": {
+        "$ref": "#/entities/DiagnosticReport"
+      },
+      "description": "User-submitted sanitized diagnostic reports and recorded system failure summaries scoped by userId."
+    }
+  }
+}

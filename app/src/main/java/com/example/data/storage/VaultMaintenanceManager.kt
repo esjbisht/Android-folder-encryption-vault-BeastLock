@@ -145,7 +145,7 @@ class VaultMaintenanceManager(
     for (folder in folders) {
       currentCoroutineContext().ensureActive()
       if (folder.isInternalVault) {
-        val root = File(File(context.filesDir, "vaults"), folder.id)
+        val root = resolveInternalVaultDir(folder.id)
         if (root.exists()) {
           root.walkTopDown()
             .filter {
@@ -341,49 +341,58 @@ class VaultMaintenanceManager(
     val seenIds = mutableSetOf<String>()
     val folders = vaultDao.getAllFoldersOnce()
     val validFolderIds = folders.map { it.id }.toSet()
-    val folderNamesById = folders.associate { it.id to it.name }
+    val folderById = folders.associateBy { it.id }
 
-    // 1. Scan internal vaults root for leftover scratch files & unreferenced directories
-    val vaultsRoot = File(context.filesDir, "vaults")
-    if (vaultsRoot.exists()) {
-      vaultsRoot.listFiles().orEmpty().forEach { child ->
-        if (child.isDirectory && child.name !in validFolderIds) {
-          val dirSize = child.walkTopDown().filter { it.isFile }.sumOf { it.length() }
-          val id = "dir:${child.absolutePath}"
-          if (seenIds.add(id)) {
-            candidates.add(
-              OrphanedFileCandidate(
-                id = id,
-                displayName = child.name,
-                category = OrphanCategory.ORPHANED_VAULT_DIR,
-                locationLabel = "Unreferenced internal vault directory",
-                sizeBytes = dirSize,
-                lastModifiedMillis = child.lastModified(),
-                localPath = child.absolutePath,
-                isDirectory = true,
-              ),
-            )
-          }
-        } else if (child.isDirectory) {
-          val folderName = folderNamesById[child.name] ?: child.name
-          child.walkTopDown()
-            .filter { it.isFile && isTempOrphanName(it.name) }
-            .forEach { file ->
-              val id = "file:${file.absolutePath}"
-              if (seenIds.add(id)) {
-                candidates.add(
-                  OrphanedFileCandidate(
-                    id = id,
-                    displayName = file.name,
-                    category = classifyTempFileName(file.name),
-                    locationLabel = "Vault folder: $folderName",
-                    sizeBytes = file.length(),
-                    lastModifiedMillis = file.lastModified(),
-                    localPath = file.absolutePath,
-                  ),
-                )
-              }
+    // 1. Scan internal stealth & legacy vaults roots for leftover scratch files & unreferenced directories
+    listOf(
+      File(context.filesDir, ".beastlock_private"),
+      File(context.filesDir, "vaults"),
+    ).forEach { vaultsRoot ->
+      if (vaultsRoot.exists()) {
+        vaultsRoot.listFiles().orEmpty().forEach { child ->
+          if (child.isDirectory && child.name !in validFolderIds) {
+            val dirSize = child.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+            val id = "dir:${child.absolutePath}"
+            if (seenIds.add(id)) {
+              candidates.add(
+                OrphanedFileCandidate(
+                  id = id,
+                  displayName = child.name,
+                  category = OrphanCategory.ORPHANED_VAULT_DIR,
+                  locationLabel = "Unreferenced internal vault directory",
+                  sizeBytes = dirSize,
+                  lastModifiedMillis = child.lastModified(),
+                  localPath = child.absolutePath,
+                  isDirectory = true,
+                ),
+              )
             }
+          } else if (child.isDirectory) {
+            val matchedFolder = folderById[child.name]
+            val folderLabel = if (matchedFolder?.isStealthHidden == true) {
+              "Stealth Private Vault"
+            } else {
+              matchedFolder?.name ?: child.name
+            }
+            child.walkTopDown()
+              .filter { it.isFile && isTempOrphanName(it.name) }
+              .forEach { file ->
+                val id = "file:${file.absolutePath}"
+                if (seenIds.add(id)) {
+                  candidates.add(
+                    OrphanedFileCandidate(
+                      id = id,
+                      displayName = file.name,
+                      category = classifyTempFileName(file.name),
+                      locationLabel = "Vault folder: $folderLabel",
+                      sizeBytes = file.length(),
+                      lastModifiedMillis = file.lastModified(),
+                      localPath = file.absolutePath,
+                    ),
+                  )
+                }
+              }
+          }
         }
       }
     }
@@ -707,7 +716,7 @@ class VaultMaintenanceManager(
         for (folderId in succeededFolderIds) {
           val folder = selectedFolders.find { it.id == folderId } ?: continue
           if (folder.isInternalVault) {
-            File(File(context.filesDir, "vaults"), folder.id).deleteRecursively()
+            resolveInternalVaultDir(folder.id).deleteRecursively()
           }
           vaultDao.deleteFolderById(folder.id)
           removedFoldersCount++
@@ -796,7 +805,7 @@ class VaultMaintenanceManager(
   private fun collectExportSpecs(folder: VaultFolderEntity): List<ExportFileSpec> {
     val specs = mutableListOf<ExportFileSpec>()
     if (folder.isInternalVault) {
-      val root = File(File(context.filesDir, "vaults"), folder.id)
+      val root = resolveInternalVaultDir(folder.id)
       if (!root.exists()) return emptyList()
       root.walkTopDown()
         .filter { it.isFile && !isScratchOrMarker(it.name) }
@@ -820,6 +829,12 @@ class VaultMaintenanceManager(
       collectSafExportSpecs(tree, "", specs)
     }
     return specs
+  }
+
+  private fun resolveInternalVaultDir(folderId: String): File {
+    val stealthDir = File(File(context.filesDir, ".beastlock_private"), folderId)
+    val legacyDir = File(File(context.filesDir, "vaults"), folderId)
+    return if (!stealthDir.exists() && legacyDir.exists()) legacyDir else stealthDir
   }
 
   private fun collectSafExportSpecs(

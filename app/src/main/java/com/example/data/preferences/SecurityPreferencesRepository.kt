@@ -11,9 +11,11 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.crypto.AesFolderCipher
+import com.example.crypto.DualKeyVaultBundle
 import com.example.crypto.KeystoreManager
 import com.example.security.PanicSensitivity
 import com.example.ui.theme.ThemeMode
+import javax.crypto.Cipher
 import javax.crypto.SecretKey
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -21,8 +23,52 @@ import kotlinx.coroutines.flow.map
 
 private val Context.securityDataStore: DataStore<Preferences> by preferencesDataStore(name = "vault_security_prefs")
 
+enum class PrimaryLockType(val label: String) {
+  PATTERN("3×3 Pattern"),
+  PIN_4("4-Digit PIN"),
+  PIN_6("6-Digit PIN"),
+  ;
+
+  companion object {
+    fun fromName(raw: String?): PrimaryLockType =
+      entries.firstOrNull { it.name == raw } ?: PIN_6
+  }
+}
+
+enum class StealthGestureMode(val label: String) {
+  LONG_PRESS_SHIELD("Long-Press Hero Shield"),
+  TRIPLE_TAP_SHIELD("Triple-Tap Hero Shield"),
+  ;
+
+  companion object {
+    fun fromName(raw: String?): StealthGestureMode =
+      entries.firstOrNull { it.name == raw } ?: LONG_PRESS_SHIELD
+  }
+}
+
+data class DualKeyCredentialSnapshot(
+  val keyFingerprint: String,
+  val primaryLockType: PrimaryLockType,
+  val pinLength: Int,
+  val pinSaltB64: String?,
+  val pinWrappedDek: String?,
+  val pinVerifier: String?,
+  val patternSaltB64: String?,
+  val patternWrappedDek: String?,
+  val patternVerifier: String?,
+  val recoveryQ1: String,
+  val recoveryQ2: String,
+  val recoverySaltB64: String?,
+  val recoveryWrappedDek: String?,
+  val recoveryVerifier: String?,
+  val biometricEnabled: Boolean,
+)
+
 data class SecuritySettings(
   val isVaultInitialized: Boolean = false,
+  val primaryLockType: PrimaryLockType = PrimaryLockType.PIN_6,
+  val pinLength: Int = 6,
+  val hasPinCredential: Boolean = false,
   val biometricEnabled: Boolean = true,
   val autoLockEnabled: Boolean = true,
   val autoLockTimeoutSeconds: Int = 30,
@@ -44,6 +90,12 @@ data class SecuritySettings(
   val hasSecurityQuestions: Boolean = false,
   val securityQuestion1: String = "",
   val securityQuestion2: String = "",
+  val shareCustomQuestionSuggestions: Boolean = true,
+  val pendingCustomQuestionsToSync: String = "",
+  val dualKeyExternalTreeUri: String = "",
+  val dualKeyLastSyncAtMillis: Long = 0L,
+  val dualKeyChecksumValid: Boolean = true,
+  val dualKeyTamperAlert: String = "",
   val autoBackupTreeUri: String = "",
   val autoBackupProviderLabel: String = "Google Drive",
   val lastAutoBackupAtMillis: Long = 0L,
@@ -52,12 +104,16 @@ data class SecuritySettings(
   val pendingBatteryPausedReencrypt: Boolean = false,
   val hasPatternLock: Boolean = false,
   val preferPatternFallback: Boolean = false,
+  val patternStealthMode: Boolean = false,
   val googleDriveSyncConnected: Boolean = false,
   val googleDriveAccountEmail: String = "",
   val googleDriveAutoSyncEnabled: Boolean = false,
   val lastGoogleDriveSyncAtMillis: Long = 0L,
   val idleTimeoutEnabled: Boolean = true,
   val idleTimeoutSeconds: Int = 120,
+  val hasCustomStealthCode: Boolean = false,
+  val stealthGestureMode: StealthGestureMode = StealthGestureMode.LONG_PRESS_SHIELD,
+  val alwaysBlockScreenshots: Boolean = false,
 )
 
 class SecurityPreferencesRepository(
@@ -66,6 +122,8 @@ class SecurityPreferencesRepository(
 ) {
   private object Keys {
     val INITIALIZED = booleanPreferencesKey("vault_initialized")
+    val PRIMARY_LOCK_TYPE = stringPreferencesKey("primary_lock_type")
+    val PIN_LENGTH = intPreferencesKey("pin_length")
     val PIN_SALT = stringPreferencesKey("pin_salt")
     val PIN_VERIFIER = stringPreferencesKey("pin_verifier")
     val PIN_WRAPPED_DEK = stringPreferencesKey("pin_wrapped_dek")
@@ -96,6 +154,12 @@ class SecurityPreferencesRepository(
     val RECOVERY_SALT = stringPreferencesKey("recovery_salt")
     val RECOVERY_VERIFIER = stringPreferencesKey("recovery_verifier")
     val RECOVERY_WRAPPED_DEK = stringPreferencesKey("recovery_wrapped_dek")
+    val SHARE_CUSTOM_QUESTIONS = booleanPreferencesKey("share_custom_questions")
+    val PENDING_CUSTOM_QUESTIONS = stringPreferencesKey("pending_custom_questions")
+    val DUAL_KEY_EXTERNAL_TREE_URI = stringPreferencesKey("dual_key_external_tree_uri")
+    val DUAL_KEY_LAST_SYNC_AT = longPreferencesKey("dual_key_last_sync_at")
+    val DUAL_KEY_CHECKSUM_VALID = booleanPreferencesKey("dual_key_checksum_valid")
+    val DUAL_KEY_TAMPER_ALERT = stringPreferencesKey("dual_key_tamper_alert")
     val AUTO_BACKUP_TREE_URI = stringPreferencesKey("auto_backup_tree_uri")
     val AUTO_BACKUP_PROVIDER = stringPreferencesKey("auto_backup_provider_label")
     val LAST_AUTO_BACKUP_AT = longPreferencesKey("last_auto_backup_at")
@@ -106,17 +170,30 @@ class SecurityPreferencesRepository(
     val PATTERN_VERIFIER = stringPreferencesKey("pattern_verifier")
     val PATTERN_WRAPPED_DEK = stringPreferencesKey("pattern_wrapped_dek")
     val PREFER_PATTERN_FALLBACK = booleanPreferencesKey("prefer_pattern_fallback")
+    val PATTERN_STEALTH_MODE = booleanPreferencesKey("pattern_stealth_mode")
     val GDRIVE_SYNC_CONNECTED = booleanPreferencesKey("gdrive_sync_connected")
     val GDRIVE_ACCOUNT_EMAIL = stringPreferencesKey("gdrive_account_email")
     val GDRIVE_AUTO_SYNC_ENABLED = booleanPreferencesKey("gdrive_auto_sync_enabled")
     val LAST_GDRIVE_SYNC_AT = longPreferencesKey("last_gdrive_sync_at")
     val IDLE_TIMEOUT_ENABLED = booleanPreferencesKey("idle_timeout_enabled")
     val IDLE_TIMEOUT_SECONDS = intPreferencesKey("idle_timeout_seconds")
+    val STEALTH_CODE_SALT = stringPreferencesKey("stealth_code_salt")
+    val STEALTH_CODE_VERIFIER = stringPreferencesKey("stealth_code_verifier")
+    val STEALTH_GESTURE_MODE = stringPreferencesKey("stealth_gesture_mode")
+    val ALWAYS_BLOCK_SCREENSHOTS = booleanPreferencesKey("always_block_screenshots")
   }
 
   val securitySettings: Flow<SecuritySettings> = context.securityDataStore.data.map { prefs ->
     val q1 = prefs[Keys.RECOVERY_Q1] ?: ""
     val q2 = prefs[Keys.RECOVERY_Q2] ?: ""
+    val hasPattern = !prefs[Keys.PATTERN_VERIFIER].isNullOrBlank() && !prefs[Keys.PATTERN_WRAPPED_DEK].isNullOrBlank()
+    val hasPin = !prefs[Keys.PIN_VERIFIER].isNullOrBlank() && !prefs[Keys.PIN_WRAPPED_DEK].isNullOrBlank()
+    val resolvedPinLength = if ((prefs[Keys.PIN_LENGTH] ?: 6) == 4) 4 else 6
+    val resolvedLockType = prefs[Keys.PRIMARY_LOCK_TYPE]?.let { PrimaryLockType.fromName(it) } ?: when {
+      hasPattern && !hasPin -> PrimaryLockType.PATTERN
+      resolvedPinLength == 4 -> PrimaryLockType.PIN_4
+      else -> PrimaryLockType.PIN_6
+    }
     val storedMode = prefs[Keys.THEME_MODE]
     val resolvedThemeMode = if (storedMode != null) {
       ThemeMode.fromName(storedMode)
@@ -129,6 +206,9 @@ class SecurityPreferencesRepository(
     }
     SecuritySettings(
       isVaultInitialized = prefs[Keys.INITIALIZED] ?: false,
+      primaryLockType = resolvedLockType,
+      pinLength = resolvedPinLength,
+      hasPinCredential = hasPin,
       biometricEnabled = prefs[Keys.BIOMETRIC_ENABLED] ?: true,
       autoLockEnabled = prefs[Keys.AUTO_LOCK_ENABLED] ?: true,
       autoLockTimeoutSeconds = prefs[Keys.AUTO_LOCK_SECONDS] ?: 30,
@@ -150,20 +230,31 @@ class SecurityPreferencesRepository(
       hasSecurityQuestions = q1.isNotBlank() && q2.isNotBlank() && !prefs[Keys.RECOVERY_WRAPPED_DEK].isNullOrBlank(),
       securityQuestion1 = q1,
       securityQuestion2 = q2,
+      shareCustomQuestionSuggestions = prefs[Keys.SHARE_CUSTOM_QUESTIONS] ?: true,
+      pendingCustomQuestionsToSync = prefs[Keys.PENDING_CUSTOM_QUESTIONS] ?: "",
+      dualKeyExternalTreeUri = prefs[Keys.DUAL_KEY_EXTERNAL_TREE_URI] ?: "",
+      dualKeyLastSyncAtMillis = prefs[Keys.DUAL_KEY_LAST_SYNC_AT] ?: 0L,
+      dualKeyChecksumValid = prefs[Keys.DUAL_KEY_CHECKSUM_VALID] ?: true,
+      dualKeyTamperAlert = prefs[Keys.DUAL_KEY_TAMPER_ALERT] ?: "",
       autoBackupTreeUri = prefs[Keys.AUTO_BACKUP_TREE_URI] ?: "",
       autoBackupProviderLabel = prefs[Keys.AUTO_BACKUP_PROVIDER] ?: "Google Drive",
       lastAutoBackupAtMillis = prefs[Keys.LAST_AUTO_BACKUP_AT] ?: 0L,
       batterySaverModeEnabled = prefs[Keys.BATTERY_SAVER_ENABLED] ?: true,
       pendingBatteryPausedAutoSync = prefs[Keys.PENDING_BATTERY_PAUSED_SYNC] ?: false,
       pendingBatteryPausedReencrypt = prefs[Keys.PENDING_BATTERY_PAUSED_REENCRYPT] ?: false,
-      hasPatternLock = !prefs[Keys.PATTERN_VERIFIER].isNullOrBlank() && !prefs[Keys.PATTERN_WRAPPED_DEK].isNullOrBlank(),
+      hasPatternLock = hasPattern,
       preferPatternFallback = prefs[Keys.PREFER_PATTERN_FALLBACK] ?: false,
+      patternStealthMode = prefs[Keys.PATTERN_STEALTH_MODE] ?: false,
       googleDriveSyncConnected = prefs[Keys.GDRIVE_SYNC_CONNECTED] ?: false,
       googleDriveAccountEmail = prefs[Keys.GDRIVE_ACCOUNT_EMAIL] ?: "",
       googleDriveAutoSyncEnabled = prefs[Keys.GDRIVE_AUTO_SYNC_ENABLED] ?: false,
       lastGoogleDriveSyncAtMillis = prefs[Keys.LAST_GDRIVE_SYNC_AT] ?: 0L,
       idleTimeoutEnabled = prefs[Keys.IDLE_TIMEOUT_ENABLED] ?: true,
       idleTimeoutSeconds = (prefs[Keys.IDLE_TIMEOUT_SECONDS] ?: 120).coerceAtLeast(1),
+      hasCustomStealthCode = !prefs[Keys.STEALTH_CODE_VERIFIER].isNullOrBlank() &&
+        !prefs[Keys.STEALTH_CODE_SALT].isNullOrBlank(),
+      stealthGestureMode = StealthGestureMode.fromName(prefs[Keys.STEALTH_GESTURE_MODE]),
+      alwaysBlockScreenshots = prefs[Keys.ALWAYS_BLOCK_SCREENSHOTS] ?: false,
     )
   }
 
@@ -175,25 +266,93 @@ class SecurityPreferencesRepository(
     question2: String,
     answer2: String,
   ): SecretKey {
+    val resolvedType = if (pin.length == 4) PrimaryLockType.PIN_4 else PrimaryLockType.PIN_6
+    return initializeVaultWithChoice(
+      lockType = resolvedType,
+      pin = pin,
+      patternNodes = null,
+      enableBiometrics = enableBiometrics,
+      question1 = question1,
+      answer1 = answer1,
+      question2 = question2,
+      answer2 = answer2,
+      shareCustomQuestionSuggestions = false,
+    )
+  }
+
+  suspend fun initializeVaultWithChoice(
+    lockType: PrimaryLockType,
+    pin: String?,
+    patternNodes: List<Int>?,
+    enableBiometrics: Boolean,
+    question1: String,
+    answer1: String,
+    question2: String,
+    answer2: String,
+    shareCustomQuestionSuggestions: Boolean = true,
+  ): SecretKey {
     val dek = AesFolderCipher.generateAes256Key()
-    val salt = AesFolderCipher.generateSalt()
-    val pinKey = AesFolderCipher.derivePinKey(pin, salt)
-    val pinWrapped = AesFolderCipher.wrapDekWithKey(dek, pinKey)
-    val pinVerifier = AesFolderCipher.computePinVerifier(pin, salt)
     val keystoreWrapped = keystoreManager.wrapDekWithKeystore(dek)
     val fingerprint = AesFolderCipher.computeKeyFingerprint(dek)
+
+    val pinSalt = pin?.takeIf { it.length == 4 || it.length == 6 }?.let { AesFolderCipher.generateSalt() }
+    val pinWrapped = if (pin != null && pinSalt != null) {
+      val pinKey = AesFolderCipher.derivePinKey(pin, pinSalt)
+      AesFolderCipher.wrapDekWithKey(dek, pinKey)
+    } else null
+    val pinVerifier = if (pin != null && pinSalt != null) {
+      AesFolderCipher.computePinVerifier(pin, pinSalt)
+    } else null
+
+    val canonicalPattern = patternNodes?.let { canonicalPatternString(it) }
+    val patternSalt = canonicalPattern?.let { AesFolderCipher.generateSalt() }
+    val patternWrapped = if (canonicalPattern != null && patternSalt != null) {
+      val pKey = AesFolderCipher.derivePinKey(canonicalPattern, patternSalt)
+      AesFolderCipher.wrapDekWithKey(dek, pKey)
+    } else null
+    val patternVerifier = if (canonicalPattern != null && patternSalt != null) {
+      AesFolderCipher.computePinVerifier(canonicalPattern, patternSalt)
+    } else null
+
+    require(pinWrapped != null || patternWrapped != null) {
+      "Either a Master PIN or a 3×3 Pattern must be configured."
+    }
 
     val recoverySalt = AesFolderCipher.generateSalt()
     val normalizedAnswers = normalizeRecoveryAnswers(answer1, answer2)
     val recoveryKey = AesFolderCipher.derivePinKey(normalizedAnswers, recoverySalt)
     val recoveryWrapped = AesFolderCipher.wrapDekWithKey(dek, recoveryKey)
     val recoveryVerifier = AesFolderCipher.computePinVerifier(normalizedAnswers, recoverySalt)
+    val resolvedPinLength = when {
+      pin != null && pin.length == 4 -> 4
+      lockType == PrimaryLockType.PIN_4 -> 4
+      else -> 6
+    }
 
     context.securityDataStore.edit { prefs ->
       prefs[Keys.INITIALIZED] = true
-      prefs[Keys.PIN_SALT] = Base64.encodeToString(salt, Base64.NO_WRAP)
-      prefs[Keys.PIN_VERIFIER] = pinVerifier
-      prefs[Keys.PIN_WRAPPED_DEK] = pinWrapped
+      prefs[Keys.PRIMARY_LOCK_TYPE] = lockType.name
+      prefs[Keys.PIN_LENGTH] = resolvedPinLength
+      if (pinSalt != null && pinVerifier != null && pinWrapped != null) {
+        prefs[Keys.PIN_SALT] = Base64.encodeToString(pinSalt, Base64.NO_WRAP)
+        prefs[Keys.PIN_VERIFIER] = pinVerifier
+        prefs[Keys.PIN_WRAPPED_DEK] = pinWrapped
+      } else {
+        prefs.remove(Keys.PIN_SALT)
+        prefs.remove(Keys.PIN_VERIFIER)
+        prefs.remove(Keys.PIN_WRAPPED_DEK)
+      }
+      if (patternSalt != null && patternVerifier != null && patternWrapped != null) {
+        prefs[Keys.PATTERN_SALT] = Base64.encodeToString(patternSalt, Base64.NO_WRAP)
+        prefs[Keys.PATTERN_VERIFIER] = patternVerifier
+        prefs[Keys.PATTERN_WRAPPED_DEK] = patternWrapped
+        prefs[Keys.PREFER_PATTERN_FALLBACK] = (lockType == PrimaryLockType.PATTERN)
+      } else {
+        prefs.remove(Keys.PATTERN_SALT)
+        prefs.remove(Keys.PATTERN_VERIFIER)
+        prefs.remove(Keys.PATTERN_WRAPPED_DEK)
+        prefs[Keys.PREFER_PATTERN_FALLBACK] = false
+      }
       prefs[Keys.KEYSTORE_WRAPPED_DEK] = keystoreWrapped
       prefs[Keys.BIOMETRIC_ENABLED] = enableBiometrics
       prefs[Keys.KEY_FINGERPRINT] = fingerprint
@@ -205,6 +364,7 @@ class SecurityPreferencesRepository(
       prefs[Keys.RECOVERY_SALT] = Base64.encodeToString(recoverySalt, Base64.NO_WRAP)
       prefs[Keys.RECOVERY_VERIFIER] = recoveryVerifier
       prefs[Keys.RECOVERY_WRAPPED_DEK] = recoveryWrapped
+      prefs[Keys.SHARE_CUSTOM_QUESTIONS] = shareCustomQuestionSuggestions
     }
     return dek
   }
@@ -230,18 +390,45 @@ class SecurityPreferencesRepository(
     return dek
   }
 
-  suspend fun unlockWithKeystoreAfterBiometric(): SecretKey? {
+  suspend fun prepareKeystoreUnwrapCipher(): Cipher? {
     val prefs = context.securityDataStore.data.first()
     val wrapped = prefs[Keys.KEYSTORE_WRAPPED_DEK] ?: return null
-    val dek = keystoreManager.unwrapDekWithKeystore(wrapped)
+    return runCatching { keystoreManager.prepareDekUnwrapCipher(wrapped) }.getOrNull()
+  }
+
+  suspend fun unlockWithKeystoreCipherAfterBiometric(unlockedCipher: Cipher?): SecretKey? {
+    val prefs = context.securityDataStore.data.first()
+    val wrapped = prefs[Keys.KEYSTORE_WRAPPED_DEK] ?: return null
+    val dek = if (unlockedCipher != null) {
+      keystoreManager.finishUnwrapDekWithCipher(wrapped, unlockedCipher)
+    } else {
+      keystoreManager.unwrapDekWithKeystore(wrapped)
+    }
     context.securityDataStore.edit { p -> p[Keys.FAILED_ATTEMPTS] = 0 }
     return dek
   }
+
+  suspend fun unlockWithKeystoreAfterBiometric(): SecretKey? =
+    unlockWithKeystoreCipherAfterBiometric(unlockedCipher = null)
 
   suspend fun recoverAndResetPin(
     answer1: String,
     answer2: String,
     newPin: String,
+  ): SecretKey? = recoverWithSecurityQuestions(
+    answer1 = answer1,
+    answer2 = answer2,
+    newPin = newPin,
+    newPatternNodes = null,
+    newLockType = if (newPin.length == 4) PrimaryLockType.PIN_4 else PrimaryLockType.PIN_6,
+  )
+
+  suspend fun recoverWithSecurityQuestions(
+    answer1: String,
+    answer2: String,
+    newPin: String? = null,
+    newPatternNodes: List<Int>? = null,
+    newLockType: PrimaryLockType? = null,
   ): SecretKey? {
     val prefs = context.securityDataStore.data.first()
     val recoverySaltB64 = prefs[Keys.RECOVERY_SALT] ?: return null
@@ -260,17 +447,31 @@ class SecurityPreferencesRepository(
 
     val recoveryKey = AesFolderCipher.derivePinKey(normalizedAnswers, recoverySalt)
     val dek = AesFolderCipher.unwrapDekWithKey(recoveryWrappedDek, recoveryKey)
-
-    val newPinSalt = AesFolderCipher.generateSalt()
-    val newPinKey = AesFolderCipher.derivePinKey(newPin, newPinSalt)
-    val newPinWrapped = AesFolderCipher.wrapDekWithKey(dek, newPinKey)
-    val newPinVerifier = AesFolderCipher.computePinVerifier(newPin, newPinSalt)
     val newKeystoreWrapped = keystoreManager.wrapDekWithKeystore(dek)
 
+    val validNewPin = newPin?.takeIf { it.length == 4 || it.length == 6 }
+    val canonicalPattern = newPatternNodes?.let { canonicalPatternString(it) }
+
     context.securityDataStore.edit { p ->
-      p[Keys.PIN_SALT] = Base64.encodeToString(newPinSalt, Base64.NO_WRAP)
-      p[Keys.PIN_VERIFIER] = newPinVerifier
-      p[Keys.PIN_WRAPPED_DEK] = newPinWrapped
+      if (validNewPin != null) {
+        val newPinSalt = AesFolderCipher.generateSalt()
+        val newPinKey = AesFolderCipher.derivePinKey(validNewPin, newPinSalt)
+        p[Keys.PIN_SALT] = Base64.encodeToString(newPinSalt, Base64.NO_WRAP)
+        p[Keys.PIN_VERIFIER] = AesFolderCipher.computePinVerifier(validNewPin, newPinSalt)
+        p[Keys.PIN_WRAPPED_DEK] = AesFolderCipher.wrapDekWithKey(dek, newPinKey)
+        p[Keys.PIN_LENGTH] = validNewPin.length
+      }
+      if (canonicalPattern != null) {
+        val pSalt = AesFolderCipher.generateSalt()
+        val pKey = AesFolderCipher.derivePinKey(canonicalPattern, pSalt)
+        p[Keys.PATTERN_SALT] = Base64.encodeToString(pSalt, Base64.NO_WRAP)
+        p[Keys.PATTERN_VERIFIER] = AesFolderCipher.computePinVerifier(canonicalPattern, pSalt)
+        p[Keys.PATTERN_WRAPPED_DEK] = AesFolderCipher.wrapDekWithKey(dek, pKey)
+        p[Keys.PREFER_PATTERN_FALLBACK] = (newLockType == PrimaryLockType.PATTERN)
+      }
+      if (newLockType != null) {
+        p[Keys.PRIMARY_LOCK_TYPE] = newLockType.name
+      }
       p[Keys.KEYSTORE_WRAPPED_DEK] = newKeystoreWrapped
       p[Keys.FAILED_ATTEMPTS] = 0
     }
@@ -309,19 +510,36 @@ class SecurityPreferencesRepository(
 
   suspend fun changePin(currentPin: String, newPin: String): Boolean {
     val dek = unlockWithPin(currentPin) ?: return false
+    return setOrUpdatePin(dek = dek, newPin = newPin, makePrimaryIfPin = true)
+  }
+
+  suspend fun setOrUpdatePin(
+    dek: SecretKey,
+    newPin: String,
+    makePrimaryIfPin: Boolean = false,
+  ): Boolean {
+    if (newPin.length != 4 && newPin.length != 6) return false
     val newSalt = AesFolderCipher.generateSalt()
     val newPinKey = AesFolderCipher.derivePinKey(newPin, newSalt)
     val newWrapped = AesFolderCipher.wrapDekWithKey(dek, newPinKey)
     val newVerifier = AesFolderCipher.computePinVerifier(newPin, newSalt)
+    val nextPinType = if (newPin.length == 4) PrimaryLockType.PIN_4 else PrimaryLockType.PIN_6
 
     context.securityDataStore.edit { prefs ->
       prefs[Keys.PIN_SALT] = Base64.encodeToString(newSalt, Base64.NO_WRAP)
       prefs[Keys.PIN_VERIFIER] = newVerifier
       prefs[Keys.PIN_WRAPPED_DEK] = newWrapped
+      prefs[Keys.PIN_LENGTH] = newPin.length
+      val currentType = PrimaryLockType.fromName(prefs[Keys.PRIMARY_LOCK_TYPE])
+      if (makePrimaryIfPin && currentType != PrimaryLockType.PATTERN) {
+        prefs[Keys.PRIMARY_LOCK_TYPE] = nextPinType.name
+      }
       prefs[Keys.FAILED_ATTEMPTS] = 0
     }
     return true
   }
+
+  suspend fun verifyCurrentPin(pin: String): Boolean = unlockWithPin(pin) != null
 
   suspend fun setBiometricEnabled(enabled: Boolean) {
     context.securityDataStore.edit { it[Keys.BIOMETRIC_ENABLED] = enabled }
@@ -479,12 +697,19 @@ class SecurityPreferencesRepository(
       prefs.remove(Keys.PATTERN_VERIFIER)
       prefs.remove(Keys.PATTERN_WRAPPED_DEK)
       prefs[Keys.PREFER_PATTERN_FALLBACK] = false
+      prefs[Keys.PATTERN_STEALTH_MODE] = false
     }
   }
 
   suspend fun setPreferPatternFallback(prefer: Boolean) {
     context.securityDataStore.edit { prefs ->
       prefs[Keys.PREFER_PATTERN_FALLBACK] = prefer
+    }
+  }
+
+  suspend fun setPatternStealthMode(enabled: Boolean) {
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.PATTERN_STEALTH_MODE] = enabled
     }
   }
 
@@ -526,6 +751,169 @@ class SecurityPreferencesRepository(
     }
   }
 
+  suspend fun setStealthGestureMode(mode: StealthGestureMode) {
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.STEALTH_GESTURE_MODE] = mode.name
+    }
+  }
+
+  suspend fun setAlwaysBlockScreenshots(enabled: Boolean) {
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.ALWAYS_BLOCK_SCREENSHOTS] = enabled
+    }
+  }
+
+  suspend fun setStealthAccessCode(rawCode: String): Boolean {
+    val clean = normalizeStealthCode(rawCode) ?: return false
+    val salt = AesFolderCipher.generateSalt()
+    val verifier = AesFolderCipher.computePinVerifier(clean, salt)
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.STEALTH_CODE_SALT] = Base64.encodeToString(salt, Base64.NO_WRAP)
+      prefs[Keys.STEALTH_CODE_VERIFIER] = verifier
+    }
+    return true
+  }
+
+  suspend fun verifyStealthAccessCode(candidate: String): Boolean {
+    val clean = candidate.trim()
+    if (clean.length < 4) return false
+    val prefs = context.securityDataStore.data.first()
+    val saltB64 = prefs[Keys.STEALTH_CODE_SALT]
+    val verifier = prefs[Keys.STEALTH_CODE_VERIFIER]
+    return if (!saltB64.isNullOrBlank() && !verifier.isNullOrBlank()) {
+      val salt = Base64.decode(saltB64, Base64.NO_WRAP)
+      AesFolderCipher.computePinVerifier(clean, salt) == verifier
+    } else {
+      clean == DEFAULT_STEALTH_CODE
+    }
+  }
+
+  suspend fun setPrimaryLockType(lockType: PrimaryLockType) {
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.PRIMARY_LOCK_TYPE] = lockType.name
+      if (lockType == PrimaryLockType.PIN_4) prefs[Keys.PIN_LENGTH] = 4
+      if (lockType == PrimaryLockType.PIN_6) prefs[Keys.PIN_LENGTH] = 6
+      prefs[Keys.PREFER_PATTERN_FALLBACK] = (lockType == PrimaryLockType.PATTERN)
+    }
+  }
+
+  suspend fun setShareCustomQuestionSuggestions(enabled: Boolean) {
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.SHARE_CUSTOM_QUESTIONS] = enabled
+    }
+  }
+
+  suspend fun queueCustomQuestionsForSync(questions: List<String>) {
+    val clean = questions.map { it.trim() }.filter { it.length >= 5 }.distinct()
+    if (clean.isEmpty()) return
+    context.securityDataStore.edit { prefs ->
+      val existing = prefs[Keys.PENDING_CUSTOM_QUESTIONS].orEmpty()
+        .split('\n')
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+      val merged = (existing + clean).distinct().take(10)
+      prefs[Keys.PENDING_CUSTOM_QUESTIONS] = merged.joinToString("\n")
+    }
+  }
+
+  suspend fun clearQueuedCustomQuestions() {
+    context.securityDataStore.edit { prefs ->
+      prefs.remove(Keys.PENDING_CUSTOM_QUESTIONS)
+    }
+  }
+
+  suspend fun setDualKeyExternalTreeUri(treeUri: String) {
+    context.securityDataStore.edit { prefs ->
+      if (treeUri.isBlank()) {
+        prefs.remove(Keys.DUAL_KEY_EXTERNAL_TREE_URI)
+      } else {
+        prefs[Keys.DUAL_KEY_EXTERNAL_TREE_URI] = treeUri
+      }
+    }
+  }
+
+  suspend fun recordDualKeySyncStatus(
+    syncedAtMillis: Long,
+    checksumValid: Boolean,
+    tamperAlert: String? = null,
+  ) {
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.DUAL_KEY_LAST_SYNC_AT] = syncedAtMillis
+      prefs[Keys.DUAL_KEY_CHECKSUM_VALID] = checksumValid
+      if (tamperAlert.isNullOrBlank()) {
+        prefs.remove(Keys.DUAL_KEY_TAMPER_ALERT)
+      } else {
+        prefs[Keys.DUAL_KEY_TAMPER_ALERT] = tamperAlert
+      }
+    }
+  }
+
+  suspend fun getKeyWrapSnapshot(): DualKeyCredentialSnapshot? {
+    val prefs = context.securityDataStore.data.first()
+    if (prefs[Keys.INITIALIZED] != true) return null
+    val hasPattern = !prefs[Keys.PATTERN_VERIFIER].isNullOrBlank() && !prefs[Keys.PATTERN_WRAPPED_DEK].isNullOrBlank()
+    val hasPin = !prefs[Keys.PIN_VERIFIER].isNullOrBlank() && !prefs[Keys.PIN_WRAPPED_DEK].isNullOrBlank()
+    val pinLen = if ((prefs[Keys.PIN_LENGTH] ?: 6) == 4) 4 else 6
+    val lockType = prefs[Keys.PRIMARY_LOCK_TYPE]?.let { PrimaryLockType.fromName(it) } ?: when {
+      hasPattern && !hasPin -> PrimaryLockType.PATTERN
+      pinLen == 4 -> PrimaryLockType.PIN_4
+      else -> PrimaryLockType.PIN_6
+    }
+    return DualKeyCredentialSnapshot(
+      keyFingerprint = prefs[Keys.KEY_FINGERPRINT] ?: "",
+      primaryLockType = lockType,
+      pinLength = pinLen,
+      pinSaltB64 = prefs[Keys.PIN_SALT],
+      pinWrappedDek = prefs[Keys.PIN_WRAPPED_DEK],
+      pinVerifier = prefs[Keys.PIN_VERIFIER],
+      patternSaltB64 = prefs[Keys.PATTERN_SALT],
+      patternWrappedDek = prefs[Keys.PATTERN_WRAPPED_DEK],
+      patternVerifier = prefs[Keys.PATTERN_VERIFIER],
+      recoveryQ1 = prefs[Keys.RECOVERY_Q1] ?: "",
+      recoveryQ2 = prefs[Keys.RECOVERY_Q2] ?: "",
+      recoverySaltB64 = prefs[Keys.RECOVERY_SALT],
+      recoveryWrappedDek = prefs[Keys.RECOVERY_WRAPPED_DEK],
+      recoveryVerifier = prefs[Keys.RECOVERY_VERIFIER],
+      biometricEnabled = prefs[Keys.BIOMETRIC_ENABLED] ?: true,
+    )
+  }
+
+  suspend fun restoreFromDualVaultBundle(bundle: DualKeyVaultBundle, dek: SecretKey) {
+    val keystoreWrapped = keystoreManager.wrapDekWithKeystore(dek)
+    val fingerprint = AesFolderCipher.computeKeyFingerprint(dek)
+    val lockType = PrimaryLockType.fromName(bundle.primaryLockType)
+    context.securityDataStore.edit { prefs ->
+      prefs[Keys.INITIALIZED] = true
+      prefs[Keys.PRIMARY_LOCK_TYPE] = lockType.name
+      prefs[Keys.PIN_LENGTH] = if (bundle.pinLength == 4) 4 else 6
+      prefs[Keys.KEY_FINGERPRINT] = fingerprint
+      prefs[Keys.KEYSTORE_WRAPPED_DEK] = keystoreWrapped
+      if (bundle.pinSaltB64 != null && bundle.pinVerifier != null && bundle.pinWrappedDek != null) {
+        prefs[Keys.PIN_SALT] = bundle.pinSaltB64
+        prefs[Keys.PIN_VERIFIER] = bundle.pinVerifier
+        prefs[Keys.PIN_WRAPPED_DEK] = bundle.pinWrappedDek
+      }
+      if (bundle.patternSaltB64 != null && bundle.patternVerifier != null && bundle.patternWrappedDek != null) {
+        prefs[Keys.PATTERN_SALT] = bundle.patternSaltB64
+        prefs[Keys.PATTERN_VERIFIER] = bundle.patternVerifier
+        prefs[Keys.PATTERN_WRAPPED_DEK] = bundle.patternWrappedDek
+      }
+      if (bundle.recoveryQ1.isNotBlank() && bundle.recoveryQ2.isNotBlank() &&
+        bundle.recoverySaltB64 != null && bundle.recoveryVerifier != null && bundle.recoveryWrappedDek != null
+      ) {
+        prefs[Keys.RECOVERY_Q1] = bundle.recoveryQ1
+        prefs[Keys.RECOVERY_Q2] = bundle.recoveryQ2
+        prefs[Keys.RECOVERY_SALT] = bundle.recoverySaltB64
+        prefs[Keys.RECOVERY_VERIFIER] = bundle.recoveryVerifier
+        prefs[Keys.RECOVERY_WRAPPED_DEK] = bundle.recoveryWrappedDek
+      }
+      prefs[Keys.PREFER_PATTERN_FALLBACK] = (lockType == PrimaryLockType.PATTERN)
+      prefs[Keys.FAILED_ATTEMPTS] = 0
+    }
+  }
+
+  fun normalizeRecoveryAnswersPublic(a1: String, a2: String): String = normalizeRecoveryAnswers(a1, a2)
+
   private fun normalizeRecoveryAnswers(a1: String, a2: String): String {
     val c1 = a1.trim().lowercase().replace(Regex("\\s+"), " ")
     val c2 = a2.trim().lowercase().replace(Regex("\\s+"), " ")
@@ -534,6 +922,13 @@ class SecurityPreferencesRepository(
 
   companion object {
     const val MIN_PATTERN_NODES = 4
+    const val DEFAULT_STEALTH_CODE = "#7788"
+
+    fun normalizeStealthCode(raw: String): String? {
+      val trimmed = raw.trim()
+      if (trimmed.length < 4 || trimmed.length > 32) return null
+      return if (trimmed.startsWith("#")) trimmed else "#$trimmed"
+    }
 
     fun canonicalPatternString(nodes: List<Int>): String? {
       val uniqueValid = nodes.distinct().filter { it in 0..8 }
